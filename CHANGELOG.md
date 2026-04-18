@@ -1,0 +1,158 @@
+# Changelog
+
+All notable changes to `isobar` are recorded here. Format follows
+[Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/);
+versioning is phase-gated (`vPHASE.X.Y`) per `docs/ROADMAP.md`.
+
+Every PR that changes behavior **must** update this file in the same
+commit. Non-behavior changes (pure docs, typo fixes, CI tweaks) may
+skip it but are encouraged to note the fact in the PR description.
+
+Section order within a release: `Added` · `Changed` · `Fixed` ·
+`Removed` · `Deprecated` · `Security` · `Docs` · `Research`.
+
+## [Unreleased]
+
+### Docs
+- _(placeholder — next change lands here)_
+
+---
+
+## [0.2.0] — 2026-04-18 — Refactor: `internal/retry` + throttle fix
+
+### Added
+- `internal/retry` package (`Do` / `Jitter` / `Next`) — single canonical
+  exponential-backoff-with-jitter primitive shared across every WS and
+  REST consumer. 97% covered.
+- `kalshi.Client.DiscoverOpenTickers(ctx, series, logger)` — promoted
+  out of `cmd/tape`; paginates, deduplicates, guards against the
+  cursor-with-empty-page infinite-loop case.
+- `make coverage` target producing `coverage.html`.
+- `TestThrottleDoesNotSerializeCallers` race-regression guard.
+- `TestDiscoverOpenTickersPaginatesAndDedupes` +
+  `TestDiscoverOpenTickersHandlesEmptyPageWithCursor`.
+
+### Changed
+- `kalshi.Subscriber.Run` now delegates reconnect/backoff to
+  `retry.Do` instead of reimplementing the loop.
+- `kalshi.Client.throttle` reserves its rate-limit slot under the mutex
+  and sleeps outside it. Previously the lock was held across
+  `time.Sleep`, serializing every concurrent caller.
+- Adaptive `minDelay` growth on HTTP 429 capped at `maxAdaptiveDelay =
+  2s` to prevent compound slowdown.
+- 429 retry backoff uses bit-shift `1<<n` instead of
+  `math.Pow(2, float64(n))`.
+
+### Fixed
+- Concurrency bug: `kalshi.Client.throttle` held `rateMu` across the
+  sleep — N concurrent callers would wait N × `minDelay` total instead
+  of queuing past each other.
+
+### Removed
+- Private `jitter()` function in `kalshi/ws.go` and its test.
+- Inline `discoverTickers` in `cmd/tape/main.go`.
+
+### Docs
+- `docs/ARCHITECTURE.md` updated: new `internal/retry` section; kalshi
+  section rewritten for the new throttle semantics +
+  `DiscoverOpenTickers`.
+- `docs/TESTING.md` updated: coverage target row for `internal/retry`;
+  `make coverage` entry.
+
+---
+
+## [0.1.0] — 2026-04-18 — W1: research pivot + Coinbase kill
+
+### Added
+- `docs/research/SYNTHESIS.md` consolidating the 8 agent reports into
+  a single decision document.
+- `docs/research/06-microstructure-math.md` — Wave-2 agent output
+  (reservation price with bounded σ² = P(1-P)/√t, optimal half-spread,
+  M/M/∞ fill probability, OFI gate, no-trade zone, CUSUM, Kelly with
+  ρ = −1/(K−1)).
+- `docs/research/07-atmospheric-physics.md` — Wave-2 agent output
+  (predictability ceilings, NGR/EMOS/AIFS blending, EnKF 3h pre-close,
+  conformal intervals, hurricane SST+intensity, radar advection
+  inversion).
+- `docs/research/08-evt-statmech.md` — Wave-2 agent output
+  (Peaks-Over-Threshold for tail brackets, copula joint pricing,
+  Lyapunov chaos bound, power-law tail MM, rabbit-holes to skip).
+
+### Changed
+- `docs/STRATEGY.md` rewritten: two signals (`weather-calibrated` +
+  `hurricane-landfall`); NGR/EMOS calibration mandatory; conformal
+  intervals wrap predictors; EVT/POT for tail brackets; intraday
+  Bayesian update at T−3h; Lyapunov 8-day hard gate; fee-aware edge
+  floor `> 0.07·2P(1-P) + 1¢`.
+- `docs/ROADMAP.md` rewritten: Phase-0.5 gate now requires calibrated
+  Brier-skill beating market-implied on OOS 90-day held-out data;
+  hurricane-landfall milestone timed for the 2026 Atlantic season
+  (June 1).
+- `docs/RISK.md` updated: fee-aware edge floor, Lyapunov horizon cap,
+  Kelly with ρ = −1/(K−1) correction, bounded-payoff σ² correction.
+- `docs/ARCHITECTURE.md`, `docs/TESTING.md`, `docs/OPERATIONS.md`,
+  `docs/GLOSSARY.md`, `README.md` all updated to reflect 2-source
+  tree and 2-signal strategy.
+- `config/config.example.yaml`: `coinbase:` block removed.
+- `internal/config/config.go`: `Coinbase` struct and its validation
+  deleted; `Config` loses one field.
+
+### Removed
+- `internal/coinbase/ws.go` and `internal/coinbase/ws_test.go`.
+- `startCoinbase` goroutine in `cmd/tape/main.go`.
+- BTC-hourly / Coinbase-vs-KXBTCD strategy references throughout
+  docs and tests.
+
+### Research
+- Wave 1 (4 agents): Kalshi bot landscape, weather-thesis critical
+  audit, alternative non-BTC markets, dashboard architecture.
+  See `docs/research/01`–`04`.
+- Wave 2 (3 agents): microstructure math, atmospheric physics,
+  EVT + stat-mech + chaos. See `docs/research/06`–`08`.
+- Literature review (1 agent) in `docs/research/05`.
+
+### Decision summary
+After 8 parallel research agents the naive `p_fair = members/31`
+thesis was judged structurally money-losing on Kalshi after fees
+(raw ensemble fractions uncalibrated; Kalshi fees `ceil(0.07·N·P·(1-P))`
+peak at 50¢ mid; Kalshi MMs already run calibrated multi-model stacks).
+BTC-hourly was judged dead alpha at REST-from-cloud latency after
+Coinbase's Kalshi integration in Jan 2026. Pivot: two calibrated
+signals sharing a probabilistic-forecaster-vs-event-contract framework.
+Full reasoning: `docs/research/SYNTHESIS.md`; individual ADRs:
+`docs/decisions/`.
+
+---
+
+## [0.0.2] — 2026-04-18 — Initial doc + test coverage
+
+### Added
+- `docs/ROADMAP.md`, `docs/STRATEGY.md`, `docs/ARCHITECTURE.md`,
+  `docs/TESTING.md`, `docs/OPERATIONS.md`, `docs/RISK.md`,
+  `docs/GLOSSARY.md`, `docs/README.md` (index).
+- Package tests across the board: `clock` (100%), `config`
+  (92.6%), `env` (88.1%), `openmeteo` (87.7%), `coinbase` (79.5%),
+  `obs` (76.9%), `journal` (71.9%), `kalshi` (67.6%). Total 75.1%.
+- Race-tested WS mocks for Kalshi + Coinbase.
+- Httptest-based mocks for Open-Meteo.
+
+### Changed
+- `README.md` links the new `docs/` suite.
+
+---
+
+## [0.0.1] — 2026-04-18 — Phase 0 scaffold
+
+### Added
+- `cmd/tape` recorder (Kalshi WS + Coinbase WS + Open-Meteo REST).
+- `internal/journal` append-only rotating JSONL writer with batched
+  fsync and non-blocking `Write`.
+- `internal/kalshi` REST client + RSA-PSS signer + authenticated
+  WS subscriber (ported from `arbhunter`).
+- `internal/coinbase` public WS subscriber.
+- `internal/openmeteo` GFS ensemble REST poller.
+- `internal/clock` paired (wall, monotonic) timestamp.
+- `internal/config` YAML + env overlay + validation.
+- `internal/env` minimal `.env` loader.
+- `internal/obs` JSON `slog` bootstrap.
+- `Makefile`, `.golangci.yml`, `.github/workflows/ci.yml`.
