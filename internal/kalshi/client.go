@@ -1,0 +1,426 @@
+package kalshi
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"math"
+	"net/http"
+	"net/url"
+	"strconv"
+	"sync"
+	"time"
+)
+
+// Client is a typed REST client for the Kalshi Trade API v2.
+// It includes per-request rate limiting and automatic retry on 429 responses.
+type Client struct {
+	baseURL    string
+	pathPrefix string
+	signer     *Signer
+	httpClient *http.Client
+
+	rateMu   sync.Mutex
+	lastCall time.Time
+	minDelay time.Duration // minimum delay between requests
+}
+
+// NewClient creates a Kalshi API client with built-in rate limiting.
+func NewClient(baseURL string, signer *Signer) *Client {
+	// Extract path prefix from baseURL for request signing.
+	// e.g. "https://api.elections.kalshi.com/trade-api/v2" -> "/trade-api/v2"
+	pathPrefix := ""
+	if u, err := url.Parse(baseURL); err == nil {
+		pathPrefix = u.Path
+	}
+	return &Client{
+		baseURL:    baseURL,
+		pathPrefix: pathPrefix,
+		signer:     signer,
+		httpClient: &http.Client{
+			Timeout: 10 * time.Second,
+		},
+		minDelay: 1000 * time.Millisecond, // ~1 req/s to stay within Kalshi rate limits
+	}
+}
+
+// ResetRateLimit resets the adaptive rate limit delay back to the base rate.
+// Call this after discovery to avoid carrying over inflated delays into polling.
+func (c *Client) ResetRateLimit() {
+	c.rateMu.Lock()
+	c.minDelay = 1000 * time.Millisecond
+	c.rateMu.Unlock()
+}
+
+// throttle enforces minimum delay between API calls.
+func (c *Client) throttle() {
+	c.rateMu.Lock()
+	defer c.rateMu.Unlock()
+	elapsed := time.Since(c.lastCall)
+	if elapsed < c.minDelay {
+		time.Sleep(c.minDelay - elapsed)
+	}
+	c.lastCall = time.Now()
+}
+
+// --- Market Data ---
+
+// GetMarket fetches a single market by ticker.
+func (c *Client) GetMarket(ctx context.Context, ticker string) (Market, error) {
+	var resp getMarketResponse
+	if err := c.get(ctx, "/markets/"+ticker, nil, &resp); err != nil {
+		return Market{}, err
+	}
+	return resp.Market, nil
+}
+
+// GetMarketRaw fetches a single market and returns the raw JSON for debugging.
+func (c *Client) GetMarketRaw(ctx context.Context, ticker string) (string, error) {
+	return c.getRaw(ctx, "/markets/"+ticker, nil)
+}
+
+// GetMarkets lists markets with optional filters.
+func (c *Client) GetMarkets(ctx context.Context, params map[string]string) ([]Market, error) {
+	var resp getMarketsResponse
+	if err := c.get(ctx, "/markets", params, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Markets, nil
+}
+
+// GetMarketsPage lists markets and returns the next pagination cursor when present.
+func (c *Client) GetMarketsPage(ctx context.Context, params map[string]string) ([]Market, string, error) {
+	var resp getMarketsResponse
+	if err := c.get(ctx, "/markets", params, &resp); err != nil {
+		return nil, "", err
+	}
+	return resp.Markets, resp.Cursor, nil
+}
+
+// GetEvents lists events with optional filters.
+func (c *Client) GetEvents(ctx context.Context, params map[string]string) ([]Event, error) {
+	var resp getEventsResponse
+	if err := c.get(ctx, "/events", params, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Events, nil
+}
+
+// GetOrderbookRaw fetches the raw JSON orderbook response for debugging.
+func (c *Client) GetOrderbookRaw(ctx context.Context, ticker string) (string, error) {
+	return c.getRaw(ctx, "/markets/"+ticker+"/orderbook", nil)
+}
+
+// GetOrdersRaw fetches raw JSON for debugging order response format.
+func (c *Client) GetOrdersRaw(ctx context.Context, params map[string]string) (string, error) {
+	return c.getRaw(ctx, "/portfolio/orders", params)
+}
+
+// GetFillsRaw fetches raw JSON for debugging fill response format.
+func (c *Client) GetFillsRaw(ctx context.Context, params map[string]string) (string, error) {
+	return c.getRaw(ctx, "/portfolio/fills", params)
+}
+
+// GetOrderbook fetches the orderbook for a market ticker.
+// depth limits the number of levels returned (0 = default).
+func (c *Client) GetOrderbook(ctx context.Context, ticker string, depth int) (Orderbook, error) {
+	params := map[string]string{}
+	if depth > 0 {
+		params["depth"] = strconv.Itoa(depth)
+	}
+	var resp getOrderbookResponse
+	if err := c.get(ctx, "/markets/"+ticker+"/orderbook", params, &resp); err != nil {
+		return Orderbook{}, err
+	}
+
+	// Prefer new "fp" format if present; convert to legacy integer-cents format.
+	if len(resp.OrderbookFP.YesDollars) > 0 || len(resp.OrderbookFP.NoDollars) > 0 {
+		ob := Orderbook{
+			Yes: fpLevelsToInt(resp.OrderbookFP.YesDollars),
+			No:  fpLevelsToInt(resp.OrderbookFP.NoDollars),
+		}
+		return ob, nil
+	}
+	return resp.Orderbook, nil
+}
+
+// fpLevelsToInt converts dollar-string levels to integer-cent levels.
+func fpLevelsToInt(levels []OrderbookLevelFP) []OrderbookLevel {
+	result := make([]OrderbookLevel, 0, len(levels))
+	for _, l := range levels {
+		price, err := strconv.ParseFloat(l[0], 64)
+		if err != nil {
+			continue
+		}
+		qty, err := strconv.ParseFloat(l[1], 64)
+		if err != nil {
+			continue
+		}
+		cents := int(math.Round(price * 100))
+		if cents <= 0 || cents >= 100 {
+			continue
+		}
+		result = append(result, OrderbookLevel{cents, int(qty)})
+	}
+	return result
+}
+
+// --- Orders ---
+
+// CreateOrder places a new order.
+func (c *Client) CreateOrder(ctx context.Context, req CreateOrderRequest) (Order, error) {
+	if req.Type == "" {
+		req.Type = "limit"
+	}
+	var resp createOrderResponse
+	if err := c.post(ctx, "/portfolio/orders", req, &resp); err != nil {
+		return Order{}, err
+	}
+	return resp.Order, nil
+}
+
+// CancelOrder cancels an order by its order ID.
+func (c *Client) CancelOrder(ctx context.Context, orderID string) (Order, error) {
+	var resp cancelOrderResponse
+	if err := c.delete(ctx, "/portfolio/orders/"+orderID, &resp); err != nil {
+		return Order{}, err
+	}
+	return resp.Order, nil
+}
+
+// GetOrder fetches a single order by ID.
+func (c *Client) GetOrder(ctx context.Context, orderID string) (Order, error) {
+	var resp getOrderResponse
+	if err := c.get(ctx, "/portfolio/orders/"+orderID, nil, &resp); err != nil {
+		return Order{}, err
+	}
+	return resp.Order, nil
+}
+
+// GetOrders lists orders with optional filters.
+func (c *Client) GetOrders(ctx context.Context, params map[string]string) ([]Order, error) {
+	var resp getOrdersResponse
+	if err := c.get(ctx, "/portfolio/orders", params, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Orders, nil
+}
+
+// --- Portfolio ---
+
+// GetFills lists fills with optional filters.
+func (c *Client) GetFills(ctx context.Context, params map[string]string) ([]Fill, error) {
+	var resp getFillsResponse
+	if err := c.get(ctx, "/portfolio/fills", params, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Fills, nil
+}
+
+// GetPositions lists portfolio positions.
+func (c *Client) GetPositions(ctx context.Context, params map[string]string) ([]Position, error) {
+	var resp getPositionsResponse
+	if err := c.get(ctx, "/portfolio/positions", params, &resp); err != nil {
+		return nil, err
+	}
+	return resp.MarketPositions, nil
+}
+
+// GetPositionsRaw returns the raw JSON response for positions.
+func (c *Client) GetPositionsRaw(ctx context.Context, params map[string]string) ([]byte, error) {
+	s, err := c.getRaw(ctx, "/portfolio/positions", params)
+	return []byte(s), err
+}
+
+// GetBalance fetches the portfolio balance.
+func (c *Client) GetBalance(ctx context.Context) (Balance, error) {
+	var bal Balance
+	if err := c.get(ctx, "/portfolio/balance", nil, &bal); err != nil {
+		return Balance{}, err
+	}
+	return bal, nil
+}
+
+// GetBalanceRaw fetches the portfolio balance as raw JSON for debugging.
+func (c *Client) GetBalanceRaw(ctx context.Context) (string, error) {
+	return c.getRaw(ctx, "/portfolio/balance", nil)
+}
+
+// --- HTTP helpers ---
+
+func (c *Client) getRaw(ctx context.Context, path string, params map[string]string) (string, error) {
+	fullPath := path
+	if len(params) > 0 {
+		q := url.Values{}
+		for k, v := range params {
+			q.Set(k, v)
+		}
+		fullPath = path + "?" + q.Encode()
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+fullPath, nil)
+	if err != nil {
+		return "", fmt.Errorf("kalshi: build GET request: %w", err)
+	}
+
+	if err := c.sign(req, path); err != nil {
+		return "", err
+	}
+
+	bodyBytes, err := c.doRaw(req)
+	if err != nil {
+		return "", err
+	}
+	return string(bodyBytes), nil
+}
+
+func (c *Client) get(ctx context.Context, path string, params map[string]string, out interface{}) error {
+	fullPath := path
+	if len(params) > 0 {
+		q := url.Values{}
+		for k, v := range params {
+			q.Set(k, v)
+		}
+		fullPath = path + "?" + q.Encode()
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+fullPath, nil)
+	if err != nil {
+		return fmt.Errorf("kalshi: build GET request: %w", err)
+	}
+
+	// Signature covers path without base URL or query string.
+	if err := c.sign(req, path); err != nil {
+		return err
+	}
+
+	return c.do(req, out)
+}
+
+func (c *Client) post(ctx context.Context, path string, body interface{}, out interface{}) error {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("kalshi: marshal request body: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("kalshi: build POST request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	if err := c.sign(req, path); err != nil {
+		return err
+	}
+
+	return c.do(req, out)
+}
+
+func (c *Client) delete(ctx context.Context, path string, out interface{}) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.baseURL+path, nil)
+	if err != nil {
+		return fmt.Errorf("kalshi: build DELETE request: %w", err)
+	}
+
+	if err := c.sign(req, path); err != nil {
+		return err
+	}
+
+	return c.do(req, out)
+}
+
+func (c *Client) sign(req *http.Request, path string) error {
+	if c.signer == nil {
+		return nil
+	}
+	signPath := c.pathPrefix + path
+	key, sig, ts, err := c.signer.AuthHeaders(req.Method, signPath)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("KALSHI-ACCESS-KEY", key)
+	req.Header.Set("KALSHI-ACCESS-SIGNATURE", sig)
+	req.Header.Set("KALSHI-ACCESS-TIMESTAMP", ts)
+	return nil
+}
+
+const maxRetries = 5
+
+func (c *Client) doRaw(req *http.Request) ([]byte, error) {
+	req.Header.Set("Accept", "application/json")
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		c.throttle()
+
+		// Clone request body for retries.
+		if req.Body != nil && req.GetBody != nil {
+			newBody, err := req.GetBody()
+			if err != nil {
+				return nil, fmt.Errorf("kalshi: reset request body: %w", err)
+			}
+			req.Body = newBody
+		}
+
+		// Re-sign on retry (timestamp may have drifted).
+		if attempt > 0 {
+			signPath := req.URL.Path
+			// Strip the base URL path prefix that was already prepended in sign().
+			if len(c.pathPrefix) > 0 && len(signPath) > len(c.pathPrefix) {
+				signPath = signPath[len(c.pathPrefix):]
+			}
+			if err := c.sign(req, signPath); err != nil {
+				return nil, err
+			}
+		}
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("kalshi: HTTP request failed: %w", err)
+		}
+
+		bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+		_ = resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("kalshi: read response body: %w", err)
+		}
+
+		if resp.StatusCode == 429 && attempt < maxRetries {
+			// Adaptively slow down on rate limits.
+			c.rateMu.Lock()
+			if c.minDelay < 2*time.Second {
+				c.minDelay = c.minDelay * 2
+			}
+			c.rateMu.Unlock()
+
+			backoff := time.Duration(math.Pow(2, float64(attempt+1))) * time.Second
+			select {
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			case <-time.After(backoff):
+				continue
+			}
+		}
+
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, fmt.Errorf("kalshi: API error %d: %s", resp.StatusCode, string(bodyBytes))
+		}
+		return bodyBytes, nil
+	}
+	return nil, fmt.Errorf("kalshi: exhausted retries")
+}
+
+func (c *Client) do(req *http.Request, out interface{}) error {
+	bodyBytes, err := c.doRaw(req)
+	if err != nil {
+		return err
+	}
+
+	if out != nil && len(bodyBytes) > 0 {
+		if err := json.Unmarshal(bodyBytes, out); err != nil {
+			return fmt.Errorf("kalshi: decode response: %w", err)
+		}
+	}
+	return nil
+}
