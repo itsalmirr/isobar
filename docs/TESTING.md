@@ -58,8 +58,9 @@
 | `internal/obs`         | 90%                  | Level parsing + handler shape.     |
 | `internal/config`      | 95%                  | Every `Validate` branch.           |
 | `internal/journal`     | 90%                  | Rotation, drop, roundtrip, shutdown.|
-| `internal/kalshi`      | 85%                  | All REST verbs + signer + ws subscribe msg. |
+| `internal/kalshi`      | 85%                  | All REST verbs + signer + ws subscribe msg + DiscoverOpenTickers + throttle. |
 | `internal/openmeteo`   | 85%                  | URL build + error propagation.     |
+| `internal/retry`       | 95%                  | Jitter, Next, Do happy-path + ctx + max-attempts. |
 
 Coverage is a floor, not a ceiling, and not a substitute for
 thinking — a 100%-covered function can still be wrong. But a package under
@@ -145,6 +146,7 @@ c := NewClient(srv.URL, signer)
 | `make test`        | full race-tested run, canonical CI run       |
 | `make test-short`  | `-short` for pre-commit speed                |
 | `make bench`       | `go test -bench=.` on hot paths              |
+| `make coverage`    | race-tested run with HTML coverage report    |
 | `make lint`        | golangci-lint with repo config               |
 | `make vet`         | `go vet ./...`                               |
 | `make all`         | lint + vet + test + build                    |

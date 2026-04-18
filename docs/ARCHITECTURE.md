@@ -38,6 +38,7 @@ internal/
   kalshi/              REST client + signer + authenticated WS subscriber
   obs/                 slog JSON bootstrap
   openmeteo/           GFS + ECMWF ensemble REST poller
+  retry/               Context-aware exponential backoff with jitter
   calibration/         NGR, conformal, EVT, T-3h Bayesian (W2–5)
   nhc/                 NHC ATCF a-deck/b-deck advisory parser (W6)
   hurricanemodel/      HAFS/HWRF + NDBC SST (W7–8)
@@ -141,14 +142,35 @@ produces a clean drain.
   where `signature = RSASSA-PSS(SHA256, timestamp + method + path)`. The
   path must include Kalshi's API version prefix (e.g. `/trade-api/v2/...`).
 - `Client` applies a built-in min-delay rate limiter (1 req/s baseline)
-  and doubles the delay adaptively on HTTP 429 up to 2s. Call
-  `ResetRateLimit` after discovery to avoid dragging an inflated delay
-  into a polling loop.
-- `Client` retries on 429 up to `maxRetries=5` with exponential backoff;
-  non-2xx/non-429 are surfaced as `API error <status>: <body>`.
-- `Subscriber` is the WS counterpart: authenticated dial, subscribe to
-  configured channels + market tickers, forward raw frames via `OnFrame`.
-  Reconnects with jittered exponential backoff on any read error.
+  that reserves slots under the mutex and sleeps *outside* it — so
+  concurrent callers queue past each other instead of serializing on
+  the sleep. Adaptive slowdown on 429 is capped at `maxAdaptiveDelay`
+  (2 s) so a flaky API can't compound into minute-long gaps. Call
+  `ResetRateLimit` after discovery to drop the inflated delay before
+  polling.
+- `Client` retries on 429 up to `maxRetries=5` with bit-shift
+  exponential backoff; non-2xx/non-429 are surfaced as
+  `API error <status>: <body>`.
+- `Client.DiscoverOpenTickers(ctx, series, logger)` paginates
+  `GET /markets` for each series prefix, deduplicates, filters to
+  open markets matching the prefix. One call, reusable from any
+  caller — not reimplemented in `cmd/tape`.
+- `Subscriber` is the WS counterpart: authenticated dial, subscribe
+  to configured channels + market tickers, forward raw frames via
+  `OnFrame`. Reconnect/backoff is delegated to `internal/retry`.
+
+### `internal/retry`
+
+- `Do(ctx, cfg, logger, fn)` is the single canonical reconnect/backoff
+  loop. Every WS-ish component and REST poller that needs to retry goes
+  through it. Zero values in `Config` degrade to sensible defaults
+  (500 ms initial, 30 s cap, unlimited attempts).
+- `Jitter(d)` returns `d + U[0, d/4]`; `Next(prev, max)` returns the
+  next doubled backoff capped at `max`. Callers that need a custom loop
+  (e.g. the Kalshi 429 handler) compose with these helpers instead of
+  reimplementing them.
+- Clean context cancellation always returns `nil` from `Do`; callers
+  don't have to tell "graceful shutdown" from "real failure".
 
 ### `internal/openmeteo`
 

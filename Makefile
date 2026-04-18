@@ -33,6 +33,13 @@ test-short:
 bench:
 	$(GO) test -run='^$$' -bench=. -benchmem -benchtime=2s $(PKGS)
 
+.PHONY: coverage
+coverage:
+	$(GO) test -race -count=1 -coverprofile=coverage.out $(PKGS)
+	$(GO) tool cover -func=coverage.out | tail -1
+	$(GO) tool cover -html=coverage.out -o coverage.html
+	@echo "open coverage.html"
+
 .PHONY: vet
 vet:
 	$(GO) vet $(PKGS)
