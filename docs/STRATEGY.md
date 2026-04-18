@@ -7,37 +7,61 @@
 ## Thesis in one paragraph
 
 Kalshi weather-bracket markets price discrete-temperature outcomes
-(`[60,65)°F`, `[65,70)°F`, …) for a location and date. Retail flow dominates
-these books. NOAA's GFS ensemble publishes 31 equiprobable forecast paths —
-so for any bracket, a fair YES price is just the fraction of ensemble members
-whose forecast lands inside the bracket. When that fraction diverges from
-the market mid by more than fees + slippage, there is an edge. The ensemble
-updates every 6h and micro-updates continuously; the market typically does
-not react instantly. That lag is the bot's home.
+(`[60,65)°F`, `[65,70)°F`, …) for a location and date. Retail flow
+dominates these books. NOAA's GFS ensemble publishes 31 forecast paths,
+ECMWF IFS publishes 51, and ML models (GenCast, AIFS) publish more —
+but **raw member fractions are uncalibrated probabilities**, systematically
+biased by under-dispersion and by grid-vs-station error. After
+**NGR/EMOS calibration**, **ECMWF blending**, and an **intraday Bayesian
+update at T−3h** that incorporates the observed temperature trajectory,
+our posterior for a bracket can be 5–15 pp tighter than the market's,
+which updates on a 6-hour NWP cadence. That gap is the bot's home.
 
-Secondary thesis: BTC hourly `KXBTCD` contracts lag Coinbase spot by tens of
-seconds on decisive moves. A measured lead-lag + maker-only execution is
-profitable if (and only if) fees can be paid from the lead. This is an
-`arbhunter`-style strategy we already know how to operate.
+Secondary thesis: **hurricane-landfall markets** (`KXHURRICANE*`). NHC
+updates the cone on 3-hour advisories; models contain the signal
+earlier. The cone is the 67th-percentile envelope, so tail brackets
+(extreme landfall zones, Cat-5 intensity) are intrinsically mispriced.
+NDBC-buoy SST nudging drops intensity MAE from 9 mph to ~7.5 mph at 24h.
+Seasonal (June–November); perfect fit for a 6-month runway.
 
-Both theses are *measured* in Phase 0.5, not assumed. If the measurement
-fails the gate (`>10 brackets/day with >8% edge after fees`), the strategy
-is killed without ceremony.
+Both theses are *measured* in Phase 0.5, not assumed. Gate:
+**`>10 events/day with >5% calibrated edge after fees` on at least
+one signal**, with **calibrated Brier-skill beating market-implied
+on held-out 90-day OOS data**. If calibration fails the Brier gate,
+the signal is disabled — no negotiation.
+
+**BTC-hourly is killed.** Research (waves 1+2) converged: Coinbase
+integrated Kalshi in Jan 2026, compressing lead-lag to sub-second.
+At REST-from-cloud latency we are 10–50 ms behind serious competitors.
+`internal/coinbase` and the `coinbase` config block are removed.
 
 ## The two signals
 
-### `weather` — NOAA ensemble vs. bracket YES
+### `weather-calibrated` — calibrated ensemble vs. bracket YES
 
-**Pricing model.**
+**Pricing model (do NOT use raw fraction — it's miscalibrated by
+10–15 pp at bracket boundaries; see `docs/research/02-weather-thesis-audit.md`).**
 
-For a bracket `B = [lo, hi)` over location `L` on date `D`:
+Pipeline:
 
-```
-p_fair = (1 / N) * Σ_i  1{ x_i ∈ B }
-```
+1. Fetch GEFS (31 members) + ECMWF IFS (51 members) for the target
+   station and date.
+2. Apply **NGR / EMOS** per `(station, season, lead-time)` bin, fit on
+   ≥2 years of paired archive-vs-NWS-CLI observations. Produces a
+   calibrated predictive CDF, not a raw member count.
+3. Blend the two models (inverse-variance weighted).
+4. Apply **EVT / Peaks-Over-Threshold (GPD)** for tail brackets where
+   raw count is 0–1 members — extrapolates tail probability from
+   20y of station history.
+5. At T−3h, perform a **Bayesian update** using observed METAR/ASOS
+   trajectory: `P(finalT | obs) ∝ P(obs | finalT) · P(finalT | ensemble)`.
+   This is the largest single-shot edge (+5–10¢/bracket at settlement).
+6. Wrap the predictor with **conformal prediction intervals**
+   (distribution-free coverage guarantees). Only bet when
+   `bracket width > conformal width + bid-ask`.
 
-where `x_i` is ensemble member i's forecast for L at the resolution time
-(e.g., the `temperature_2m_max` value for D). N = 31 for GFS ensemble.
+The resulting `p_fair` is a calibrated posterior probability with
+known coverage, not a raw member fraction.
 
 **Edge.**
 
@@ -52,11 +76,20 @@ on price, per Kalshi schedule.
 
 **Entry.**
 
-- Enter when `edge_side > EDGE_MIN` (default 8¢) and the book has size
-  (`min_size` contracts at the far-touch).
-- Quote maker-only, `yes_price = floor(p_fair * 100) - 1` or `+1`
-  depending on side (joining, not stepping).
-- One order per bracket per ensemble refresh.
+- **Fee-aware edge floor** (do NOT use fixed 8¢):
+  `edge > 0.07 · 2 · P · (1−P) + 1¢` per side. Forces the bot to skip
+  P≈0.5 brackets unless edge is large, because that's where Kalshi's
+  fee curve peaks.
+- **Lyapunov 8-day gate**: no signal emitted for brackets with
+  lead_time > 8 days. Forecast error doubles every ~5 days
+  (λ ≈ 0.2 day⁻¹); beyond 8 days any "edge" is noise.
+- Enter when all gates pass AND the book has `min_size` at the far-touch.
+- Quote maker-only. **Post-only** (`PostOnly: true`) on every order —
+  exchange rejects rather than crosses.
+- Reservation price + half-spread per `docs/research/06-microstructure-math.md`:
+  `σ²_bin(P) = P(1−P)/√t_days` (NOT P(1-P) alone — bounded-payoff
+  correction).
+- One order per `(strategy, market, side)` at a time.
 
 **Exit.**
 
@@ -79,22 +112,38 @@ on price, per Kalshi schedule.
   emission on "fully-updated" (all expected hours present for the target
   day).
 
-### `btc-hourly` — Coinbase spot vs. `KXBTCD`
+### `hurricane-landfall` — NHC advisory + models vs. bracket YES
 
-**Pricing model.**
+**Pricing model.** For a landfall-zone bracket (or category-at-landfall
+bracket) with advisory time `T`:
 
-For a KXBTCD bracket `[lo, hi)` with expiry `T`:
+1. Pull NHC ATCF a-deck (deterministic forecast) + b-deck (best-track
+   analysis) for the active storm.
+2. Ingest GEFS 30-member tropical ensemble + HAFS-A/B + HWRF via
+   NOAA NOMADS (all free).
+3. Run SST-nudged intensity ML model trained on 10y NOAA archive with
+   NDBC-buoy real-time heat content. Drops intensity MAE from 9 mph
+   to ~7.5 mph at 24h.
+4. **EVT/POT** for Cat-5 tail pricing (extreme brackets).
+5. Regime-switch **HMM** over weakening/strengthening/steady-state for
+   the storm's current intensity phase.
 
-```
-p_fair = P[ BTC_spot(T) ∈ [lo, hi) | BTC_spot(now), σ, time_to_T ]
-```
+**Why the edge exists.** NHC's cone is the 67th-percentile envelope
+by construction — tails are structurally under-weighted by retail
+reading the cone. NHC reprices on 3-hour advisory cadence (2-hour near
+landfall); models reprice on 6-hour model cadence; realized-observation
+signal (SST, METAR near the target coast) is continuous. The gap
+between these three cadences is the edge.
 
-Use a calibrated Black-Scholes-style log-normal evaluator with σ fit from
-Coinbase trailing realized vol. The model is deliberately *simple*; the
-edge isn't cleverness, it's speed-of-reaction relative to Kalshi retail.
+**Entry.** Same gates as weather-calibrated (fee-aware floor,
+Lyapunov-horizon adapted to hurricane predictability), plus:
+- Only emit signals during active NHC advisories (AL or EP basin).
+- Skip when HMM state is "uncertain" (transition probabilities
+  within 15 pp of each other).
 
-**Entry / Exit / Caveats.** Inherited nearly verbatim from `arbhunter` —
-see `internal/signal/btchourly` docstring in Phase 1 for the full spec.
+**Seasonality.** Atlantic season June 1 – November 30. 6–12 tradable
+storms per year historically. Off-season is used for backtest /
+calibration work against the 2020–2025 archive.
 
 ## Execution doctrine
 

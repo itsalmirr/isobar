@@ -23,17 +23,21 @@
 
 ---
 
-## Phase 0 — Data collection *(current)*
+## Phase 0 — Data collection *(current, scope reduced)*
 
-**Goal.** Record synchronized market data from three sources for ≥48h so
-Phase 0.5 can measure edges empirically instead of estimating them from vibes.
+**Goal.** Record synchronized market data from two sources (Kalshi WS +
+Open-Meteo REST) so Phase 0.5 can measure edges empirically.
+
+*Scope note:* the Coinbase WS source was removed after research
+determined BTC-hourly lead-lag is dead alpha at REST-from-cloud
+latency (see `docs/research/SYNTHESIS.md`).
 
 **Deliverables.**
 - [x] `cmd/tape` orchestrator with one goroutine per source.
 - [x] Crash-safe rotating JSONL journal (`internal/journal`).
 - [x] Kalshi REST client + authenticated WS subscriber.
-- [x] Coinbase public WS subscriber.
-- [x] Open-Meteo ensemble REST poller.
+- [x] Open-Meteo ensemble REST poller (GEFS).
+- [ ] Open-Meteo ECMWF endpoint added (51-member IFS blend).
 - [x] Paired (wall, monotonic) timestamping for cross-source alignment.
 - [ ] Continuous 48h recording with ≤0.1% dropped frames per source.
 
@@ -53,28 +57,40 @@ Phase 0.5 can measure edges empirically instead of estimating them from vibes.
 
 ## Phase 0.5 — Decision-gate report
 
-**Goal.** Answer one question in writing: *do tradeable edges exist on
-weather brackets, on BTC contracts, both, or neither?* Nothing else matters
-until this is answered.
+**Goal.** Produce a written decision-gate report proving that at least
+one **calibrated** signal survives real fees on real data.
 
 **Deliverables.**
-- `cmd/analyze` binary that replays a recording directory and emits a
-  Markdown report.
-- `internal/replay`: streaming JSONL reader that reconstructs per-market
-  orderbook state from `orderbook_delta` frames.
-- `internal/edge`: edge calculators —
-  - *Weather brackets:* ensemble-derived probability vs. market mid, for
-    every `KXHIGH*`/`KXLOW*` bracket, every time the ensemble refreshes.
-  - *BTC hourly:* Coinbase spot vs. Kalshi `KXBTCD` mid, computing
-    simulated maker PnL with Kalshi's fee schedule applied.
-- Lead-lag histograms (Coinbase → Kalshi) and (Open-Meteo → Kalshi).
+- `cmd/calibrate` — fits NGR/EMOS per (station, season, lead) bin on
+  ≥2 years of paired GEFS + ECMWF archive vs NWS-CLI. Writes
+  reliability diagrams and Brier-skill vs market-implied to
+  `reports/calibration/<station>/`.
+- `internal/calibration/` — NGR, conformal intervals, EVT/POT,
+  T−3h Bayesian update, Lyapunov-horizon gate.
+- `cmd/analyze` — replays recordings, reconstructs orderbook from
+  `orderbook_delta`, computes per-signal edge counts with
+  **fee-aware edge floor** (`edge > 0.07·2P(1-P) + 1¢` per side),
+  simulated maker PnL, lead-lag distributions.
+- `internal/signal/weather` implementation using the full calibration
+  pipeline.
+- `internal/signal/hurricane` implementation (W6–8 of the 12-week plan,
+  timed for June 1 season start).
 
 **Exit criteria (the decision gate).**
-> `>10 brackets/day with >8% edge after fees` on **at least one** strategy.
 
-If **both** strategies pass, Phase 1 builds both behind a shared `Signal`
-interface. If **one** passes, build only that one. If **neither** passes,
-stop — record the negative result and move on.
+Hard gate to Phase 1:
+> `>10 events/day with >5% calibrated edge after fees` on **at least one**
+> signal, AND calibrated Brier-skill > market-implied on held-out
+> 90-day OOS data.
+
+Signal-specific kill gates:
+- **weather-calibrated:** calibrated Brier must beat market-implied on
+  OOS; reliability diagram within ±5 pp of diagonal.
+- **hurricane-landfall:** on 2020–2025 season replay, model must beat
+  NHC cone by ≥5% Brier on landfall-zone brackets.
+
+If **neither** passes, stop — record the negative result in
+`docs/decisions/` and reconsider.
 
 **Artifacts that must exist before sign-off.**
 - `reports/phase0.5/<date>/report.md` — narrative + charts.
