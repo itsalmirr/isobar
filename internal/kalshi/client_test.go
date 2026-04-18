@@ -7,9 +7,14 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -201,4 +206,76 @@ func TestSignerAuthHeaders(t *testing.T) {
 	require.Equal(t, keyID, key)
 	require.NotEmpty(t, sig)
 	require.NotEmpty(t, ts)
+}
+
+func TestDiscoverOpenTickersPaginatesAndDedupes(t *testing.T) {
+	// Three pages with a duplicate ticker across pages and one non-prefix
+	// market that must be filtered out.
+	pages := []getMarketsResponse{
+		{Markets: []Market{{Ticker: "KXHIGHNY-APR18-T75"}, {Ticker: "KXHIGHNY-APR18-T80"}}, Cursor: "p2"},
+		{Markets: []Market{{Ticker: "KXHIGHNY-APR18-T80"}, {Ticker: "OTHER-MARKET"}, {Ticker: "KXHIGHNY-APR18-T85"}}, Cursor: "p3"},
+		{Markets: []Market{{Ticker: "KXHIGHNY-APR19-T75"}}, Cursor: ""},
+	}
+	var idx atomic.Int32
+
+	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/markets", r.URL.Path)
+		require.Equal(t, "KXHIGHNY", r.URL.Query().Get("series_ticker"))
+		require.Equal(t, "open", r.URL.Query().Get("status"))
+		i := int(idx.Add(1)) - 1
+		require.Less(t, i, len(pages))
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(pages[i]))
+	}))
+
+	got, err := c.DiscoverOpenTickers(context.Background(), []string{"KXHIGHNY"}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	require.NoError(t, err)
+	require.Equal(t, []string{
+		"KXHIGHNY-APR18-T75",
+		"KXHIGHNY-APR18-T80",
+		"KXHIGHNY-APR18-T85",
+		"KXHIGHNY-APR19-T75",
+	}, got)
+}
+
+func TestDiscoverOpenTickersHandlesEmptyPageWithCursor(t *testing.T) {
+	// Defensive: if the API returns cursor != "" but zero markets,
+	// DiscoverOpenTickers must break (not spin forever).
+	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(getMarketsResponse{
+			Markets: nil,
+			Cursor:  "still-has-cursor-but-no-data",
+		}))
+	}))
+	got, err := c.DiscoverOpenTickers(context.Background(), []string{"KXHIGHNY"}, nil)
+	require.NoError(t, err)
+	require.Empty(t, got)
+}
+
+func TestThrottleDoesNotSerializeCallers(t *testing.T) {
+	// If throttle held the mutex across its sleep, 4 concurrent callers
+	// would each wait 1s back-to-back. The fix reserves slots under the
+	// lock and sleeps outside, so total wall time is ~3s for 4 callers
+	// (first goes immediately, then 1s * 3 for the queue). We keep the
+	// assertion loose so it's not flaky: wall time must be substantially
+	// less than the buggy serialization worst case of ~4s.
+	c := &Client{minDelay: 1000 * time.Millisecond}
+
+	var wg sync.WaitGroup
+	start := time.Now()
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.throttle()
+		}()
+	}
+	wg.Wait()
+	elapsed := time.Since(start)
+
+	// Bug-case would be ~4s (each caller sleeps 1s in series). Fixed
+	// case is ~3s (one slot per second, reserved under the lock). Leave
+	// margin to keep the test reliable under CI load.
+	require.Less(t, elapsed, 3500*time.Millisecond, "throttle is serializing callers; lock is held during sleep")
 }

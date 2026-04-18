@@ -6,13 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
 	"github.com/coder/websocket"
+
+	"github.com/wh0o0pz/isobar/internal/retry"
 )
 
 // SubscriberOptions configures a WS subscriber.
@@ -64,34 +65,20 @@ func NewSubscriber(opts SubscriberOptions) *Subscriber {
 
 // Run connects, subscribes, and pumps frames until ctx is cancelled.
 // Returns nil on clean cancellation; otherwise the last error after
-// exhausting MaxAttempts (when set).
+// exhausting MaxAttempts (when set). Reconnect/backoff is delegated
+// to internal/retry so every WS-ish consumer behaves identically.
 func (s *Subscriber) Run(ctx context.Context) error {
-	backoff := s.opts.Reconnect.InitialBackoff
-	attempt := 0
-	for {
-		if ctx.Err() != nil {
-			return nil
-		}
-		err := s.runOnce(ctx)
-		if err == nil || ctx.Err() != nil {
-			return nil
-		}
-		attempt++
-		if s.opts.Reconnect.MaxAttempts > 0 && attempt >= s.opts.Reconnect.MaxAttempts {
-			return fmt.Errorf("kalshi-ws: max reconnect attempts exceeded: %w", err)
-		}
-		wait := jitter(backoff)
-		s.logger.Warn("ws disconnected; reconnecting", "err", err, "wait", wait, "attempt", attempt)
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-time.After(wait):
-		}
-		backoff *= 2
-		if backoff > s.opts.Reconnect.MaxBackoff {
-			backoff = s.opts.Reconnect.MaxBackoff
-		}
+	err := retry.Do(ctx, retry.Config{
+		InitialBackoff: s.opts.Reconnect.InitialBackoff,
+		MaxBackoff:     s.opts.Reconnect.MaxBackoff,
+		MaxAttempts:    s.opts.Reconnect.MaxAttempts,
+	}, s.logger, func(int) error {
+		return s.runOnce(ctx)
+	})
+	if err != nil {
+		return fmt.Errorf("kalshi-ws: %w", err)
 	}
+	return nil
 }
 
 func (s *Subscriber) runOnce(ctx context.Context) error {
@@ -174,12 +161,4 @@ func HandshakeHeaders(signer *Signer, wsURL string) (http.Header, error) {
 	h.Set("KALSHI-ACCESS-SIGNATURE", sig)
 	h.Set("KALSHI-ACCESS-TIMESTAMP", ts)
 	return h, nil
-}
-
-// jitter returns d plus uniform random jitter up to d/4.
-func jitter(d time.Duration) time.Duration {
-	if d <= 0 {
-		return 0
-	}
-	return d + time.Duration(rand.Int64N(int64(d/4)+1))
 }

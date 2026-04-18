@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -54,15 +56,25 @@ func (c *Client) ResetRateLimit() {
 	c.rateMu.Unlock()
 }
 
-// throttle enforces minimum delay between API calls.
+// throttle enforces a minimum gap between API calls. It computes the
+// required delay under the mutex, reserves the next slot by advancing
+// lastCall, then releases the lock BEFORE sleeping so concurrent
+// callers can queue their own slots instead of serializing on the
+// sleep. Without this correction, N concurrent callers would wait
+// N*minDelay total even though the rate limit is per-process.
 func (c *Client) throttle() {
 	c.rateMu.Lock()
-	defer c.rateMu.Unlock()
-	elapsed := time.Since(c.lastCall)
-	if elapsed < c.minDelay {
-		time.Sleep(c.minDelay - elapsed)
+	now := time.Now()
+	gap := c.minDelay - now.Sub(c.lastCall)
+	if gap < 0 {
+		gap = 0
 	}
-	c.lastCall = time.Now()
+	// Reserve our slot at now+gap; subsequent callers will queue past us.
+	c.lastCall = now.Add(gap)
+	c.rateMu.Unlock()
+	if gap > 0 {
+		time.Sleep(gap)
+	}
 }
 
 // --- Market Data ---
@@ -97,6 +109,66 @@ func (c *Client) GetMarketsPage(ctx context.Context, params map[string]string) (
 		return nil, "", err
 	}
 	return resp.Markets, resp.Cursor, nil
+}
+
+// DiscoverOpenTickers enumerates open market tickers for the given series
+// prefixes. It paginates GET /markets for each series, deduplicates
+// across pages, and filters to tickers that actually begin with the
+// series prefix (the API occasionally returns near-matches).
+//
+// A small inter-page pause keeps the call friendly to the API; the
+// context bounds total wall time. A non-nil logger emits one Debug
+// per series with the running total.
+func (c *Client) DiscoverOpenTickers(ctx context.Context, series []string, logger *slog.Logger) ([]string, error) {
+	const (
+		pageSize      = "200"
+		interPagePace = 50 * time.Millisecond
+	)
+	seen := map[string]struct{}{}
+	var out []string
+
+	for _, s := range series {
+		params := map[string]string{
+			"series_ticker": s,
+			"status":        "open",
+			"limit":         pageSize,
+		}
+		cursor := ""
+		for {
+			if cursor != "" {
+				params["cursor"] = cursor
+			}
+			markets, next, err := c.GetMarketsPage(ctx, params)
+			if err != nil {
+				return nil, fmt.Errorf("series %s: %w", s, err)
+			}
+			for _, m := range markets {
+				if !strings.HasPrefix(m.Ticker, s) {
+					continue
+				}
+				if _, dup := seen[m.Ticker]; dup {
+					continue
+				}
+				seen[m.Ticker] = struct{}{}
+				out = append(out, m.Ticker)
+			}
+			// Guard against API returning a non-empty cursor with no markets:
+			// would spin forever. One empty page is enough to declare "done".
+			if next == "" || len(markets) == 0 {
+				break
+			}
+			cursor = next
+			select {
+			case <-ctx.Done():
+				return out, ctx.Err()
+			case <-time.After(interPagePace):
+			}
+		}
+		if logger != nil {
+			logger.Debug("kalshi: series enumerated", "series", s, "running_total", len(out))
+		}
+	}
+	return out, nil
 }
 
 // GetEvents lists events with optional filters.
@@ -346,7 +418,10 @@ func (c *Client) sign(req *http.Request, path string) error {
 	return nil
 }
 
-const maxRetries = 5
+const (
+	maxRetries       = 5
+	maxAdaptiveDelay = 2 * time.Second
+)
 
 func (c *Client) doRaw(req *http.Request) ([]byte, error) {
 	req.Header.Set("Accept", "application/json")
@@ -387,14 +462,20 @@ func (c *Client) doRaw(req *http.Request) ([]byte, error) {
 		}
 
 		if resp.StatusCode == 429 && attempt < maxRetries {
-			// Adaptively slow down on rate limits.
+			// Adaptively slow down on rate limits, capped at MaxAdaptiveDelay
+			// so a flaky API doesn't compound into minute-long gaps.
 			c.rateMu.Lock()
-			if c.minDelay < 2*time.Second {
-				c.minDelay = c.minDelay * 2
+			if c.minDelay < maxAdaptiveDelay {
+				c.minDelay *= 2
+				if c.minDelay > maxAdaptiveDelay {
+					c.minDelay = maxAdaptiveDelay
+				}
 			}
 			c.rateMu.Unlock()
 
-			backoff := time.Duration(math.Pow(2, float64(attempt+1))) * time.Second
+			// 2^(attempt+1) seconds; bit-shift avoids the float64 allocation
+			// of math.Pow for small integers.
+			backoff := time.Duration(1<<uint(attempt+1)) * time.Second
 			select {
 			case <-req.Context().Done():
 				return nil, req.Context().Err()
