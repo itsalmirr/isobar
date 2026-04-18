@@ -1,0 +1,80 @@
+# isobar Phase 0 recorder config.
+# Copy to config/config.yaml and edit. Env vars (ISOBAR_*) override these.
+
+# Where journals are written. One subdir per source.
+data_dir: ./data
+
+# Per-source journal tuning. Trade durability vs throughput here.
+journal:
+  # Rotate to a new file when this size or age is hit (whichever first).
+  max_file_bytes: 268435456     # 256 MiB
+  max_file_age:   1h
+  # Flush + fsync cadence. Smaller = less data loss on crash, more syscalls.
+  flush_every:    250ms
+  # Buffered channel between WS receiver and writer goroutine.
+  # Sized for ~2s of bursty Kalshi orderbook traffic; if full, we drop and
+  # log at warn (recorder, not trader — never block the producer).
+  queue_size:     16384
+  # If true, gzip the file when rotating. Saves 5-10x on disk.
+  compress_on_rotate: true
+
+# --- Sources ---------------------------------------------------------------
+
+kalshi:
+  enabled: true
+  api_base: https://api.elections.kalshi.com/trade-api/v2
+  ws_url:   wss://api.elections.kalshi.com/trade-api/ws/v2
+  # Series prefixes to subscribe to. KXBTCD = hourly BTC; KXHIGH*/KXLOW* = weather.
+  series:
+    - KXBTCD
+    - KXHIGHNY     # NYC daily high
+    - KXHIGHMIA    # Miami daily high
+    - KXHIGHLAX    # LA daily high
+    - KXHIGHCHI    # Chicago daily high
+    - KXLOWNY
+    - KXLOWMIA
+    - KXLOWLAX
+    - KXLOWCHI
+  # Channels to subscribe to per market.
+  channels:
+    - orderbook_delta
+    - ticker_v2
+    - trade
+  # WS reconnect tuning.
+  reconnect:
+    initial_backoff: 500ms
+    max_backoff:     30s
+    max_attempts:    0           # 0 = retry forever
+
+coinbase:
+  enabled: true
+  ws_url: wss://ws-feed.exchange.coinbase.com
+  product_ids:
+    - BTC-USD
+  channels:
+    - ticker
+    - matches
+  reconnect:
+    initial_backoff: 500ms
+    max_backoff:     30s
+
+openmeteo:
+  enabled: true
+  base_url: https://ensemble-api.open-meteo.com/v1/ensemble
+  # GFS gives 31 ensemble members — exactly what we want for tail-bracket pricing.
+  model: gfs_seamless
+  # Poll cadence. GFS publishes new runs every 6h, but member fields update
+  # within the run; 30m polling is enough to catch refreshes without abuse.
+  poll_interval: 30m
+  # Locations correspond 1:1 with Kalshi weather series above.
+  locations:
+    - { name: NY,  series: [KXHIGHNY,  KXLOWNY],  lat: 40.7794, lon: -73.9692 }   # Central Park
+    - { name: MIA, series: [KXHIGHMIA, KXLOWMIA], lat: 25.7617, lon: -80.1918 }   # Miami Intl
+    - { name: LAX, series: [KXHIGHLAX, KXLOWLAX], lat: 33.9416, lon: -118.4085 }  # LAX
+    - { name: CHI, series: [KXHIGHCHI, KXLOWCHI], lat: 41.9742, lon: -87.9073 }   # ORD
+  variables:
+    - temperature_2m
+    - temperature_2m_max
+    - temperature_2m_min
+    - precipitation
+  forecast_days: 3

@@ -1,0 +1,47 @@
+# Strict-but-not-noisy linter config. Tuned for a small team that wants
+# real signal: correctness, concurrency, and resource safety bugs.
+version: "2"
+
+run:
+  timeout: 3m
+  tests: true
+
+linters:
+  default: none
+  enable:
+    - errcheck         # unchecked errors
+    - govet            # core go vet checks (includes shadow, copylocks)
+    - ineffassign      # ineffectual assignments
+    - staticcheck      # SA*, ST*, S* — single most useful linter
+    - unused           # dead code
+    - bodyclose        # http.Response.Body close
+    - contextcheck     # context propagation
+    - errorlint        # %w wrapping, errors.Is/As correctness
+    - gosec            # security issues (G-codes)
+    - misspell         # typos in comments/strings
+    - nilerr           # return nil after non-nil err
+    - rowserrcheck     # database/sql Rows.Err
+    - sqlclosecheck    # close db rows/stmt
+    - unconvert        # redundant type conversions
+    - wastedassign
+
+  settings:
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment   # noisy on small structs; revisit if profiling shows cache misses
+    gosec:
+      excludes:
+        - G404   # math/rand is fine for jitter
+    errcheck:
+      exclude-functions:
+        - (io.Closer).Close   # we close in defers; explicit is overkill
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
