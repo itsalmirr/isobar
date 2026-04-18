@@ -81,3 +81,14 @@ Recorded data lands under `./data/<source>/<YYYY-MM-DD>/<source>-<hour>.jsonl`.
 - **Phase 1**: live bot — strategy modules behind a common `Signal` interface, maker-only execution, warm-start via SQLite WAL
 - **Phase 2**: paper-trade with realistic fill sim (queue position, adverse selection)
 - **Phase 3**: live $50 → $200 after gate clears
+
+Full detail — exit criteria per phase, risk controls, test strategy — is
+in [`docs/`](./docs/README.md):
+
+- [Roadmap](./docs/ROADMAP.md) — phase-by-phase with explicit gates
+- [Strategy](./docs/STRATEGY.md) — edge thesis and execution doctrine
+- [Architecture](./docs/ARCHITECTURE.md) — package layout and invariants
+- [Testing](./docs/TESTING.md) — rules, coverage floors, CI expectations
+- [Operations](./docs/OPERATIONS.md) — runbook and troubleshooting
+- [Risk](./docs/RISK.md) — the L0–L4 control hierarchy
+- [Glossary](./docs/GLOSSARY.md) — terms, defined once
