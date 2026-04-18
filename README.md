@@ -112,3 +112,8 @@ in [`docs/`](./docs/README.md):
 - [Operations](./docs/OPERATIONS.md) — runbook and troubleshooting
 - [Risk](./docs/RISK.md) — the L0–L4 control hierarchy
 - [Glossary](./docs/GLOSSARY.md) — terms, defined once
+- [Research](./docs/research/) — 8 agent reports + [SYNTHESIS.md](./docs/research/SYNTHESIS.md) decision doc
+- [Decisions](./docs/decisions/) — Architecture Decision Records (ADRs)
+
+Running log of every change: [CHANGELOG.md](./CHANGELOG.md).
+PR + commit conventions: [CONTRIBUTING.md](./CONTRIBUTING.md).
