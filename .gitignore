@@ -1,0 +1,40 @@
+# Binaries
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Recorded data — never commit market data or analysis output
+/data/
+/var/
+*.jsonl
+*.jsonl.gz
+
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Local config overrides
+config/config.yaml
+config/config.local.yaml
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Profiles
+*.pprof
+cpu.prof
+mem.prof
+trace.out
+
+# Coverage
+coverage.out
+coverage.html
