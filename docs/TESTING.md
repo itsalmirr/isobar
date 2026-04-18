@@ -39,9 +39,8 @@
    pre-commit hook can run it without friction. Slow tests gate behind
    `testing.Short()`.
 6. **No test reaches the real network.** Any test that talks to
-   `api.kalshi.com`, `ws-feed.exchange.coinbase.com`, or
-   `ensemble-api.open-meteo.com` fails CI by design — mock the server with
-   `httptest` / `websocket.Accept`.
+   `api.kalshi.com` or `ensemble-api.open-meteo.com` fails CI by design
+   — mock the server with `httptest` / `websocket.Accept`.
 7. **Secrets never leak.** RSA keys used in tests are freshly generated
    with `rsa.GenerateKey(rand.Reader, 2048)` in the test helper. No
    checked-in PEMs, not even "obviously throwaway" ones.
@@ -60,7 +59,6 @@
 | `internal/config`      | 95%                  | Every `Validate` branch.           |
 | `internal/journal`     | 90%                  | Rotation, drop, roundtrip, shutdown.|
 | `internal/kalshi`      | 85%                  | All REST verbs + signer + ws subscribe msg. |
-| `internal/coinbase`    | 80%                  | Subscribe msg shape, reconnect.    |
 | `internal/openmeteo`   | 85%                  | URL build + error propagation.     |
 
 Coverage is a floor, not a ceiling, and not a substitute for
@@ -175,9 +173,9 @@ go test -race -count=100 -run TestJournalRotatesOnSize ./internal/journal
 
 ## Known non-goals
 
-- **We do not test the real Kalshi/Coinbase/Open-Meteo APIs from CI.**
-  They change, they rate-limit, and they'd block developers without
-  secrets. Manual smoke tests happen in staging with a `-dry-run` flag.
+- **We do not test the real Kalshi/Open-Meteo APIs from CI.** They
+  change, they rate-limit, and they'd block developers without secrets.
+  Manual smoke tests happen in staging with a `-dry-run` flag.
 - **We do not test `main` directly.** `cmd/tape/main.go` is a 50-line
   wiring file — its behavior is covered by the integration tests of the
   packages it wires.

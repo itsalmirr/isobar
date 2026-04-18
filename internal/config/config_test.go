@@ -40,7 +40,6 @@ func TestLoadNoPathWithAllDisabledUsesDefaults(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "./data", cfg.DataDir)
 	require.False(t, cfg.Kalshi.Enabled)
-	require.False(t, cfg.Coinbase.Enabled)
 	require.False(t, cfg.OpenMeteo.Enabled)
 }
 
@@ -67,12 +66,6 @@ kalshi:
   series: [KXHIGHNY]
   channels: [ticker_v2]
 
-coinbase:
-  enabled: true
-  ws_url: wss://coinbase.example/ws
-  product_ids: [BTC-USD]
-  channels: [ticker]
-
 openmeteo:
   enabled: true
   base_url: https://weather.example
@@ -92,8 +85,6 @@ openmeteo:
 	require.Equal(t, []string{"KXHIGHNY"}, cfg.Kalshi.Series)
 	require.Equal(t, "abc-12345678", cfg.Kalshi.APIKeyID)
 	require.Equal(t, "/tmp/fake.pem", cfg.Kalshi.PrivateKeyPath)
-	require.True(t, cfg.Coinbase.Enabled)
-	require.Equal(t, []string{"BTC-USD"}, cfg.Coinbase.ProductIDs)
 	require.True(t, cfg.OpenMeteo.Enabled)
 	require.Equal(t, 5*time.Minute, cfg.OpenMeteo.PollInterval)
 }
@@ -200,19 +191,6 @@ func TestValidateKalshiAcceptsFullConfig(t *testing.T) {
 	c.Kalshi.Series = []string{"KXHIGHNY"}
 	c.Kalshi.Channels = []string{"ticker_v2"}
 	require.NoError(t, c.Validate())
-}
-
-func TestValidateCoinbase(t *testing.T) {
-	c := Defaults()
-	c.Coinbase.Enabled = true
-	c.Coinbase.WSURL = "wss://cb/ws"
-	require.ErrorContains(t, c.Validate(), "product_ids")
-
-	c.Coinbase.ProductIDs = []string{"BTC-USD"}
-	require.NoError(t, c.Validate())
-
-	c.Coinbase.WSURL = ""
-	require.ErrorContains(t, c.Validate(), "ws_url")
 }
 
 func TestValidateOpenMeteo(t *testing.T) {

@@ -23,7 +23,6 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/wh0o0pz/isobar/internal/clock"
-	"github.com/wh0o0pz/isobar/internal/coinbase"
 	"github.com/wh0o0pz/isobar/internal/config"
 	"github.com/wh0o0pz/isobar/internal/env"
 	"github.com/wh0o0pz/isobar/internal/journal"
@@ -79,9 +78,6 @@ func run(ctx context.Context, logger *slog.Logger, cfg config.Config) error {
 	if cfg.Kalshi.Enabled {
 		g.Go(func() error { return startKalshi(ctx, logger, cfg) })
 	}
-	if cfg.Coinbase.Enabled {
-		g.Go(func() error { return startCoinbase(ctx, logger, cfg) })
-	}
 	if cfg.OpenMeteo.Enabled {
 		g.Go(func() error { return startOpenMeteo(ctx, logger, cfg) })
 	}
@@ -127,26 +123,6 @@ func startKalshi(ctx context.Context, logger *slog.Logger, cfg config.Config) er
 		},
 		Logger:  logger,
 		OnFrame: makeWSFrameHandler(jrn, "kalshi"),
-	})
-	return sub.Run(ctx)
-}
-
-func startCoinbase(ctx context.Context, logger *slog.Logger, cfg config.Config) error {
-	jrn, err := openJournal(cfg, "coinbase", logger)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = jrn.Close() }()
-
-	sub := coinbase.NewSubscriber(coinbase.Options{
-		WSURL:          cfg.Coinbase.WSURL,
-		ProductIDs:     cfg.Coinbase.ProductIDs,
-		Channels:       cfg.Coinbase.Channels,
-		InitialBackoff: cfg.Coinbase.Reconnect.InitialBackoff,
-		MaxBackoff:     cfg.Coinbase.Reconnect.MaxBackoff,
-		MaxAttempts:    cfg.Coinbase.Reconnect.MaxAttempts,
-		Logger:         logger,
-		OnFrame:        makeWSFrameHandler(jrn, "coinbase"),
 	})
 	return sub.Run(ctx)
 }

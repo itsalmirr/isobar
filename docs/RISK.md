@@ -52,6 +52,13 @@ risk:
   max_per_series_notional_dollars: 25
   max_portfolio_notional_dollars: 50
   max_order_contracts: 100
+  # Fee-aware edge floor: the minimum calibrated edge needed to justify
+  # a trade scales with bracket mid-price because Kalshi fees peak at 50c.
+  # Implementation: edge > 0.07 * 2 * P * (1-P) + 1c per side.
+  fee_aware_edge_floor: true
+  # Lyapunov horizon: forecast error doubles every ~5 days on a single
+  # station. Past 8 days, no calibration rescues the signal.
+  max_lead_time_days: 8
 ```
 
 **Invariants.**
@@ -61,6 +68,15 @@ risk:
    exposure — a resting order counts.
 3. If any cap would be exceeded, the order is skipped with a warn log
    (not an error — caps are expected to bite).
+4. **Sizing uses Kelly with the mutually-exclusive-bracket correlation
+   correction** `ρ_ij = −1/(K−1)` for a K-bracket set. Standard Kelly
+   over-sizes on correlated bets; this correction is mandatory for
+   any KXHIGH/KXLOW/KXHURRICANE portfolio. Allocate fractional
+   Kelly (0.5×).
+5. **Reservation price / half-spread use bounded-payoff σ:**
+   `σ²_bin(P) = P(1−P)/√t_days`. Naive σ = P(1-P) over-estimates
+   volatility away from expiry and under-estimates at expiry; same γ
+   across all maturities = systematically wrong sizing.
 
 **Enforcement point.** `internal/risk.Gate(ctx, order, state) error`.
 Called by `cmd/bot` between signal emission and exec submission.
@@ -102,9 +118,10 @@ cleans up or halts; never silently proceeds.
 - For `weather`: ensemble response has N members matching the
   expected count (N = 31 for GFS); if N differs, log and skip the
   signal for this refresh.
-- For `btc-hourly`: Coinbase spot is within ±2× trailing 1h σ — a
-  spike of >2σ triggers the signal to pause until mean-reversion or
-  a sustained break confirms.
+- For `hurricane-landfall`: only emit during active NHC advisories
+  (AL or EP basin); skip when regime-switching HMM posterior over
+  {weakening, strengthening, steady} is within 15 pp of uniform
+  (i.e., "uncertain" state).
 
 **Enforcement point.** Baked into each `Signal.Tick` prologue.
 Centralized precondition checks in `internal/signal/guard.go`.

@@ -97,9 +97,11 @@ interval measurements only.
 **Stamp.** A `(Wall, Mono)` pair sampled from a single `time.Now()` call.
 Defined in `internal/clock`.
 
-**Lead-lag.** The distribution of `(t_kalshi - t_coinbase)` for paired
-events (a Coinbase print and the resulting Kalshi reprice). Positive
-values mean Kalshi lags, which is the typical edge-direction.
+**Lead-lag.** The distribution of `(t_kalshi_reprice - t_signal_input)`
+for paired events (e.g. an Open-Meteo ensemble refresh and the resulting
+Kalshi reprice). Positive values mean Kalshi lags, which is the typical
+edge-direction. For BTC the lead compressed to sub-second after
+Coinbase's Kalshi integration in Jan 2026 — that signal is dead.
 
 **Staleness.** Elapsed wall time since the most recent frame for a
 given market. A precondition cap is enforced before signal emission
