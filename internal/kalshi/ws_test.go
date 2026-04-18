@@ -219,7 +219,7 @@ func TestKalshiWSMaxAttemptsReturnsError(t *testing.T) {
 	defer cancel()
 	err = sub.Run(ctx)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "max reconnect attempts")
+	require.Contains(t, err.Error(), "max attempts")
 }
 
 func TestSubscriberDefaultOnFrameIsSafe(t *testing.T) {
@@ -229,16 +229,6 @@ func TestSubscriberDefaultOnFrameIsSafe(t *testing.T) {
 	require.NotNil(t, s)
 	// Touch the default OnFrame to prove it's non-nil and non-panicking.
 	s.opts.OnFrame([]byte("ok"))
-}
-
-func TestJitterWithinBounds(t *testing.T) {
-	// jitter(d) returns d + rand[0, d/4]; so d ≤ result ≤ d + d/4.
-	for i := 0; i < 1000; i++ {
-		out := jitter(100 * time.Millisecond)
-		require.GreaterOrEqual(t, out, 100*time.Millisecond)
-		require.LessOrEqual(t, out, 125*time.Millisecond)
-	}
-	require.Equal(t, time.Duration(0), jitter(0))
 }
 
 // Ensure using the subscriber type plus its internal fields doesn't

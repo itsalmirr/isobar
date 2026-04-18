@@ -46,18 +46,6 @@ kalshi:
     max_backoff:     30s
     max_attempts:    0           # 0 = retry forever
 
-coinbase:
-  enabled: true
-  ws_url: wss://ws-feed.exchange.coinbase.com
-  product_ids:
-    - BTC-USD
-  channels:
-    - ticker
-    - matches
-  reconnect:
-    initial_backoff: 500ms
-    max_backoff:     30s
-
 openmeteo:
   enabled: true
   base_url: https://ensemble-api.open-meteo.com/v1/ensemble

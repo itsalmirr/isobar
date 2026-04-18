@@ -19,7 +19,6 @@ type Config struct {
 	DataDir   string    `yaml:"data_dir"`
 	Journal   Journal   `yaml:"journal"`
 	Kalshi    Kalshi    `yaml:"kalshi"`
-	Coinbase  Coinbase  `yaml:"coinbase"`
 	OpenMeteo OpenMeteo `yaml:"openmeteo"`
 }
 
@@ -54,15 +53,6 @@ type Kalshi struct {
 	APIKeyID       string `yaml:"-"`
 	PrivateKey     string `yaml:"-"`
 	PrivateKeyPath string `yaml:"-"`
-}
-
-// Coinbase configures the Coinbase public market-data subscriber.
-type Coinbase struct {
-	Enabled    bool      `yaml:"enabled"`
-	WSURL      string    `yaml:"ws_url"`
-	ProductIDs []string  `yaml:"product_ids"`
-	Channels   []string  `yaml:"channels"`
-	Reconnect  Reconnect `yaml:"reconnect"`
 }
 
 // OpenMeteoLocation pairs a Kalshi series identifier set with NOAA grid coords.
@@ -100,13 +90,6 @@ func Defaults() Config {
 		Kalshi: Kalshi{
 			APIBase: "https://api.elections.kalshi.com/trade-api/v2",
 			WSURL:   "wss://api.elections.kalshi.com/trade-api/ws/v2",
-			Reconnect: Reconnect{
-				InitialBackoff: 500 * time.Millisecond,
-				MaxBackoff:     30 * time.Second,
-			},
-		},
-		Coinbase: Coinbase{
-			WSURL: "wss://ws-feed.exchange.coinbase.com",
 			Reconnect: Reconnect{
 				InitialBackoff: 500 * time.Millisecond,
 				MaxBackoff:     30 * time.Second,
@@ -200,15 +183,6 @@ func (c Config) Validate() error {
 		}
 		if len(c.Kalshi.Channels) == 0 {
 			return errors.New("config: kalshi.channels must list at least one channel")
-		}
-	}
-
-	if c.Coinbase.Enabled {
-		if c.Coinbase.WSURL == "" {
-			return errors.New("config: coinbase.ws_url required when coinbase.enabled")
-		}
-		if len(c.Coinbase.ProductIDs) == 0 {
-			return errors.New("config: coinbase.product_ids must list at least one product")
 		}
 	}
 

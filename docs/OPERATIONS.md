@@ -46,7 +46,7 @@ Checklist immediately after start (first 60s):
 - [ ] `isobar tape starting` log line with version/commit populated.
 - [ ] `kalshi: credentials loaded` with a redacted key prefix.
 - [ ] `kalshi: discovered markets` with `n > 0`.
-- [ ] `ws connected` for `kalshi` and (if enabled) `coinbase`.
+- [ ] `ws connected` for `kalshi`.
 - [ ] `journal opened` appears for each enabled source.
 
 If any of the above is missing after 60s, stop (`Ctrl-C`) and see §7.

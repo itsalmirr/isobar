@@ -26,32 +26,54 @@
 ```
 cmd/
   tape/                Phase 0 recorder (main.go today)
-  analyze/             Phase 0.5 replay + report (next)
-  bot/                 Phase 1+ live bot (later)
+  calibrate/           Phase 0.5 NGR fit + reliability plots (W2)
+  analyze/             Phase 0.5 replay + gate report (W10)
+  bot/                 Phase 1+ live bot (W11–12)
 
 internal/
   clock/               (Wall, Mono) stamp pair
-  coinbase/            Public WS subscriber
   config/              YAML + env overlay + validation
   env/                 Stdlib-only .env loader
   journal/             Append-only rotating JSONL writer
   kalshi/              REST client + signer + authenticated WS subscriber
   obs/                 slog JSON bootstrap
-  openmeteo/           GFS ensemble REST poller
+  openmeteo/           GFS + ECMWF ensemble REST poller
+  retry/               Context-aware exponential backoff with jitter
+  calibration/         NGR, conformal, EVT, T-3h Bayesian (W2–5)
+  nhc/                 NHC ATCF a-deck/b-deck advisory parser (W6)
+  hurricanemodel/      HAFS/HWRF + NDBC SST (W7–8)
+  microstructure/      Reservation price, half-spread, OFI, CUSUM (W9)
+  risk/                L0–L4 pre/post-trade controls (W9)
+  signal/              Signal interface + weather + hurricane (W5, W8)
+  busevents/           In-process pub/sub for dashboard (W11)
+  dashboard/           SSE + htmx server (W11)
+  controlstore/        modernc.org/sqlite WAL for control plane (W11)
+  state/               Warm-start + reconciliation (W12)
+  exec/                Paper + Kalshi exec adapters (W11–12)
 
 config/
   config.example.yaml  Canonical example; copy to config.yaml
+
+web/
+  templates/           html/template fragments (W11)
+  static/              htmx, lightweight-charts vendored (W11)
+
+docs/
+  research/            8 research reports + SYNTHESIS.md
 ```
+
+*Historical note:* `internal/coinbase` (public Coinbase WS subscriber)
+was removed in W1. BTC-hourly lead-lag is dead alpha at
+REST-from-cloud latency after Coinbase's Kalshi integration (Jan 2026).
 
 ## Runtime shape (Phase 0)
 
 ```
-  ┌────────────┐   ┌────────────┐   ┌────────────────┐
-  │ kalshi.WS  │   │coinbase.WS │   │ openmeteo.REST │
-  └─────┬──────┘   └─────┬──────┘   └────────┬───────┘
-        │                │                   │
-        │ OnFrame(raw)   │ OnFrame(raw)      │ OnFetch(loc, raw)
-        ▼                ▼                   ▼
+  ┌────────────┐              ┌────────────────┐
+  │ kalshi.WS  │              │ openmeteo.REST │
+  └─────┬──────┘              └────────┬───────┘
+        │ OnFrame(raw)                 │ OnFetch(loc, raw)
+        ▼                              ▼
    ┌──────────────────────────────────────────────┐
    │           journal.Journal (one per source)   │
    │   in <- envelope (copied) → writer goroutine │
@@ -103,7 +125,6 @@ produces a clean drain.
   - both `journal.max_file_bytes == 0` AND `max_file_age == 0`.
   - `kalshi.enabled` without an API key + PEM source.
   - `kalshi.enabled` with no series or no channels.
-  - `coinbase.enabled` with no product IDs.
   - `openmeteo.enabled` with `poll_interval < 1m`.
 
 ### `internal/env`
@@ -121,19 +142,35 @@ produces a clean drain.
   where `signature = RSASSA-PSS(SHA256, timestamp + method + path)`. The
   path must include Kalshi's API version prefix (e.g. `/trade-api/v2/...`).
 - `Client` applies a built-in min-delay rate limiter (1 req/s baseline)
-  and doubles the delay adaptively on HTTP 429 up to 2s. Call
-  `ResetRateLimit` after discovery to avoid dragging an inflated delay
-  into a polling loop.
-- `Client` retries on 429 up to `maxRetries=5` with exponential backoff;
-  non-2xx/non-429 are surfaced as `API error <status>: <body>`.
-- `Subscriber` is the WS counterpart: authenticated dial, subscribe to
-  configured channels + market tickers, forward raw frames via `OnFrame`.
-  Reconnects with jittered exponential backoff on any read error.
+  that reserves slots under the mutex and sleeps *outside* it — so
+  concurrent callers queue past each other instead of serializing on
+  the sleep. Adaptive slowdown on 429 is capped at `maxAdaptiveDelay`
+  (2 s) so a flaky API can't compound into minute-long gaps. Call
+  `ResetRateLimit` after discovery to drop the inflated delay before
+  polling.
+- `Client` retries on 429 up to `maxRetries=5` with bit-shift
+  exponential backoff; non-2xx/non-429 are surfaced as
+  `API error <status>: <body>`.
+- `Client.DiscoverOpenTickers(ctx, series, logger)` paginates
+  `GET /markets` for each series prefix, deduplicates, filters to
+  open markets matching the prefix. One call, reusable from any
+  caller — not reimplemented in `cmd/tape`.
+- `Subscriber` is the WS counterpart: authenticated dial, subscribe
+  to configured channels + market tickers, forward raw frames via
+  `OnFrame`. Reconnect/backoff is delegated to `internal/retry`.
 
-### `internal/coinbase`
+### `internal/retry`
 
-- Public feed, no credentials. Same lifecycle/reconnect contract as
-  Kalshi WS.
+- `Do(ctx, cfg, logger, fn)` is the single canonical reconnect/backoff
+  loop. Every WS-ish component and REST poller that needs to retry goes
+  through it. Zero values in `Config` degrade to sensible defaults
+  (500 ms initial, 30 s cap, unlimited attempts).
+- `Jitter(d)` returns `d + U[0, d/4]`; `Next(prev, max)` returns the
+  next doubled backoff capped at `max`. Callers that need a custom loop
+  (e.g. the Kalshi 429 handler) compose with these helpers instead of
+  reimplementing them.
+- Clean context cancellation always returns `nil` from `Do`; callers
+  don't have to tell "graceful shutdown" from "real failure".
 
 ### `internal/openmeteo`
 
@@ -173,17 +210,23 @@ produces a clean drain.
 
 ## Future (Phase 1+) shape
 
-Phase 1 adds three packages without altering the Phase 0 boundaries:
+Phase 1 adds these packages without altering the Phase 0 boundaries:
 
 ```
 internal/
   signal/              Signal interface + implementations
-    weather/           Ensemble-vs-bracket strategy
-    btchourly/         Coinbase-vs-KXBTCD strategy
+    weather/           Calibrated-ensemble-vs-bracket strategy
+    hurricane/         NHC advisory + HAFS/HWRF + NDBC SST strategy
+  calibration/         NGR, conformal, EVT, T-3h Bayesian update
+  nhc/                 NHC ATCF a-deck/b-deck advisory parser
+  hurricanemodel/      HAFS/HWRF fetch + NDBC SST feed
+  microstructure/      Reservation price, half-spread, OFI, CUSUM
+  risk/                Pre-trade caps + kill-switch + Kelly-with-ρ
   exec/                Exec interface + PaperExec + KalshiExec
-  state/               SQLite WAL warm-start
-  risk/                Pre-trade caps + kill-switch
-  paper/               Realistic fill simulator (Phase 2)
+  state/               SQLite WAL warm-start + reconciliation
+  busevents/           In-process pub/sub
+  dashboard/           SSE + htmx server
+  controlstore/        modernc.org/sqlite WAL control plane
 ```
 
 The `cmd/bot` entrypoint wires:

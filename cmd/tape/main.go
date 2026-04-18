@@ -1,9 +1,11 @@
 // Command tape is the Phase 0 market-data recorder.
 //
-// It runs one goroutine per enabled source (Kalshi WS, Coinbase WS,
-// Open-Meteo REST), each writing raw frames into a per-source append-only
-// JSONL journal under DataDir. SIGINT/SIGTERM trigger a graceful shutdown
-// that drains queues and fsyncs current files.
+// It runs one goroutine per enabled source (Kalshi WS, Open-Meteo REST),
+// each writing raw frames into a per-source append-only JSONL journal
+// under DataDir. SIGINT/SIGTERM trigger a graceful shutdown that drains
+// queues and fsyncs current files.
+//
+// BTC-hourly (Coinbase) was removed in W1 — see docs/research/SYNTHESIS.md.
 package main
 
 import (
@@ -16,14 +18,11 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"syscall"
-	"time"
 
 	"golang.org/x/sync/errgroup"
 
 	"github.com/wh0o0pz/isobar/internal/clock"
-	"github.com/wh0o0pz/isobar/internal/coinbase"
 	"github.com/wh0o0pz/isobar/internal/config"
 	"github.com/wh0o0pz/isobar/internal/env"
 	"github.com/wh0o0pz/isobar/internal/journal"
@@ -79,9 +78,6 @@ func run(ctx context.Context, logger *slog.Logger, cfg config.Config) error {
 	if cfg.Kalshi.Enabled {
 		g.Go(func() error { return startKalshi(ctx, logger, cfg) })
 	}
-	if cfg.Coinbase.Enabled {
-		g.Go(func() error { return startCoinbase(ctx, logger, cfg) })
-	}
 	if cfg.OpenMeteo.Enabled {
 		g.Go(func() error { return startOpenMeteo(ctx, logger, cfg) })
 	}
@@ -106,7 +102,7 @@ func startKalshi(ctx context.Context, logger *slog.Logger, cfg config.Config) er
 	defer func() { _ = jrn.Close() }()
 
 	rest := kalshi.NewClient(cfg.Kalshi.APIBase, signer)
-	tickers, err := discoverTickers(ctx, rest, cfg.Kalshi.Series, logger)
+	tickers, err := rest.DiscoverOpenTickers(ctx, cfg.Kalshi.Series, logger)
 	if err != nil {
 		return fmt.Errorf("kalshi: discover tickers: %w", err)
 	}
@@ -127,26 +123,6 @@ func startKalshi(ctx context.Context, logger *slog.Logger, cfg config.Config) er
 		},
 		Logger:  logger,
 		OnFrame: makeWSFrameHandler(jrn, "kalshi"),
-	})
-	return sub.Run(ctx)
-}
-
-func startCoinbase(ctx context.Context, logger *slog.Logger, cfg config.Config) error {
-	jrn, err := openJournal(cfg, "coinbase", logger)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = jrn.Close() }()
-
-	sub := coinbase.NewSubscriber(coinbase.Options{
-		WSURL:          cfg.Coinbase.WSURL,
-		ProductIDs:     cfg.Coinbase.ProductIDs,
-		Channels:       cfg.Coinbase.Channels,
-		InitialBackoff: cfg.Coinbase.Reconnect.InitialBackoff,
-		MaxBackoff:     cfg.Coinbase.Reconnect.MaxBackoff,
-		MaxAttempts:    cfg.Coinbase.Reconnect.MaxAttempts,
-		Logger:         logger,
-		OnFrame:        makeWSFrameHandler(jrn, "coinbase"),
 	})
 	return sub.Run(ctx)
 }
@@ -235,53 +211,4 @@ func redactKeyID(id string) string {
 		return id
 	}
 	return id[:8] + "…"
-}
-
-// discoverTickers walks each configured series prefix and collects open
-// market tickers via the REST list endpoint. The set of tickers is what
-// the WS subscriber will subscribe to (Kalshi WS requires explicit market
-// tickers; there's no series-prefix subscribe).
-func discoverTickers(ctx context.Context, c *kalshi.Client, series []string, logger *slog.Logger) ([]string, error) {
-	seen := map[string]struct{}{}
-	var out []string
-
-	for _, s := range series {
-		params := map[string]string{
-			"series_ticker": s,
-			"status":        "open",
-			"limit":         "200",
-		}
-		cursor := ""
-		for {
-			if cursor != "" {
-				params["cursor"] = cursor
-			}
-			markets, next, err := c.GetMarketsPage(ctx, params)
-			if err != nil {
-				return nil, fmt.Errorf("series %s: %w", s, err)
-			}
-			for _, m := range markets {
-				if !strings.HasPrefix(m.Ticker, s) {
-					continue
-				}
-				if _, dup := seen[m.Ticker]; dup {
-					continue
-				}
-				seen[m.Ticker] = struct{}{}
-				out = append(out, m.Ticker)
-			}
-			if next == "" {
-				break
-			}
-			cursor = next
-			// Light pause between pages to be friendly to the API.
-			select {
-			case <-ctx.Done():
-				return out, ctx.Err()
-			case <-time.After(50 * time.Millisecond):
-			}
-		}
-		logger.Debug("kalshi: series enumerated", "series", s, "running_total", len(out))
-	}
-	return out, nil
 }
