@@ -13,8 +13,18 @@ Section order within a release: `Added` · `Changed` · `Fixed` ·
 
 ## [Unreleased]
 
+### Added
+- `scripts/tape-health.sh` — smoke-test checker run after the first
+  ~1 hour of tape uptime. Inspects per-source file stats, freshness,
+  and log patterns (auth errors, dropped frames, reconnect storms).
+  Exits `0` = run 48h, `1` = fix first. Answers the "is this worth a
+  48-hour recording?" question with an exit code instead of vibes.
+- `scripts/README.md` with conventions.
+
 ### Docs
-- _(placeholder — next change lands here)_
+- `docs/OPERATIONS.md` §2.1 "Smoke-test your first run" — how to
+  use `tape-health.sh`, what passing/failing runs look like, the
+  48h decision criterion.
 
 ---
 

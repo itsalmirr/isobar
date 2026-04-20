@@ -51,6 +51,64 @@ Checklist immediately after start (first 60s):
 
 If any of the above is missing after 60s, stop (`Ctrl-C`) and see §7.
 
+## 2.1 Smoke-test your first run (1-hour gate)
+
+First time running the tape? Let it run for **~60 minutes**, then
+answer the question *"should I leave this going for 48 hours?"* with
+the health checker — not with vibes:
+
+```bash
+scripts/tape-health.sh
+# or with custom paths:
+scripts/tape-health.sh --data /srv/isobar/data --log /var/log/tape.log
+```
+
+The script exits `0` if the tape is healthy and `1` if something is
+off. It inspects:
+
+- **Per-source file stats.** Lines, size, newest-file age.
+  Freshness: Kalshi must touch a file within 5 min; Open-Meteo
+  within 35 min (30-min poll cadence + slack).
+- **Log patterns.** `error` / `warn` counts, dropped-frame events,
+  reconnect storms, auth errors (`API error 401`, `decode PEM`),
+  whether `ws connected` ever appeared.
+- **Verdict.** Ranked PASS/FAIL/WARN plus a one-line recommendation.
+
+### What a passing 1-hour run looks like
+
+- Kalshi: thousands of frames under `data/kalshi/<today>/`. Rate
+  varies with how many markets you subscribed to and the hour;
+  10–30 frames/min per market is typical on an active hour.
+- Open-Meteo: at least 1 file — maybe 2 — per configured location.
+- Log: one `ws connected` line, zero reconnects, zero dropped
+  frames, zero errors.
+- File sizes: kalshi 5–50 MB total; openmeteo 50–500 KB per location.
+
+### What a failing run looks like
+
+- `newest file > 5 min ago` on Kalshi → WS died silently. Check log
+  for `ws disconnected` and see §7.
+- `auth errors detected (N)` → PEM / API-key-ID mismatch or clock
+  drift. Run `timedatectl status` first, Kalshi dashboard second.
+- `0 frames from kalshi` → subscription never landed. Check series
+  prefixes in `config.yaml`; e.g. `KXHIGHNY` only resolves if there
+  are open NYC-high markets for the date range.
+- `log file missing` → you forgot to pipe to a file. Restart with
+  `| tee -a var/tape.log`. Data is still being written to disk, but
+  log-based checks will be disabled.
+
+### Should I run 48h?
+
+- Script exits `0` ⇒ **yes**, let it run overnight and re-check at
+  24h and 48h.
+- Script exits `1` ⇒ **no**. Fix the FAIL condition first. A 48-hour
+  recording with a silent WS outage is worse than no recording.
+
+Full 48h is what the ROADMAP wants for Phase 0.5. After that you can
+either stop and pivot to calibration / analysis work, or leave the
+tape running on a persistent host (cloud VM per ADR-0003 — deferred
+to W6) while calibration happens in parallel.
+
 ## 3. Healthy-steady-state signals
 
 Every 5 minutes a healthy recorder should show approximately:
