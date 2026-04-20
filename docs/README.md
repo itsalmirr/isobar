@@ -15,6 +15,8 @@ contract that explains *why* the code is what it is.
 | [OPERATIONS.md](./OPERATIONS.md)        | Runbook: start/stop, health signals, troubleshooting                  |
 | [RISK.md](./RISK.md)                    | The risk-control hierarchy (L0–L4)                                    |
 | [GLOSSARY.md](./GLOSSARY.md)            | Terms we use, defined once                                            |
+| [RESEARCH_PIPELINE.md](./RESEARCH_PIPELINE.md) | The Python ↔ Go boundary contract (ADR-0006 implementation)    |
+| [design/](./design/)                    | Pre-implementation design docs — lock APIs + test vectors before code |
 | [research/](./research/)                | Research reports (8) + `SYNTHESIS.md` decision doc                    |
 | [decisions/](./decisions/)              | Architecture Decision Records (ADRs) — why choices were made          |
 | [../CHANGELOG.md](../CHANGELOG.md)      | Running log of every behavior change                                  |

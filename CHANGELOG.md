@@ -20,11 +20,34 @@ Section order within a release: `Added` · `Changed` · `Fixed` ·
   Exits `0` = run 48h, `1` = fix first. Answers the "is this worth a
   48-hour recording?" question with an exit code instead of vibes.
 - `scripts/README.md` with conventions.
+- `research/README.md` — anchor directory for the Python half of the
+  dual-language architecture. Content lands in W2; directory is
+  declared now so the contract in `RESEARCH_PIPELINE.md` is testable.
+
+### Changed
+- `.gitignore` — adds research/ Python-environment patterns; explicitly
+  keeps `models/*.json` and `testdata/` under version control (they
+  are source, not artifacts).
 
 ### Docs
 - `docs/OPERATIONS.md` §2.1 "Smoke-test your first run" — how to
   use `tape-health.sh`, what passing/failing runs look like, the
   48h decision criterion.
+- **ADR-0006: Go runtime + Python research pipeline**
+  (`docs/decisions/0006-dual-language-architecture.md`). Locks in
+  the language decision: runtime is Go-only; NGR/EMOS/conformal/EVT
+  fitting is Python-only; the boundary is immutable JSON artifacts
+  with full provenance. Supersedes any implicit "everything in Go"
+  assumption.
+- **`docs/RESEARCH_PIPELINE.md`** — the concrete contract for
+  ADR-0006. Directory layout, dependency allowlist, JSON artifact
+  schema (worked example for NGR v1), cross-language golden-fixture
+  test pattern, CI wiring.
+- **`docs/design/fee-math.md`** — `internal/fees` package design
+  with Kalshi's published formula, 34 hand-verified test vectors
+  (every arithmetic result reproduced independently before
+  publication), the API surface, and a verification plan. Landing
+  target: W5.
 
 ---
 

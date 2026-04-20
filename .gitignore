@@ -38,3 +38,18 @@ trace.out
 # Coverage
 coverage.out
 coverage.html
+
+# Python research pipeline (see docs/RESEARCH_PIPELINE.md / ADR-0006)
+research/.venv/
+research/__pycache__/
+research/**/__pycache__/
+research/.ipynb_checkpoints/
+research/**/.ipynb_checkpoints/
+research/archive/         # locally-cached raw archive data
+.python-version           # per-dir pin is enough; allow override
+!research/.python-version
+
+# ⚠️ models/ and testdata/ are SOURCE — NOT ignored.
+# models/*.json are fitted artifacts consumed by Go at runtime.
+# testdata/**/*.json are golden fixtures for cross-language tests.
+# Both require review like any other code change.
