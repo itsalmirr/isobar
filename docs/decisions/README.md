@@ -25,6 +25,7 @@ the old one rather than editing history.
 | [0003](./0003-dashboard-stack.md)       | 2026-04-18 | Dashboard = stdlib Go + htmx + SSE + Lightweight Charts + SQLite WAL | Accepted |
 | [0004](./0004-two-signal-scope.md)      | 2026-04-18 | Scope to two signals (weather-calibrated + hurricane-landfall); defer tail-MM | Accepted |
 | [0005](./0005-extract-retry.md)         | 2026-04-18 | Extract `internal/retry`; fix kalshi throttle; promote DiscoverOpenTickers | Accepted |
+| [0006](./0006-peek-probe-kalshi-naming.md) | 2026-04-22 | Keep `cmd/peek` as an ongoing Kalshi catalog probe | Accepted |
 
 ## Template
 

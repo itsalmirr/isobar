@@ -30,6 +30,10 @@ Section order within a release: `Added` · `Changed` · `Fixed` ·
   `cmd/peek` and refreshed `cmd/analyze` descriptions now that both
   exist. Fixed a stale `ticker_v2` reference in the README kalshi
   component blurb.
+- `docs/decisions/0006-peek-probe-kalshi-naming.md` — ADR capturing
+  the `KXHIGH*` / `KXLOWT*` naming asymmetry, the `category` label
+  fact (`"Climate and Weather"`, not `"Weather"`), and the decision to
+  keep `cmd/peek` first-class for W6 hurricane series discovery.
 
 ### Tests
 - `internal/kalshi`: added `TestGetRaw` + `TestGetRawPropagatesAPIError`.
