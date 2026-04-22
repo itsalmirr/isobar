@@ -13,8 +13,16 @@ Section order within a release: `Added` · `Changed` · `Fixed` ·
 
 ## [Unreleased]
 
-### Docs
-- _(placeholder — next change lands here)_
+### Fixed
+- `config/config.example.yaml`: corrected Kalshi WS channel list — `ticker_v2`
+  is rejected by the current API (`code 8 "Unknown channel name"`); removed.
+  Remaining `orderbook_delta` + `trade` carry strictly more information.
+- `config/config.example.yaml`: corrected Kalshi daily-low series names.
+  `KXLOW{CITY}` returns zero markets; the live API uses `KXLOWT{CITY}` with
+  an extra `T`, and NY is `KXLOWTNYC`. `DiscoverOpenTickers` count rises
+  from 48 (highs only) to 72 (highs + lows) on a current run.
+- `config/config.example.yaml`: removed stale `KXBTCD` (BTC-hourly was
+  killed in 0.1.0 but the example still listed it).
 
 ---
 
