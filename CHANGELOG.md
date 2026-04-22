@@ -13,6 +13,14 @@ Section order within a release: `Added` · `Changed` · `Fixed` ·
 
 ## [Unreleased]
 
+### Changed
+- `.golangci.yml`: errcheck exclusions widened to cover `(*os.File).Close`
+  and `(*github.com/coder/websocket.Conn).Close` — the bare
+  `(io.Closer).Close` pattern wasn't catching concrete-type defer closes.
+- Recorder journal files now open at `0o600`; directories at `0o750`.
+  Recorded data is owner-only; no shared read on the Vultr box is
+  expected (`chmod` if that changes).
+
 ### Added
 - `cmd/peek` — one-off Kalshi REST probe. Enumerates candidate series
   names and prints market counts per status. Built to diagnose the
@@ -32,6 +40,18 @@ Section order within a release: `Added` · `Changed` · `Fixed` ·
   from 48 (highs only) to 72 (highs + lows) on a current run.
 - `config/config.example.yaml`: removed stale `KXBTCD` (BTC-hourly was
   killed in 0.1.0 but the example still listed it).
+- `kalshi.ws.Subscriber.runOnce`: HTTP upgrade response body is now
+  closed on successful dial (previously leaked the 101 Switching
+  Protocols response body — flagged by `bodyclose`).
+- `internal/obs/log_test.go`: handler `Enabled` tests now pass
+  `context.Background()` instead of `nil` (SA1012 staticcheck).
+- `internal/retry/retry.go:72,79`: ctx-cancel-returns-nil is documented
+  package behavior; silenced the `nilerr` linter with a per-line
+  `//nolint` + rationale.
+
+### Security
+- Journal files open at `0o600` and journal dirs at `0o750` (was
+  `0o644` / `0o755`).
 
 ---
 

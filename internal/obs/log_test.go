@@ -1,6 +1,7 @@
 package obs
 
 import (
+	"context"
 	"log/slog"
 	"testing"
 
@@ -46,8 +47,8 @@ func TestInitReturnsNonNilForUnknownLevel(t *testing.T) {
 	l := Init("nonsense")
 	require.NotNil(t, l)
 	// With level=info, debug should be filtered out but info allowed.
-	require.True(t, l.Handler().Enabled(nil, slog.LevelInfo))
-	require.False(t, l.Handler().Enabled(nil, slog.LevelDebug))
+	require.True(t, l.Handler().Enabled(context.Background(), slog.LevelInfo))
+	require.False(t, l.Handler().Enabled(context.Background(), slog.LevelDebug))
 }
 
 func TestInitHonorsLevel(t *testing.T) {
@@ -55,6 +56,6 @@ func TestInitHonorsLevel(t *testing.T) {
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
 	l := Init("error")
-	require.False(t, l.Handler().Enabled(nil, slog.LevelWarn))
-	require.True(t, l.Handler().Enabled(nil, slog.LevelError))
+	require.False(t, l.Handler().Enabled(context.Background(), slog.LevelWarn))
+	require.True(t, l.Handler().Enabled(context.Background(), slog.LevelError))
 }

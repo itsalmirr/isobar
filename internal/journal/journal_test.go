@@ -120,7 +120,7 @@ func TestJournalRotatesOnSize(t *testing.T) {
 		"expected at least 2 files after rotation; got plain=%d gz=%d", len(plain), len(zipped))
 
 	for _, p := range zipped {
-		f, err := os.Open(p)
+		f, err := os.Open(p) //nolint:gosec // test-local path under t.TempDir()
 		require.NoError(t, err)
 		gr, err := gzip.NewReader(f)
 		require.NoError(t, err, "gzipped file %s should be readable", p)

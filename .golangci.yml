@@ -35,7 +35,10 @@ linters:
         - G404   # math/rand is fine for jitter
     errcheck:
       exclude-functions:
-        - (io.Closer).Close   # we close in defers; explicit is overkill
+        - (io.Closer).Close       # we close in defers; explicit is overkill
+        - (*os.File).Close        # errcheck doesn't resolve the iface on *os.File
+        # websocket.Conn.Close takes (status, reason) — not io.Closer-shaped
+        - (*github.com/coder/websocket.Conn).Close
 
 formatters:
   enable:
