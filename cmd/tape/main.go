@@ -193,7 +193,7 @@ func makeWSFrameHandler(jrn *journal.Journal, source string) func([]byte) {
 // or the file read fails. The second return identifies the source for logs.
 func loadKalshiPEM(k config.Kalshi) ([]byte, string, error) {
 	if k.PrivateKey != "" {
-		return []byte(k.PrivateKey), "inline (KALSHI_API_KEY)", nil
+		return []byte(k.PrivateKey), "inline (KALSHI_PRIVATE_KEY)", nil
 	}
 	if k.PrivateKeyPath == "" {
 		return nil, "", errors.New("kalshi: no PEM source configured")

@@ -13,6 +13,35 @@ Section order within a release: `Added` · `Changed` · `Fixed` ·
 
 ## [Unreleased]
 
+### Changed
+- `KALSHI_PRIVATE_KEY` is now the primary bare-name env var for the
+  inline PEM; the former `KALSHI_API_KEY` is kept as a back-compat
+  alias (`KALSHI_PRIVATE_KEY` wins when both are set). The old name
+  was misleading — `KALSHI_API_KEY_ID` is the opaque key ID, the PEM
+  is a private key. `.env.example`, error messages, and the tape's
+  credential-source log label updated to match.
+
+### Fixed
+- `internal/kalshi/ws.go` `SubscriberOptions.Channels` comment listed
+  `ticker_v2` in its example; removed — `ticker_v2` is rejected by
+  the current Kalshi API (see ADR-0006) and the example could mislead
+  future consumers.
+- `docs/ROADMAP.md` Phase-0 risks: stale "`ticker_v2` as a liveness
+  canary" mitigation replaced with the actual behavior (reconnect via
+  `internal/retry`, `orderbook_delta` + `trade` serve as heartbeat).
+- `docs/GLOSSARY.md` **Fair value** definition said `fair = (members
+  in bracket) / total members`, which is the pre-pivot naive thesis
+  research showed to be money-losing. Updated to match the current
+  calibrated-posterior definition in `docs/STRATEGY.md`.
+- `docs/GLOSSARY.md` **Signal** example strategies listed `btc-hourly`;
+  replaced with the two actual signals (`weather-calibrated`,
+  `hurricane-landfall`).
+
+### Docs
+- `docs/TESTING.md` coverage table: added the `internal/replay`
+  package (floor 90%, currently 92.4%) that was extracted in this
+  release. `journal` row notes the 85.9% vs 90% gap as tracked.
+
 ### Added
 - `cmd/analyze` — Phase-0.5 sanity analyzer. Reads the per-source JSONL
   journals for a given date and prints a markdown report: frame counts,

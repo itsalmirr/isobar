@@ -34,8 +34,12 @@ sides.
 probability estimate is correct. Positive edge is necessary but not
 sufficient — size, fill probability, and adverse selection matter too.
 
-**Fair value.** Our model's central estimate of the true YES probability.
-In the weather strategy, `fair = (members in bracket) / total members`.
+**Fair value.** Our model's central estimate of the true YES probability
+(`p_fair`). For the weather strategy this is a *calibrated* posterior — the
+NGR/EMOS-adjusted ECMWF+GFS blend, EVT-corrected in the tails, and Bayesian-
+updated at T−3h (see `docs/STRATEGY.md`). The raw member fraction
+`(members in bracket) / total members` is **not** fair value — research
+showed it is miscalibrated by 10–15 pp at bracket boundaries.
 
 **Maker fee / taker fee.** Kalshi's per-contract fee schedule; maker is
 lower (and sometimes zero for inside-book quotes). Strategy docs always
@@ -47,8 +51,8 @@ conservative: assume taker on both sides unless we can prove otherwise.
 ## Signals & execution
 
 **Signal.** A Phase 1+ interface: given a `MarketState`, emit zero or more
-`Quote`s. Each strategy (e.g. `weather`, `btc-hourly`) is one
-implementation.
+`Quote`s. Each strategy (`weather-calibrated`, `hurricane-landfall`) is
+one implementation.
 
 **Quote.** An intent-to-quote: `(ticker, side, price, size)`. Transformed
 by `exec` into a Kalshi `CreateOrderRequest` with deterministic client

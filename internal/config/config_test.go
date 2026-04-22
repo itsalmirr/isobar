@@ -17,7 +17,7 @@ func clearAllKnownEnv(t *testing.T) {
 	for _, k := range []string{
 		"ISOBAR_KALSHI_API_KEY_ID", "KALSHI_API_KEY_ID",
 		"ISOBAR_KALSHI_PRIVATE_KEY_PATH", "KALSHI_PRIVATE_KEY_PATH",
-		"ISOBAR_KALSHI_PRIVATE_KEY", "KALSHI_API_KEY",
+		"ISOBAR_KALSHI_PRIVATE_KEY", "KALSHI_PRIVATE_KEY", "KALSHI_API_KEY",
 		"ISOBAR_DATA_DIR",
 	} {
 		t.Setenv(k, "")
@@ -159,14 +159,14 @@ func TestValidateKalshiRequiresAuth(t *testing.T) {
 	c := Defaults()
 	c.Kalshi.Enabled = true
 	c.Kalshi.Series = []string{"KXHIGHNY"}
-	c.Kalshi.Channels = []string{"ticker_v2"}
+	c.Kalshi.Channels = []string{"orderbook_delta"}
 	// No APIKeyID, no PEM source.
 	err := c.Validate()
 	require.ErrorContains(t, err, "KALSHI_API_KEY_ID")
 
 	c.Kalshi.APIKeyID = "k"
 	err = c.Validate()
-	require.ErrorContains(t, err, "KALSHI_API_KEY")
+	require.ErrorContains(t, err, "KALSHI_PRIVATE_KEY")
 }
 
 func TestValidateKalshiRequiresSeriesAndChannels(t *testing.T) {
@@ -174,7 +174,7 @@ func TestValidateKalshiRequiresSeriesAndChannels(t *testing.T) {
 	c.Kalshi.Enabled = true
 	c.Kalshi.APIKeyID = "k"
 	c.Kalshi.PrivateKey = "pem"
-	c.Kalshi.Channels = []string{"ticker_v2"}
+	c.Kalshi.Channels = []string{"orderbook_delta"}
 	// Empty series.
 	require.ErrorContains(t, c.Validate(), "series")
 
@@ -225,6 +225,18 @@ func TestOverlayEnvPrivateKeyPathAndInline(t *testing.T) {
 	overlayEnv(&cfg)
 	require.Equal(t, "/path/to/key.pem", cfg.Kalshi.PrivateKeyPath)
 	require.Contains(t, cfg.Kalshi.PrivateKey, "BEGIN RSA PRIVATE KEY")
+}
+
+// KALSHI_PRIVATE_KEY is the current primary name; it must win over the
+// legacy KALSHI_API_KEY alias when both are set.
+func TestOverlayEnvPrivateKeyNameWinsOverLegacy(t *testing.T) {
+	clearAllKnownEnv(t)
+	t.Setenv("KALSHI_PRIVATE_KEY", "-----BEGIN RSA PRIVATE KEY-----\nnew\n-----END RSA PRIVATE KEY-----")
+	t.Setenv("KALSHI_API_KEY", "-----BEGIN RSA PRIVATE KEY-----\nold\n-----END RSA PRIVATE KEY-----")
+
+	cfg := Defaults()
+	overlayEnv(&cfg)
+	require.Contains(t, cfg.Kalshi.PrivateKey, "new")
 }
 
 func TestValidateKalshiRequiresWSURL(t *testing.T) {
