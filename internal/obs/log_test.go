@@ -2,7 +2,9 @@ package obs
 
 import (
 	"context"
+	"io"
 	"log/slog"
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -58,4 +60,31 @@ func TestInitHonorsLevel(t *testing.T) {
 	l := Init("error")
 	require.False(t, l.Handler().Enabled(context.Background(), slog.LevelWarn))
 	require.True(t, l.Handler().Enabled(context.Background(), slog.LevelError))
+}
+
+// TestInitRenamesTimeKeyToTs exercises the ReplaceAttr callback — Init's
+// one behavior that isn't a simple pass-through. We redirect os.Stderr
+// temporarily, emit one log line, and assert the rendered JSON has
+// `"ts":` (the renamed key) rather than slog's default `"time":`.
+func TestInitRenamesTimeKeyToTs(t *testing.T) {
+	origStderr := os.Stderr
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	os.Stderr = w
+	t.Cleanup(func() { os.Stderr = origStderr })
+
+	prev := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	l := Init("info")
+	l.Info("hello", "foo", "bar")
+	require.NoError(t, w.Close())
+
+	out, err := io.ReadAll(r)
+	require.NoError(t, err)
+	got := string(out)
+	require.Contains(t, got, `"ts":`, "Init must rename the default time key to ts")
+	require.NotContains(t, got, `"time":`, "raw time key must not leak through")
+	require.Contains(t, got, `"msg":"hello"`)
+	require.Contains(t, got, `"foo":"bar"`)
 }
