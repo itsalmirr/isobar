@@ -40,7 +40,20 @@ Section order within a release: `Added` · `Changed` · `Fixed` ·
   into `internal/replay`. `cmd/analyze` now imports `replay.Open`,
   `replay.ListJournals`, `replay.ForEachFrame`, `replay.Envelope`,
   `replay.KalshiFrame`, and `replay.SeriesPrefix`. Same end-user
-  output, 94.9% line coverage on the new package.
+  output, 92.4% line coverage on the new package (drops slightly as
+  orderbook reconstruction logic lands below).
+
+### Added — Analysis
+- `replay.Book` — reconstructable Kalshi market orderbook. Handles
+  `orderbook_snapshot` (wipe + replace) and `orderbook_delta`
+  (add/remove level with sign handling). Derives `BestYesBid`,
+  `BestYesAsk` (from `100 - BestNoBid`), `MidYesCents`, and
+  `SpreadYesCents`. Prices normalize to integer cents for exact math.
+- `cmd/analyze` now prints an end-of-window book table for the top-25
+  most-active tickers, with yesBid / yesAsk / mid / spread / implied P(yes).
+  Tonight's data already flags wide-spread tail brackets
+  (`KXLOWTNYC-26APR22-B45.5` at 42¢ spread, `KXLOWTMIA-26APR22-B69.5`
+  at 31¢) — the mispricing pattern the weather thesis predicted.
 
 ### Tests
 - `internal/kalshi`: added `TestGetRaw` + `TestGetRawPropagatesAPIError`.

@@ -70,6 +70,8 @@ func reportKalshi(dir string, files []string) {
 		gapHist      = newHist() // inter-frame gaps in ms
 		errorFrames  = 0
 		totalTickers = map[string]struct{}{}
+		books        = map[string]*replay.Book{}
+		bookErrors   = 0
 	)
 
 	_ = replay.ForEachFrame(files, func(env replay.Envelope, n int, firstInFile bool) error {
@@ -99,11 +101,33 @@ func reportKalshi(dir string, files []string) {
 		if f.Type == "error" {
 			errorFrames++
 		}
-		if t := f.MarketTicker(); t != "" {
-			tickerHist[t]++
-			totalTickers[t] = struct{}{}
-			if prefix := replay.SeriesPrefix(t); prefix != "" {
+		ticker := f.MarketTicker()
+		if ticker != "" {
+			tickerHist[ticker]++
+			totalTickers[ticker] = struct{}{}
+			if prefix := replay.SeriesPrefix(ticker); prefix != "" {
 				seriesHist[prefix]++
+			}
+		}
+
+		// Orderbook reconstruction — snapshots reset; deltas adjust.
+		switch f.Type {
+		case "orderbook_snapshot":
+			if ticker == "" {
+				break
+			}
+			if books[ticker] == nil {
+				books[ticker] = replay.NewBook()
+			}
+			if err := books[ticker].ApplySnapshot(f.Msg); err != nil {
+				bookErrors++
+			}
+		case "orderbook_delta":
+			if ticker == "" || books[ticker] == nil {
+				break // deltas before a snapshot are undefined; skip
+			}
+			if err := books[ticker].ApplyDelta(f.Msg); err != nil {
+				bookErrors++
 			}
 		}
 		return nil
@@ -128,6 +152,66 @@ func reportKalshi(dir string, files []string) {
 	fmt.Printf("### Inter-frame gap distribution (ms)\n\n")
 	gapHist.print()
 	fmt.Println()
+
+	fmt.Printf("### End-of-window orderbook state (top-25 by activity)\n\n")
+	if bookErrors > 0 {
+		fmt.Printf("_%d frames dropped during book reconstruction (malformed)_\n\n", bookErrors)
+	}
+	printBookTable(tickerHist, books, 25)
+	fmt.Println()
+}
+
+// printBookTable prints a markdown table with end-of-window top-of-book
+// state for the N most active tickers. Tickers with no two-sided book
+// are flagged (no trading both sides).
+func printBookTable(tickerHist map[string]int, books map[string]*replay.Book, topN int) {
+	type row struct {
+		ticker string
+		frames int
+	}
+	rows := make([]row, 0, len(tickerHist))
+	for t, n := range tickerHist {
+		rows = append(rows, row{t, n})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].frames > rows[j].frames })
+	if topN > 0 && len(rows) > topN {
+		rows = rows[:topN]
+	}
+	if len(rows) == 0 {
+		fmt.Println("_(no tickers observed)_")
+		return
+	}
+	fmt.Println("| ticker | frames | yesBid | yesAsk | mid | spread | P(yes) |")
+	fmt.Println("|---|---:|---:|---:|---:|---:|---:|")
+	for _, r := range rows {
+		b := books[r.ticker]
+		if b == nil {
+			fmt.Printf("| %s | %d | — | — | — | — | — |\n", r.ticker, r.frames)
+			continue
+		}
+		yb := b.BestYesBid()
+		ya := b.BestYesAsk()
+		mid := b.MidYesCents()
+		sp := b.SpreadYesCents()
+		if yb == 0 || ya == 100 {
+			// One-sided market (only yes side or only no side quoting).
+			fmt.Printf("| %s | %d | %s | %s | — | — | — |\n",
+				r.ticker, r.frames, formatCents(yb), formatCents(ya))
+			continue
+		}
+		fmt.Printf("| %s | %d | %d¢ | %d¢ | %d¢ | %d¢ | %.0f%% |\n",
+			r.ticker, r.frames, yb, ya, mid, sp, float64(mid))
+	}
+}
+
+func formatCents(c int) string {
+	if c == 0 {
+		return "—"
+	}
+	if c == 100 {
+		return "—"
+	}
+	return fmt.Sprintf("%d¢", c)
 }
 
 // --- Open-Meteo report ------------------------------------------------------
