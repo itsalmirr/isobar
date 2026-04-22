@@ -49,6 +49,8 @@ internal/
   kalshi          RSA-signed auth, REST client, authenticated WS subscriber
                   (orderbook_delta + trade).
   openmeteo       NOAA GFS + ECMWF IFS ensemble REST poller (free tier).
+  replay          Reads back JSONL journals (plain + gz) for offline
+                  analysis; shared input layer for cmd/analyze.
   retry           Context-aware exponential backoff with jitter (shared).
 ```
 

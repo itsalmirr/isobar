@@ -43,6 +43,10 @@ internal/
   kalshi/              REST client + signer + authenticated WS subscriber
   obs/                 slog JSON bootstrap
   openmeteo/           GFS + ECMWF ensemble REST poller
+  replay/              Reads back JSONL journals (plain + gz) for
+                       offline analysis. Shared input layer for
+                       cmd/analyze and any future backtest/calibration
+                       tool; 94.9% covered.
   retry/               Context-aware exponential backoff with jitter
   calibration/         NGR, conformal, EVT, T-3h Bayesian (W2–5)
   nhc/                 NHC ATCF a-deck/b-deck advisory parser (W6)
