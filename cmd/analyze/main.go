@@ -1,22 +1,21 @@
 // Command analyze reads recorded JSONL journals and produces a
 // Phase-0.5 sanity report. MVP scope: does the recorder produce usable
 // data? Frame counts, gap distributions, per-market activity,
-// monotonicity checks. Edge computation is a follow-up.
+// monotonicity checks. Orderbook reconstruction and edge math are
+// follow-ups.
 package main
 
 import (
-	"bufio"
-	"compress/gzip"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/wh0o0pz/isobar/internal/replay"
 )
 
 func main() {
@@ -34,7 +33,7 @@ func main() {
 
 	for _, src := range sources {
 		dir := filepath.Join(*dataDir, src, *date)
-		files, err := listJournals(dir)
+		files, err := replay.ListJournals(dir)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "skip %s: %v\n", src, err)
 			continue
@@ -52,116 +51,7 @@ func main() {
 	}
 }
 
-// --- file enumeration -------------------------------------------------------
-
-func listJournals(dir string) ([]string, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, err
-	}
-	var out []string
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		n := e.Name()
-		if strings.HasSuffix(n, ".jsonl") || strings.HasSuffix(n, ".jsonl.gz") {
-			out = append(out, filepath.Join(dir, n))
-		}
-	}
-	sort.Strings(out)
-	return out, nil
-}
-
-// openJournal returns a reader for the given file, transparently ungzipping
-// when the path ends in .gz.
-func openJournal(path string) (io.ReadCloser, error) {
-	f, err := os.Open(path) //nolint:gosec // path from listJournals, built from our own data dir
-	if err != nil {
-		return nil, err
-	}
-	if !strings.HasSuffix(path, ".gz") {
-		return f, nil
-	}
-	gr, err := gzip.NewReader(f)
-	if err != nil {
-		_ = f.Close()
-		return nil, err
-	}
-	return &gzReader{gr: gr, f: f}, nil
-}
-
-type gzReader struct {
-	gr *gzip.Reader
-	f  *os.File
-}
-
-func (r *gzReader) Read(p []byte) (int, error) { return r.gr.Read(p) }
-func (r *gzReader) Close() error {
-	_ = r.gr.Close()
-	return r.f.Close()
-}
-
-// --- frame iteration --------------------------------------------------------
-
-type envelope struct {
-	Wall    int64           `json:"t"`
-	Mono    int64           `json:"m"`
-	Source  string          `json:"src"`
-	Kind    string          `json:"k"`
-	Payload json.RawMessage `json:"p,omitempty"`
-}
-
-// forEachFrame streams each NDJSON line from files (in order), decoding
-// into an envelope. The bool passed to fn is true on the first frame of a
-// new file — consumers use it to reset per-file state (e.g., gap tracking
-// should not span file boundaries). fn may stop early by returning an
-// error; io.EOF is treated as "stop iteration without error".
-func forEachFrame(files []string, fn func(env envelope, bytes int, firstInFile bool) error) error {
-	for _, path := range files {
-		r, err := openJournal(path)
-		if err != nil {
-			return fmt.Errorf("open %s: %w", path, err)
-		}
-		sc := bufio.NewScanner(r)
-		// Raw Kalshi frames can be tens of KB; raise the scanner buffer.
-		sc.Buffer(make([]byte, 64<<10), 8<<20)
-		firstInFile := true
-		for sc.Scan() {
-			line := sc.Bytes()
-			var env envelope
-			if err := json.Unmarshal(line, &env); err != nil {
-				// Skip malformed lines rather than abort — a single bad
-				// frame shouldn't tank a whole-day report.
-				continue
-			}
-			if err := fn(env, len(line), firstInFile); err != nil {
-				_ = r.Close()
-				if errors.Is(err, io.EOF) {
-					return nil
-				}
-				return err
-			}
-			firstInFile = false
-		}
-		_ = r.Close()
-		if err := sc.Err(); err != nil {
-			return fmt.Errorf("scan %s: %w", path, err)
-		}
-	}
-	return nil
-}
-
 // --- Kalshi report ----------------------------------------------------------
-
-type kalshiPayload struct {
-	Type string `json:"type"`
-	Seq  int64  `json:"seq,omitempty"`
-	Sid  int64  `json:"sid,omitempty"`
-	Msg  struct {
-		MarketTicker string `json:"market_ticker,omitempty"`
-	} `json:"msg"`
-}
 
 func reportKalshi(dir string, files []string) {
 	fmt.Printf("## kalshi\n\n")
@@ -182,7 +72,7 @@ func reportKalshi(dir string, files []string) {
 		totalTickers = map[string]struct{}{}
 	)
 
-	_ = forEachFrame(files, func(env envelope, n int, firstInFile bool) error {
+	_ = replay.ForEachFrame(files, func(env replay.Envelope, n int, firstInFile bool) error {
 		frames++
 		bytesTotal += n
 		if firstWall == 0 {
@@ -201,18 +91,18 @@ func reportKalshi(dir string, files []string) {
 		}
 		prevWall = env.Wall
 
-		var p kalshiPayload
-		if err := json.Unmarshal(env.Payload, &p); err != nil {
+		var f replay.KalshiFrame
+		if err := json.Unmarshal(env.Payload, &f); err != nil {
 			return nil //nolint:nilerr // skip malformed frame, don't abort the whole report
 		}
-		typeHist[p.Type]++
-		if p.Type == "error" {
+		typeHist[f.Type]++
+		if f.Type == "error" {
 			errorFrames++
 		}
-		if t := p.Msg.MarketTicker; t != "" {
+		if t := f.MarketTicker(); t != "" {
 			tickerHist[t]++
 			totalTickers[t] = struct{}{}
-			if prefix := seriesPrefix(t); prefix != "" {
+			if prefix := replay.SeriesPrefix(t); prefix != "" {
 				seriesHist[prefix]++
 			}
 		}
@@ -240,17 +130,6 @@ func reportKalshi(dir string, files []string) {
 	fmt.Println()
 }
 
-// seriesPrefix extracts the leading A-Z prefix from a market ticker.
-// e.g. "KXHIGHNY-26APR22-T64" → "KXHIGHNY".
-func seriesPrefix(ticker string) string {
-	for i, r := range ticker {
-		if r < 'A' || r > 'Z' {
-			return ticker[:i]
-		}
-	}
-	return ticker
-}
-
 // --- Open-Meteo report ------------------------------------------------------
 
 func reportOpenMeteo(dir string, files []string) {
@@ -268,7 +147,7 @@ func reportOpenMeteo(dir string, files []string) {
 		sizeHist   = newHist()
 	)
 
-	_ = forEachFrame(files, func(env envelope, n int, firstInFile bool) error {
+	_ = replay.ForEachFrame(files, func(env replay.Envelope, n int, firstInFile bool) error {
 		frames++
 		bytesTotal += n
 		sizeHist.add(float64(len(env.Payload)))
@@ -315,7 +194,7 @@ func reportOpenMeteo(dir string, files []string) {
 	}
 }
 
-// --- histogram helper -------------------------------------------------------
+// --- histogram helper (internal to this CLI; promote to internal/ when reused)
 
 type hist struct{ vals []float64 }
 

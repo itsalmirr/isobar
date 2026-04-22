@@ -35,6 +35,13 @@ Section order within a release: `Added` · `Changed` · `Fixed` ·
   fact (`"Climate and Weather"`, not `"Weather"`), and the decision to
   keep `cmd/peek` first-class for W6 hurricane series discovery.
 
+### Refactor
+- Extracted `cmd/analyze`'s journal-reading and Kalshi-frame decoding
+  into `internal/replay`. `cmd/analyze` now imports `replay.Open`,
+  `replay.ListJournals`, `replay.ForEachFrame`, `replay.Envelope`,
+  `replay.KalshiFrame`, and `replay.SeriesPrefix`. Same end-user
+  output, 94.9% line coverage on the new package.
+
 ### Tests
 - `internal/kalshi`: added `TestGetRaw` + `TestGetRawPropagatesAPIError`.
   Coverage rose from 71.0% to 75.2% (floor is 85%; still under, but
