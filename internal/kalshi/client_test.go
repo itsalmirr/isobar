@@ -279,3 +279,35 @@ func TestThrottleDoesNotSerializeCallers(t *testing.T) {
 	// margin to keep the test reliable under CI load.
 	require.Less(t, elapsed, 3500*time.Millisecond, "throttle is serializing callers; lock is held during sleep")
 }
+
+func TestGetRaw(t *testing.T) {
+	const body = `{"series":[{"ticker":"KXHIGHNY","title":"NYC daily high"}]}`
+	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodGet, r.Method)
+		require.Equal(t, "/series", r.URL.Path)
+		require.Equal(t, "Weather", r.URL.Query().Get("category"))
+		require.NotEmpty(t, r.Header.Get("KALSHI-ACCESS-KEY"))
+		require.NotEmpty(t, r.Header.Get("KALSHI-ACCESS-SIGNATURE"))
+		require.NotEmpty(t, r.Header.Get("KALSHI-ACCESS-TIMESTAMP"))
+		w.Header().Set("Content-Type", "application/json")
+		_, err := w.Write([]byte(body))
+		require.NoError(t, err)
+	}))
+
+	got, err := c.GetRaw(context.Background(), "/series", map[string]string{"category": "Weather"})
+	require.NoError(t, err)
+	require.Equal(t, body, got)
+}
+
+func TestGetRawPropagatesAPIError(t *testing.T) {
+	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, err := w.Write([]byte(`{"code":"forbidden","message":"nope"}`))
+		require.NoError(t, err)
+	}))
+
+	_, err := c.GetRaw(context.Background(), "/series", nil)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "API error 403")
+	require.Contains(t, err.Error(), "nope")
+}

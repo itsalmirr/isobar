@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -21,15 +22,15 @@ func main() {
 	}
 	cfg, err := config.Load("")
 	if err != nil {
-		die("config: " + err.Error())
+		die(fmt.Errorf("config: %w", err))
 	}
 	pem, err := loadPEM(cfg.Kalshi)
 	if err != nil {
-		die(err.Error())
+		die(err)
 	}
 	signer, err := kalshi.NewSigner(cfg.Kalshi.APIKeyID, pem)
 	if err != nil {
-		die("signer: " + err.Error())
+		die(fmt.Errorf("signer: %w", err))
 	}
 	client := kalshi.NewClient("https://api.elections.kalshi.com/trade-api/v2", signer)
 
@@ -95,10 +96,10 @@ func loadPEM(k config.Kalshi) ([]byte, error) {
 	if k.PrivateKeyPath != "" {
 		return os.ReadFile(k.PrivateKeyPath)
 	}
-	return nil, fmt.Errorf("no PEM source configured")
+	return nil, errors.New("no PEM source configured")
 }
 
-func die(msg string) {
-	fmt.Fprintln(os.Stderr, "peek:", msg)
+func die(err error) {
+	fmt.Fprintln(os.Stderr, "peek:", err)
 	os.Exit(1)
 }

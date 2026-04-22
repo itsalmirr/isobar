@@ -17,9 +17,23 @@ build:
 	@mkdir -p $(BIN_DIR)
 	$(GO) build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/tape ./cmd/tape
 
+.PHONY: build-all
+build-all: build
+	@mkdir -p $(BIN_DIR)
+	$(GO) build $(GOFLAGS) -o $(BIN_DIR)/peek ./cmd/peek
+	$(GO) build $(GOFLAGS) -o $(BIN_DIR)/analyze ./cmd/analyze
+
 .PHONY: run-tape
 run-tape: build
 	./$(BIN_DIR)/tape -config config/config.yaml
+
+.PHONY: run-peek
+run-peek:
+	$(GO) run ./cmd/peek
+
+.PHONY: run-analyze
+run-analyze:
+	$(GO) run ./cmd/analyze
 
 .PHONY: test
 test:
