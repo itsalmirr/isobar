@@ -22,6 +22,13 @@ Section order within a release: `Added` · `Changed` · `Fixed` ·
   expected (`chmod` if that changes).
 
 ### Added
+- `cmd/analyze` — Phase-0.5 sanity analyzer. Reads the per-source JSONL
+  journals for a given date and prints a markdown report: frame counts,
+  type histograms, per-series and per-market activity, wall-clock
+  regression count, inter-frame gap distribution (p50/p95/p99/max,
+  reset across file boundaries), Open-Meteo per-location poll counts
+  and gaps. MVP scope; orderbook reconstruction and implied-vs-modeled
+  edge are follow-ups once NGR/EMOS calibration lands.
 - `cmd/peek` — one-off Kalshi REST probe. Enumerates candidate series
   names and prints market counts per status. Built to diagnose the
   `KXLOW*` naming mismatch; will be reused for hurricane-landfall series
