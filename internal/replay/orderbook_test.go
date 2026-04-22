@@ -23,7 +23,7 @@ func TestBookApplySnapshotInitializesLevels(t *testing.T) {
 	// Top-of-book
 	require.Equal(t, 45, b.BestYesBid())
 	require.Equal(t, 55, b.BestNoBid())
-	require.Equal(t, 45, b.BestYesAsk()) // 100 - 55
+	require.Equal(t, 45, b.BestYesAsk())  // 100 - 55
 	require.Equal(t, 45, b.MidYesCents()) // (45 + 45) / 2
 	require.Equal(t, 0, b.SpreadYesCents())
 }
