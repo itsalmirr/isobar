@@ -20,6 +20,21 @@ Section order within a release: `Added` · `Changed` · `Fixed` ·
 - Recorder journal files now open at `0o600`; directories at `0o750`.
   Recorded data is owner-only; no shared read on the Vultr box is
   expected (`chmod` if that changes).
+- `Makefile`: added `build-all`, `run-peek`, `run-analyze` targets for
+  parity with `run-tape`.
+- `cmd/peek`: error sites now use `fmt.Errorf("…: %w", err)` to match
+  the `errorlint` convention.
+
+### Docs
+- `README.md`, `docs/ARCHITECTURE.md`, `docs/GLOSSARY.md`: added
+  `cmd/peek` and refreshed `cmd/analyze` descriptions now that both
+  exist. Fixed a stale `ticker_v2` reference in the README kalshi
+  component blurb.
+
+### Tests
+- `internal/kalshi`: added `TestGetRaw` + `TestGetRawPropagatesAPIError`.
+  Coverage rose from 71.0% to 75.2% (floor is 85%; still under, but
+  the newly-added public method is now covered).
 
 ### Added
 - `cmd/analyze` — Phase-0.5 sanity analyzer. Reads the per-source JSONL

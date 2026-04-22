@@ -32,8 +32,11 @@ held-out data.
 ## Architecture
 
 ```
-cmd/tape          Orchestrator. One goroutine per source, errgroup-managed,
+cmd/tape          Recorder. One goroutine per source, errgroup-managed,
                   signal-cancellable. Each source writes to its own journal.
+cmd/analyze       Phase-0.5 sanity report over recorded journals (MVP —
+                  frame counts, gaps, monotonicity; edge math TBD).
+cmd/peek          One-off Kalshi REST probe for series/market discovery.
 
 internal/
   clock           Paired (monotonic, wall) timestamps. Wall is the cross-source
@@ -44,8 +47,9 @@ internal/
                   throughput; periodic flush bounds data loss to N ms.
   obs             log/slog setup. JSON output to stderr, level via env.
   kalshi          RSA-signed auth, REST client, authenticated WS subscriber
-                  (orderbook_delta / ticker_v2 / trade).
+                  (orderbook_delta + trade).
   openmeteo       NOAA GFS + ECMWF IFS ensemble REST poller (free tier).
+  retry           Context-aware exponential backoff with jitter (shared).
 ```
 
 **Hot-path principle.** The recorder does not decode WS frames. Bytes from the
