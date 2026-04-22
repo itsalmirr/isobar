@@ -7,8 +7,8 @@
 ## Guiding constraints
 
 - **Single binary per concern.** `cmd/tape` records; `cmd/analyze` (Phase
-  0.5) replays; `cmd/bot` (Phase 1) trades. No god-binary with subcommands
-  for everything.
+  0.5) replays; `cmd/bot` (Phase 1) trades; `cmd/peek` is an ops-only
+  Kalshi REST probe. No god-binary with subcommands for everything.
 - **`internal/` only.** No `pkg/` until there is a second binary that needs
   to import outside this module. The compiler enforces the boundary.
 - **Stdlib first.** Every third-party dep is an audit burden. Current deps
@@ -26,8 +26,13 @@
 ```
 cmd/
   tape/                Phase 0 recorder (main.go today)
+  analyze/             Phase 0.5 sanity report — MVP today (counts,
+                       gaps, monotonicity). Orderbook replay + gate
+                       numbers arrive at W10 once calibration lands.
+  peek/                Ops probe — reads Kalshi /series and /markets
+                       to confirm series-name correctness when the
+                       catalog changes (W6 hurricane series discovery).
   calibrate/           Phase 0.5 NGR fit + reliability plots (W2)
-  analyze/             Phase 0.5 replay + gate report (W10)
   bot/                 Phase 1+ live bot (W11–12)
 
 internal/
@@ -38,6 +43,10 @@ internal/
   kalshi/              REST client + signer + authenticated WS subscriber
   obs/                 slog JSON bootstrap
   openmeteo/           GFS + ECMWF ensemble REST poller
+  replay/              Reads back JSONL journals (plain + gz) for
+                       offline analysis. Shared input layer for
+                       cmd/analyze and any future backtest/calibration
+                       tool; 94.9% covered.
   retry/               Context-aware exponential backoff with jitter
   calibration/         NGR, conformal, EVT, T-3h Bayesian (W2–5)
   nhc/                 NHC ATCF a-deck/b-deck advisory parser (W6)

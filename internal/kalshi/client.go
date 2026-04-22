@@ -320,6 +320,13 @@ func (c *Client) GetBalanceRaw(ctx context.Context) (string, error) {
 	return c.getRaw(ctx, "/portfolio/balance", nil)
 }
 
+// GetRaw performs an authenticated GET against an arbitrary path and
+// returns the raw response body. For debugging and one-off probes only;
+// production callers should add typed wrappers.
+func (c *Client) GetRaw(ctx context.Context, path string, params map[string]string) (string, error) {
+	return c.getRaw(ctx, path, params)
+}
+
 // --- HTTP helpers ---
 
 func (c *Client) getRaw(ctx context.Context, path string, params map[string]string) (string, error) {
@@ -337,8 +344,8 @@ func (c *Client) getRaw(ctx context.Context, path string, params map[string]stri
 		return "", fmt.Errorf("kalshi: build GET request: %w", err)
 	}
 
-	if err := c.sign(req, path); err != nil {
-		return "", err
+	if signErr := c.sign(req, path); signErr != nil {
+		return "", signErr
 	}
 
 	bodyBytes, err := c.doRaw(req)
@@ -450,7 +457,7 @@ func (c *Client) doRaw(req *http.Request) ([]byte, error) {
 			}
 		}
 
-		resp, err := c.httpClient.Do(req)
+		resp, err := c.httpClient.Do(req) //nolint:gosec // URL comes from our own baseURL + typed path helpers
 		if err != nil {
 			return nil, fmt.Errorf("kalshi: HTTP request failed: %w", err)
 		}
