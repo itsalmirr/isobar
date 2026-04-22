@@ -73,7 +73,7 @@ openmeteo:
   variables: [temperature_2m]
   locations:
     - { name: NY, series: [KXHIGHNY], lat: 40.0, lon: -73.0 }
-`), 0o644))
+`), 0o600))
 
 	cfg, err := Load(path)
 	require.NoError(t, err)
@@ -100,7 +100,7 @@ func TestLoadInvalidYAML(t *testing.T) {
 	clearAllKnownEnv(t)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "bad.yaml")
-	require.NoError(t, os.WriteFile(path, []byte("data_dir: [not a string}\n"), 0o644))
+	require.NoError(t, os.WriteFile(path, []byte("data_dir: [not a string}\n"), 0o600))
 
 	_, err := Load(path)
 	require.Error(t, err)

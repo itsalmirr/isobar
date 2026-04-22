@@ -75,9 +75,9 @@ func TestFillAccessors(t *testing.T) {
 
 func TestFPLevelsToIntDropsInvalid(t *testing.T) {
 	levels := []OrderbookLevelFP{
-		{"0.55", "100"},   // valid → [55, 100]
-		{"0.00", "999"},   // edge: 0 cents excluded
-		{"1.00", "50"},    // 100 cents excluded
+		{"0.55", "100"},    // valid → [55, 100]
+		{"0.00", "999"},    // edge: 0 cents excluded
+		{"1.00", "50"},     // 100 cents excluded
 		{"not-a-num", "5"}, // parse fail
 		{"0.25", "not"},    // qty parse fail
 		{"0.33", "12.5"},   // qty float → 12

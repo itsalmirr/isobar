@@ -86,11 +86,14 @@ func (s *Subscriber) runOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	conn, _, err := websocket.Dial(ctx, s.opts.WSURL, &websocket.DialOptions{
+	conn, resp, err := websocket.Dial(ctx, s.opts.WSURL, &websocket.DialOptions{
 		HTTPHeader: header,
 	})
 	if err != nil {
 		return fmt.Errorf("ws dial: %w", err)
+	}
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
 	}
 	defer conn.Close(websocket.StatusInternalError, "subscriber exit")
 

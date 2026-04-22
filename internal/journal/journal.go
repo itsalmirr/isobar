@@ -167,7 +167,7 @@ func (j *Journal) run() {
 		if err != nil {
 			return err
 		}
-		nf, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		nf, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600) //nolint:gosec // journal paths are built from our own Dir+timestamp, not user input
 		if err != nil {
 			return err
 		}
@@ -300,7 +300,7 @@ func newPath(dir, source string) (string, error) {
 	now := time.Now().UTC()
 	day := now.Format("2006-01-02")
 	folder := filepath.Join(dir, day)
-	if err := os.MkdirAll(folder, 0o755); err != nil {
+	if err := os.MkdirAll(folder, 0o750); err != nil {
 		return "", err
 	}
 	stamp := now.Format("150405.000000000")
@@ -309,13 +309,13 @@ func newPath(dir, source string) (string, error) {
 
 // gzipFile compresses src into src+".gz". Returns nil on success.
 func gzipFile(src string) error {
-	in, err := os.Open(src)
+	in, err := os.Open(src) //nolint:gosec // src is a journal file path we wrote ourselves
 	if err != nil {
 		return err
 	}
 	defer in.Close()
 
-	out, err := os.OpenFile(src+".gz", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	out, err := os.OpenFile(src+".gz", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600) //nolint:gosec // see above
 	if err != nil {
 		return err
 	}

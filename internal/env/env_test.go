@@ -57,10 +57,10 @@ func TestLoadNearestWalksUp(t *testing.T) {
 
 	top := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(top, ".env"),
-		[]byte("ISOBAR_TEST_NEAREST=found\n"), 0o644))
+		[]byte("ISOBAR_TEST_NEAREST=found\n"), 0o600))
 
 	sub := filepath.Join(top, "a", "b", "c")
-	require.NoError(t, os.MkdirAll(sub, 0o755))
+	require.NoError(t, os.MkdirAll(sub, 0o750))
 
 	path, err := LoadNearest(sub)
 	require.NoError(t, err)
@@ -90,6 +90,6 @@ func TestParseSkipsMalformedLines(t *testing.T) {
 func writeEnv(t *testing.T, body string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), ".env")
-	require.NoError(t, os.WriteFile(path, []byte(body), 0o644))
+	require.NoError(t, os.WriteFile(path, []byte(body), 0o600))
 	return path
 }

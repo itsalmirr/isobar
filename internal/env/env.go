@@ -13,7 +13,7 @@ import (
 // Load reads the named .env file and sets each KEY in the process
 // environment unless it is already set. A missing file is not an error.
 func Load(path string) error {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) //nolint:gosec // path is operator-supplied config, not user input
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
