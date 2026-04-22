@@ -47,8 +47,10 @@ latency (see `docs/research/SYNTHESIS.md`).
 - All in-scope markets for configured series present for the full window.
 
 **Risks & mitigations.**
-- *Kalshi WS drops during overnight weather-bracket expiry:* reconnect with
-  jittered backoff; subscribe to `ticker_v2` as a liveness canary.
+- *Kalshi WS drops during overnight weather-bracket expiry:* reconnect
+  with jittered backoff (`internal/retry`); `orderbook_delta` + `trade`
+  on active markets serve as the liveness heartbeat. `ticker_v2` is
+  rejected by the current API (ADR-0006).
 - *Disk fills:* gzip-on-rotate + daily `du -sh data/` in the runbook.
 - *Open-Meteo rate limits:* min `poll_interval` enforced (1m) in config
   validation; default is 30m.

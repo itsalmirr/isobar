@@ -20,7 +20,7 @@ import (
 type SubscriberOptions struct {
 	WSURL     string
 	Signer    *Signer
-	Channels  []string // e.g., ["orderbook_delta", "ticker_v2", "trade"]
+	Channels  []string // e.g., ["orderbook_delta", "trade"] — ticker_v2 is rejected by the current API; see ADR-0006
 	Tickers   []string // empty = all
 	Reconnect ReconnectOptions
 	Logger    *slog.Logger

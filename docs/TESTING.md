@@ -57,9 +57,10 @@
 | `internal/env`         | 95%                  | Multi-line quote paths included.   |
 | `internal/obs`         | 90%                  | Level parsing + handler shape.     |
 | `internal/config`      | 95%                  | Every `Validate` branch.           |
-| `internal/journal`     | 90%                  | Rotation, drop, roundtrip, shutdown.|
+| `internal/journal`     | 90%                  | Rotation, drop, roundtrip, shutdown. *Currently 85.9% — fault-injection gap tracked in CHANGELOG.* |
 | `internal/kalshi`      | 85%                  | All REST verbs + signer + ws subscribe msg + DiscoverOpenTickers + throttle. |
 | `internal/openmeteo`   | 85%                  | URL build + error propagation.     |
+| `internal/replay`      | 90%                  | Journal read + Kalshi frame decode + orderbook apply. |
 | `internal/retry`       | 95%                  | Jitter, Next, Do happy-path + ctx + max-attempts. |
 
 Coverage is a floor, not a ceiling, and not a substitute for

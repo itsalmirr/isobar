@@ -138,7 +138,10 @@ func overlayEnv(cfg *Config) {
 	if v := firstNonEmpty("ISOBAR_KALSHI_PRIVATE_KEY_PATH", "KALSHI_PRIVATE_KEY_PATH"); v != "" {
 		cfg.Kalshi.PrivateKeyPath = v
 	}
-	if v := firstNonEmpty("ISOBAR_KALSHI_PRIVATE_KEY", "KALSHI_API_KEY"); v != "" {
+	// KALSHI_PRIVATE_KEY is the current name; KALSHI_API_KEY is kept for
+	// back-compat with earlier arbhunter-style configs (the name was
+	// historically misleading — it's a PEM, not an opaque token).
+	if v := firstNonEmpty("ISOBAR_KALSHI_PRIVATE_KEY", "KALSHI_PRIVATE_KEY", "KALSHI_API_KEY"); v != "" {
 		cfg.Kalshi.PrivateKey = v
 	}
 	if v := os.Getenv("ISOBAR_DATA_DIR"); v != "" {
@@ -176,7 +179,7 @@ func (c Config) Validate() error {
 			return errors.New("config: KALSHI_API_KEY_ID (or ISOBAR_KALSHI_API_KEY_ID) required when kalshi.enabled")
 		}
 		if c.Kalshi.PrivateKey == "" && c.Kalshi.PrivateKeyPath == "" {
-			return errors.New("config: set KALSHI_API_KEY (inline PEM) or KALSHI_PRIVATE_KEY_PATH (file path) when kalshi.enabled")
+			return errors.New("config: set KALSHI_PRIVATE_KEY (inline PEM) or KALSHI_PRIVATE_KEY_PATH (file path) when kalshi.enabled")
 		}
 		if len(c.Kalshi.Series) == 0 {
 			return errors.New("config: kalshi.series must list at least one series prefix")
