@@ -110,7 +110,7 @@ func Load(path string) (Config, error) {
 	cfg := Defaults()
 
 	if path != "" {
-		data, err := os.ReadFile(path)
+		data, err := os.ReadFile(path) //nolint:gosec // path is operator-supplied config flag, not user input
 		if err != nil {
 			return Config{}, fmt.Errorf("config: read %s: %w", path, err)
 		}

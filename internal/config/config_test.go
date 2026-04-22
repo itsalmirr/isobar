@@ -73,7 +73,7 @@ openmeteo:
   variables: [temperature_2m]
   locations:
     - { name: NY, series: [KXHIGHNY], lat: 40.0, lon: -73.0 }
-`), 0o644))
+`), 0o600))
 
 	cfg, err := Load(path)
 	require.NoError(t, err)
@@ -100,7 +100,7 @@ func TestLoadInvalidYAML(t *testing.T) {
 	clearAllKnownEnv(t)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "bad.yaml")
-	require.NoError(t, os.WriteFile(path, []byte("data_dir: [not a string}\n"), 0o644))
+	require.NoError(t, os.WriteFile(path, []byte("data_dir: [not a string}\n"), 0o600))
 
 	_, err := Load(path)
 	require.Error(t, err)
@@ -214,4 +214,53 @@ func TestFirstNonEmpty(t *testing.T) {
 	t.Setenv("FNE_C", "c")
 	require.Equal(t, "b", firstNonEmpty("FNE_A", "FNE_B", "FNE_C"))
 	require.Equal(t, "", firstNonEmpty("FNE_NOT_SET_1", "FNE_NOT_SET_2"))
+}
+
+func TestOverlayEnvPrivateKeyPathAndInline(t *testing.T) {
+	clearAllKnownEnv(t)
+	t.Setenv("KALSHI_PRIVATE_KEY_PATH", "/path/to/key.pem")
+	t.Setenv("KALSHI_API_KEY", "-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----")
+
+	cfg := Defaults()
+	overlayEnv(&cfg)
+	require.Equal(t, "/path/to/key.pem", cfg.Kalshi.PrivateKeyPath)
+	require.Contains(t, cfg.Kalshi.PrivateKey, "BEGIN RSA PRIVATE KEY")
+}
+
+func TestValidateKalshiRequiresWSURL(t *testing.T) {
+	c := Defaults()
+	c.Kalshi.Enabled = true
+	c.Kalshi.WSURL = "" // clear the default
+	c.Kalshi.APIKeyID = "k"
+	c.Kalshi.PrivateKey = "pem"
+	c.Kalshi.Series = []string{"KXHIGHNY"}
+	c.Kalshi.Channels = []string{"orderbook_delta"}
+	require.ErrorContains(t, c.Validate(), "ws_url")
+}
+
+func TestValidateOpenMeteoRequiresBaseURL(t *testing.T) {
+	c := Defaults()
+	c.OpenMeteo.Enabled = true
+	c.OpenMeteo.BaseURL = "" // clear the default
+	c.OpenMeteo.Locations = []OpenMeteoLocation{{Name: "NY", Lat: 40, Lon: -73}}
+	c.OpenMeteo.PollInterval = 5 * time.Minute
+	require.ErrorContains(t, c.Validate(), "base_url")
+}
+
+// TestLoadReturnsValidationError verifies Load surfaces Validate errors,
+// not just read/parse errors (a YAML-valid but semantically-invalid file
+// must still fail Load).
+func TestLoadReturnsValidationError(t *testing.T) {
+	clearAllKnownEnv(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "unqueued.yaml")
+	// Parseable YAML that violates the "queue_size > 0" invariant.
+	require.NoError(t, os.WriteFile(path, []byte(`
+journal:
+  queue_size: 0
+  max_file_bytes: 1024
+`), 0o600))
+	_, err := Load(path)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "queue_size")
 }

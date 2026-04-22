@@ -134,7 +134,14 @@ scale-ups.
 
 **Tape.** `cmd/tape`, the Phase 0 recorder.
 
-**Analyze.** `cmd/analyze`, the Phase 0.5 edge-measurement tool.
+**Analyze.** `cmd/analyze`, the Phase 0.5 edge-measurement tool. MVP
+today reports frame counts, gap distribution, monotonicity; orderbook
+replay + modeled-vs-implied edge land with calibration (W10).
+
+**Peek.** `cmd/peek`, ops-only Kalshi REST probe. Enumerates candidate
+series names and market statuses to confirm catalog assumptions when
+Kalshi adds or renames series (used in W1 to discover the asymmetric
+`KXHIGH*` / `KXLOWT*` naming).
 
 **Bot.** `cmd/bot`, the Phase 1+ live trader.
 

@@ -13,8 +13,113 @@ Section order within a release: `Added` · `Changed` · `Fixed` ·
 
 ## [Unreleased]
 
+### Added
+- `cmd/analyze` — Phase-0.5 sanity analyzer. Reads the per-source JSONL
+  journals for a given date and prints a markdown report: frame counts,
+  type histograms, per-series and per-market activity, wall-clock
+  regression count, inter-frame gap distribution (p50/p95/p99/max,
+  reset across file boundaries), Open-Meteo per-location poll counts
+  and gaps. MVP scope; orderbook reconstruction and implied-vs-modeled
+  edge are follow-ups once NGR/EMOS calibration lands.
+- `cmd/peek` — one-off Kalshi REST probe. Enumerates candidate series
+  names and prints market counts per status. Built to diagnose the
+  `KXLOW*` naming mismatch; will be reused for hurricane-landfall series
+  discovery in W6.
+- `kalshi.Client.GetRaw(ctx, path, params)` — public wrapper on the
+  private `getRaw` helper. Supports arbitrary signed GET for diagnostics;
+  production callers should still add typed wrappers.
+- `replay.Book` — reconstructable Kalshi market orderbook. Handles
+  `orderbook_snapshot` (wipe + replace) and `orderbook_delta`
+  (add/remove level with sign handling). Derives `BestYesBid`,
+  `BestYesAsk` (from `100 - BestNoBid`), `MidYesCents`, and
+  `SpreadYesCents`. Prices normalize to integer cents for exact math.
+- `cmd/analyze` now prints an end-of-window book table for the top-25
+  most-active tickers, with yesBid / yesAsk / mid / spread / implied P(yes).
+  Tonight's data already flags wide-spread tail brackets
+  (`KXLOWTNYC-26APR22-B45.5` at 42¢ spread, `KXLOWTMIA-26APR22-B69.5`
+  at 31¢) — the mispricing pattern the weather thesis predicted.
+- `scripts/tape-health.sh` — smoke-test checker run after the first
+  ~1 hour of tape uptime. Inspects per-source file stats, freshness,
+  and log patterns (auth errors, dropped frames, reconnect storms).
+  Exits `0` = run 48h, `1` = fix first. Answers the "is this worth a
+  48-hour recording?" question with an exit code instead of vibes.
+- `scripts/README.md` with conventions.
+
+### Changed
+- `.golangci.yml`: errcheck exclusions widened to cover `(*os.File).Close`
+  and `(*github.com/coder/websocket.Conn).Close` — the bare
+  `(io.Closer).Close` pattern wasn't catching concrete-type defer closes.
+- Recorder journal files now open at `0o600`; directories at `0o750`.
+  Recorded data is owner-only; no shared read on the Vultr box is
+  expected (`chmod` if that changes).
+- `Makefile`: added `build-all`, `run-peek`, `run-analyze` targets for
+  parity with `run-tape`.
+- `cmd/peek`: error sites now use `fmt.Errorf("…: %w", err)` to match
+  the `errorlint` convention.
+- Extracted `cmd/analyze`'s journal-reading and Kalshi-frame decoding
+  into `internal/replay`. `cmd/analyze` now imports `replay.Open`,
+  `replay.ListJournals`, `replay.ForEachFrame`, `replay.Envelope`,
+  `replay.KalshiFrame`, and `replay.SeriesPrefix`. Same end-user
+  output, 92.4% line coverage on the new package.
+
+### Fixed
+- `config/config.example.yaml`: corrected Kalshi WS channel list — `ticker_v2`
+  is rejected by the current API (`code 8 "Unknown channel name"`); removed.
+  Remaining `orderbook_delta` + `trade` carry strictly more information.
+- `config/config.example.yaml`: corrected Kalshi daily-low series names.
+  `KXLOW{CITY}` returns zero markets; the live API uses `KXLOWT{CITY}` with
+  an extra `T`, and NY is `KXLOWTNYC`. `DiscoverOpenTickers` count rises
+  from 48 (highs only) to 72 (highs + lows) on a current run.
+- `config/config.example.yaml`: removed stale `KXBTCD` (BTC-hourly was
+  killed in 0.1.0 but the example still listed it).
+- `kalshi.ws.Subscriber.runOnce`: HTTP upgrade response body is now
+  closed on successful dial (previously leaked the 101 Switching
+  Protocols response body — flagged by `bodyclose`).
+- `internal/obs/log_test.go`: handler `Enabled` tests now pass
+  `context.Background()` instead of `nil` (SA1012 staticcheck).
+- `internal/retry/retry.go:72,79`: ctx-cancel-returns-nil is documented
+  package behavior; silenced the `nilerr` linter with a per-line
+  `//nolint` + rationale.
+
+### Security
+- Journal files open at `0o600` and journal dirs at `0o750` (was
+  `0o644` / `0o755`).
+
 ### Docs
-- _(placeholder — next change lands here)_
+- `README.md`, `docs/ARCHITECTURE.md`, `docs/GLOSSARY.md`: added
+  `cmd/peek` and refreshed `cmd/analyze` descriptions now that both
+  exist. Fixed a stale `ticker_v2` reference in the README kalshi
+  component blurb.
+- `docs/decisions/0006-peek-probe-kalshi-naming.md` — ADR capturing
+  the `KXHIGH*` / `KXLOWT*` naming asymmetry, the `category` label
+  fact (`"Climate and Weather"`, not `"Weather"`), and the decision to
+  keep `cmd/peek` first-class for W6 hurricane series discovery.
+- `docs/OPERATIONS.md` §2.1 "Smoke-test your first run" — how to
+  use `tape-health.sh`, what passing/failing runs look like, the
+  48h decision criterion.
+
+### Tests
+- `internal/kalshi`: added `TestGetRaw` + `TestGetRawPropagatesAPIError`.
+- **Coverage push across 5 packages**, 4 of 5 now at or above floor:
+
+  | package    | before | after | floor |
+  |------------|-------:|------:|------:|
+  | `config`   |  91.8% | 100%  |   95% |
+  | `env`      |  88.1% | 96.6% |   95% |
+  | `obs`      |  76.9% | 100%  |   90% |
+  | `kalshi`   |  75.2% | 90.3% |   85% |
+  | `journal`  |  71.9% | 85.9% |   90% |
+
+  `journal` remains 4.1% below floor — the uncovered paths are
+  fault-injection territory (file-write errors mid-run, encode
+  failures, flush/fsync failures) that would require dependency
+  injection of the filesystem layer to test cleanly. Tracked as a
+  standalone follow-up.
+- `internal/journal`: lifted two hardcoded ticker intervals
+  (`rotateCheckInterval`, `dropReportInterval`) from 15s/60s constants
+  to package-level vars so age-based-rotation and dropped-frames
+  warning paths are testable in <100 ms rather than needing real wall
+  time. Production behavior unchanged.
 
 ---
 

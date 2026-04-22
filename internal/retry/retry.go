@@ -69,14 +69,14 @@ func Do(ctx context.Context, cfg Config, logger *slog.Logger, fn func(attempt in
 	attempt := 0
 	for {
 		if ctx.Err() != nil {
-			return nil
+			return nil //nolint:nilerr // ctx cancel is clean shutdown per godoc
 		}
 		err := fn(attempt)
 		if err == nil {
 			return nil
 		}
 		if ctx.Err() != nil {
-			return nil
+			return nil //nolint:nilerr // ctx cancel is clean shutdown per godoc
 		}
 		attempt++
 		if cfg.MaxAttempts > 0 && attempt >= cfg.MaxAttempts {

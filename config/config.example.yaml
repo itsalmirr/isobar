@@ -24,21 +24,20 @@ kalshi:
   enabled: true
   api_base: https://api.elections.kalshi.com/trade-api/v2
   ws_url:   wss://api.elections.kalshi.com/trade-api/ws/v2
-  # Series prefixes to subscribe to. KXBTCD = hourly BTC; KXHIGH*/KXLOW* = weather.
+  # Series prefixes. Highs use KXHIGH{CITY}; lows use KXLOWT{CITY} (note
+  # the extra "T" and "NYC" on the low-NY ticker — Kalshi naming is asymmetric).
   series:
-    - KXBTCD
     - KXHIGHNY     # NYC daily high
     - KXHIGHMIA    # Miami daily high
     - KXHIGHLAX    # LA daily high
     - KXHIGHCHI    # Chicago daily high
-    - KXLOWNY
-    - KXLOWMIA
-    - KXLOWLAX
-    - KXLOWCHI
+    - KXLOWTNYC    # NYC daily low
+    - KXLOWTMIA    # Miami daily low
+    - KXLOWTLAX    # LA daily low
+    - KXLOWTCHI    # Chicago daily low
   # Channels to subscribe to per market.
   channels:
     - orderbook_delta
-    - ticker_v2
     - trade
   # WS reconnect tuning.
   reconnect:
@@ -56,10 +55,10 @@ openmeteo:
   poll_interval: 30m
   # Locations correspond 1:1 with Kalshi weather series above.
   locations:
-    - { name: NY,  series: [KXHIGHNY,  KXLOWNY],  lat: 40.7794, lon: -73.9692 }   # Central Park
-    - { name: MIA, series: [KXHIGHMIA, KXLOWMIA], lat: 25.7617, lon: -80.1918 }   # Miami Intl
-    - { name: LAX, series: [KXHIGHLAX, KXLOWLAX], lat: 33.9416, lon: -118.4085 }  # LAX
-    - { name: CHI, series: [KXHIGHCHI, KXLOWCHI], lat: 41.9742, lon: -87.9073 }   # ORD
+    - { name: NY,  series: [KXHIGHNY,  KXLOWTNYC], lat: 40.7794, lon: -73.9692 }   # Central Park
+    - { name: MIA, series: [KXHIGHMIA, KXLOWTMIA], lat: 25.7617, lon: -80.1918 }   # Miami Intl
+    - { name: LAX, series: [KXHIGHLAX, KXLOWTLAX], lat: 33.9416, lon: -118.4085 }  # LAX
+    - { name: CHI, series: [KXHIGHCHI, KXLOWTCHI], lat: 41.9742, lon: -87.9073 }   # ORD
   variables:
     - temperature_2m
     - temperature_2m_max
