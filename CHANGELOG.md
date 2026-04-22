@@ -13,6 +13,15 @@ Section order within a release: `Added` · `Changed` · `Fixed` ·
 
 ## [Unreleased]
 
+### Added
+- `cmd/peek` — one-off Kalshi REST probe. Enumerates candidate series
+  names and prints market counts per status. Built to diagnose the
+  `KXLOW*` naming mismatch; will be reused for hurricane-landfall series
+  discovery in W6.
+- `kalshi.Client.GetRaw(ctx, path, params)` — public wrapper on the
+  private `getRaw` helper. Supports arbitrary signed GET for diagnostics;
+  production callers should still add typed wrappers.
+
 ### Fixed
 - `config/config.example.yaml`: corrected Kalshi WS channel list — `ticker_v2`
   is rejected by the current API (`code 8 "Unknown channel name"`); removed.
