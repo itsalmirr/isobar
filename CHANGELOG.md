@@ -59,6 +59,24 @@ Section order within a release: `Added` · `Changed` · `Fixed` ·
 - `internal/kalshi`: added `TestGetRaw` + `TestGetRawPropagatesAPIError`.
   Coverage rose from 71.0% to 75.2% (floor is 85%; still under, but
   the newly-added public method is now covered).
+- **Coverage push across 5 packages**, 4 of 5 now at or above floor:
+  | package    | before | after | floor |
+  |------------|-------:|------:|------:|
+  | `config`   |  91.8% | 100%  |   95% |
+  | `env`      |  88.1% | 96.6% |   95% |
+  | `obs`      |  76.9% | 100%  |   90% |
+  | `kalshi`   |  75.2% | 90.3% |   85% |
+  | `journal`  |  71.9% | 85.9% |   90% |
+  `journal` remains 4.1% below floor — the uncovered paths are
+  fault-injection territory (file-write errors mid-run, encode
+  failures, flush/fsync failures) that would require dependency
+  injection of the filesystem layer to test cleanly. Tracked as a
+  standalone follow-up.
+- `internal/journal`: lifted two hardcoded ticker intervals
+  (`rotateCheckInterval`, `dropReportInterval`) from 15s/60s constants
+  to package-level vars so age-based-rotation and dropped-frames
+  warning paths are testable in <100 ms rather than needing real wall
+  time. Production behavior unchanged.
 
 ### Added
 - `cmd/analyze` — Phase-0.5 sanity analyzer. Reads the per-source JSONL

@@ -148,6 +148,15 @@ func (j *Journal) Wait(ctx context.Context) {
 	}
 }
 
+// Internal ticker intervals. Kept as package-level vars (not Options
+// fields) so they remain invisible to normal callers but swappable in
+// tests that would otherwise pay real-time seconds to exercise
+// age-based rotation or the dropped-frames warning.
+var (
+	rotateCheckInterval = 15 * time.Second
+	dropReportInterval  = 60 * time.Second
+)
+
 // run is the single owner of the on-disk file.
 func (j *Journal) run() {
 	defer close(j.done)
@@ -245,9 +254,9 @@ func (j *Journal) run() {
 
 	flushTimer := time.NewTicker(j.opts.FlushEvery)
 	defer flushTimer.Stop()
-	rotateTimer := time.NewTicker(15 * time.Second)
+	rotateTimer := time.NewTicker(rotateCheckInterval)
 	defer rotateTimer.Stop()
-	dropReport := time.NewTicker(60 * time.Second)
+	dropReport := time.NewTicker(dropReportInterval)
 	defer dropReport.Stop()
 
 	for {
