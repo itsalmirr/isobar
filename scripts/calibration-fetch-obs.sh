@@ -30,7 +30,9 @@ WINDOW_START="2024-04-29"
 WINDOW_END="2026-04-28"
 
 # 3-letter ASOS IDs, no leading K. Keep in sync with config/config.example.yaml.
-STATIONS=(NYC MIA LAX ORD)
+# CHI uses MDW (Midway), not ORD (O'Hare): Kalshi's KXHIGHCHI/KXLOWTCHI
+# settlement_sources both point at the NWS CLI report issuedby=MDW.
+STATIONS=(NYC MIA LAX MDW)
 
 while [ $# -gt 0 ]; do
   case "$1" in
