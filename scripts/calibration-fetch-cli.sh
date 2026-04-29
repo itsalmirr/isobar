@@ -31,8 +31,10 @@ WINDOW_END="2026-04-28"
 
 # CLI bulletins are AFOS products with PIL = "CLI" + 3-letter station ID.
 # Each station ID must resolve to the *same physical station Kalshi uses for
-# resolution* — verify via Kalshi's series rules, not assumed.
-STATIONS=(NYC MIA LAX ORD)
+# resolution* — verified via Kalshi's `settlement_sources` API, not assumed.
+# Chicago: MDW (Midway), not ORD — both KXHIGHCHI and KXLOWTCHI point at
+# https://forecast.weather.gov/product.php?site=LOT&product=CLI&issuedby=MDW.
+STATIONS=(NYC MIA LAX MDW)
 
 while [ $# -gt 0 ]; do
   case "$1" in
