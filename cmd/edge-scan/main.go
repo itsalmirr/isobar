@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/wh0o0pz/isobar/internal/calibration/mos"
 	"github.com/wh0o0pz/isobar/internal/obs"
 	"github.com/wh0o0pz/isobar/internal/openmeteo"
 	"github.com/wh0o0pz/isobar/internal/replay"
@@ -30,9 +31,21 @@ func main() {
 	date := flag.String("date", "", "YYYY-MM-DD (scans this date's journals; default: all dates)")
 	outPath := flag.String("out", "", "CSV output path (default: stdout)")
 	maxGap := flag.Duration("max-gap", 60*time.Minute, "max time gap between Kalshi snapshot and Open-Meteo poll for pairing")
+	mosPath := flag.String("mos", "", "path to MOS coefficients JSON (from cmd/calibrate-fit); when set, adds calibrated_* columns")
 	flag.Parse()
 
 	logger := obs.Init(os.Getenv("ISOBAR_LOG_LEVEL"))
+
+	var coeffs *mos.Coefficients
+	if *mosPath != "" {
+		c, err := loadCoefficients(*mosPath)
+		if err != nil {
+			logger.Error("load mos coefficients", "path", *mosPath, "err", err)
+			os.Exit(1)
+		}
+		coeffs = c
+		logger.Info("mos coefficients loaded", "path", *mosPath, "bins", len(c.Bins))
+	}
 
 	dates, err := findDates(*dataDir, *date)
 	if err != nil {
@@ -59,7 +72,7 @@ func main() {
 	defer w.Flush()
 	_ = w.Write(edgeCSVHeader())
 
-	var totalRows int
+	var totalRows, calibratedRows int
 	for _, d := range dates {
 		polls, err := loadEnsemblePolls(*dataDir, d)
 		if err != nil {
@@ -78,17 +91,35 @@ func main() {
 		}
 
 		for ticker, book := range books {
-			row, ok := computeEdge(ticker, book, walls[ticker], polls, *maxGap)
+			row, ok := computeEdge(ticker, book, walls[ticker], polls, *maxGap, coeffs)
 			if !ok {
 				continue
 			}
 			_ = writeEdgeRow(w, d, row)
 			totalRows++
+			if !isNaN(row.CalibratedP) {
+				calibratedRows++
+			}
 		}
 	}
 
-	logger.Info("edge-scan complete", "rows", totalRows, "dates", len(dates))
+	logger.Info("edge-scan complete", "rows", totalRows, "calibrated_rows", calibratedRows, "dates", len(dates))
 }
+
+func loadCoefficients(path string) (*mos.Coefficients, error) {
+	f, err := os.Open(path) //nolint:gosec // path is operator-supplied flag
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	var c mos.Coefficients
+	if err := json.NewDecoder(f).Decode(&c); err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+func isNaN(v float64) bool { return v != v }
 
 // findDates returns date directory names (YYYY-MM-DD) under dataDir/kalshi/.
 func findDates(dataDir, dateFilter string) ([]string, error) {
