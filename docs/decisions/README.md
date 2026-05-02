@@ -26,6 +26,7 @@ the old one rather than editing history.
 | [0004](./0004-two-signal-scope.md)      | 2026-04-18 | Scope to two signals (weather-calibrated + hurricane-landfall); defer tail-MM | Accepted |
 | [0005](./0005-extract-retry.md)         | 2026-04-18 | Extract `internal/retry`; fix kalshi throttle; promote DiscoverOpenTickers | Accepted |
 | [0006](./0006-peek-probe-kalshi-naming.md) | 2026-04-22 | Keep `cmd/peek` as an ongoing Kalshi catalog probe | Accepted |
+| [0007](./0007-calibration-ground-truth-cli.md) | 2026-04-29 | Use NWS CLI bulletins as the calibration y-target | Accepted |
 
 ## Template
 
