@@ -23,6 +23,7 @@ build-all: build
 	$(GO) build $(GOFLAGS) -o $(BIN_DIR)/peek ./cmd/peek
 	$(GO) build $(GOFLAGS) -o $(BIN_DIR)/analyze ./cmd/analyze
 	$(GO) build $(GOFLAGS) -o $(BIN_DIR)/calibrate-parse-cli ./cmd/calibrate-parse-cli
+	$(GO) build $(GOFLAGS) -o $(BIN_DIR)/calibrate-fit ./cmd/calibrate-fit
 	$(GO) build $(GOFLAGS) -o $(BIN_DIR)/edge-scan ./cmd/edge-scan
 
 .PHONY: run-tape

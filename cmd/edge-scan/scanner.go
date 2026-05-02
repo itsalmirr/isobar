@@ -6,15 +6,37 @@ import (
 	"math"
 	"time"
 
+	"github.com/wh0o0pz/isobar/internal/calibration/mos"
 	"github.com/wh0o0pz/isobar/internal/market"
 	"github.com/wh0o0pz/isobar/internal/openmeteo"
 	"github.com/wh0o0pz/isobar/internal/replay"
 )
 
+// locationToStation maps the ticker's location code (used in
+// config/config.example.yaml) to the CLI station identifier MOS uses.
+// LAX uses the airport (KLAX), CHI uses Midway (KMDW per ADR-0007).
+var locationToStation = map[string]string{
+	"NY":  "KNYC",
+	"MIA": "KMIA",
+	"LAX": "KLAX",
+	"CHI": "KMDW",
+}
+
+func tempVarString(v market.TempVar) string {
+	if v == market.DailyHigh {
+		return "tmax"
+	}
+	return "tmin"
+}
+
 // EdgeRow is one (ticker, book-snapshot, paired-poll) edge observation.
 // All "edge" fields are signed cents at the orderbook mid: positive means
-// the model's naive probability beats the market by that many cents per
-// contract after round-trip fees.
+// the model's probability beats the market by that many cents per contract
+// after round-trip fees.
+//
+// Calibrated* fields are populated only when --mos coefficients are loaded
+// AND a fitted bin exists for the (station, season, variable). Otherwise
+// they are NaN and serialise to empty CSV cells.
 type EdgeRow struct {
 	Ticker            string
 	Series            string
@@ -32,6 +54,14 @@ type EdgeRow struct {
 	EnsembleSpreadF   float64
 	MembersInBracket  int
 	PollAgeSeconds    float64
+
+	// Calibrated (MOS) fields. NaN when no coefficients are loaded or no
+	// matching bin exists.
+	CalibratedP            float64
+	CalibratedYesEdgeCents float64
+	CalibratedNoEdgeCents  float64
+	CalibratedMu           float64 // °F, post-bias-correction forecast mean
+	CalibratedSigma        float64 // °F, residual stdev of the bin
 }
 
 // pollEntry is an ensemble poll with metadata for time-based pairing.
@@ -112,45 +142,104 @@ func ensembleRange(members [openmeteo.NumMembers]float64) (float64, float64) {
 	return lo, hi
 }
 
+// ensembleMean returns the arithmetic mean of valid members.
+func ensembleMean(members [openmeteo.NumMembers]float64) float64 {
+	sum := 0.0
+	n := 0
+	for _, v := range members {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			continue
+		}
+		sum += v
+		n++
+	}
+	if n == 0 {
+		return math.NaN()
+	}
+	return sum / float64(n)
+}
+
 // edgeFromExtremes is the pure edge-computation kernel: given a parsed
 // ticker, the orderbook's mid + spread + ticker-side daily-extreme members,
-// and the poll's age, return a fully-populated EdgeRow.
+// the poll's age, and optional MOS coefficients, return a fully-populated
+// EdgeRow.
+//
+// When coeffs is nil OR no fitted bin matches the (station, season, var),
+// the Calibrated* fields are NaN. When a bin matches, the calibrated
+// probability is Φ((threshold − μ_calibrated) / σ_residual) for "below"
+// brackets, 1 − Φ for "above" brackets, and the calibrated edge is
+// computed identically to the naive one.
 //
 // This is the testable core. The caller (computeEdge below) handles the
 // I/O of looking up a poll and extracting daily extremes.
-func edgeFromExtremes(tk market.Ticker, mid, spread int, members [openmeteo.NumMembers]float64, pollAge time.Duration) EdgeRow {
+func edgeFromExtremes(tk market.Ticker, mid, spread int, members [openmeteo.NumMembers]float64, pollAge time.Duration, coeffs *mos.Coefficients) EdgeRow {
 	naiveP, inBracket := naiveProbability(members, tk.Type, tk.TempF)
 	feeCents := market.RoundTripFeeCents(mid)
 	naiveCents := naiveP * 100.0
 	eMin, eMax := ensembleRange(members)
 
-	return EdgeRow{
-		Ticker:            tk.Raw,
-		Series:            tk.Series,
-		Location:          tk.Location(),
-		BracketType:       tk.Type.String(),
-		TempF:             tk.TempF,
-		MarketMidCents:    mid,
-		MarketSpreadCents: spread,
-		NaiveP:            naiveP,
-		FeeRoundTripCents: feeCents,
-		YesEdgeCents:      naiveCents - float64(mid) - float64(feeCents),
-		NoEdgeCents:       float64(mid) - naiveCents - float64(feeCents),
-		EnsembleMinF:      eMin,
-		EnsembleMaxF:      eMax,
-		EnsembleSpreadF:   eMax - eMin,
-		MembersInBracket:  inBracket,
-		PollAgeSeconds:    pollAge.Seconds(),
+	row := EdgeRow{
+		Ticker:                 tk.Raw,
+		Series:                 tk.Series,
+		Location:               tk.Location(),
+		BracketType:            tk.Type.String(),
+		TempF:                  tk.TempF,
+		MarketMidCents:         mid,
+		MarketSpreadCents:      spread,
+		NaiveP:                 naiveP,
+		FeeRoundTripCents:      feeCents,
+		YesEdgeCents:           naiveCents - float64(mid) - float64(feeCents),
+		NoEdgeCents:            float64(mid) - naiveCents - float64(feeCents),
+		EnsembleMinF:           eMin,
+		EnsembleMaxF:           eMax,
+		EnsembleSpreadF:        eMax - eMin,
+		MembersInBracket:       inBracket,
+		PollAgeSeconds:         pollAge.Seconds(),
+		CalibratedP:            math.NaN(),
+		CalibratedYesEdgeCents: math.NaN(),
+		CalibratedNoEdgeCents:  math.NaN(),
+		CalibratedMu:           math.NaN(),
+		CalibratedSigma:        math.NaN(),
 	}
+
+	if coeffs == nil {
+		return row
+	}
+	station, ok := locationToStation[tk.Location()]
+	if !ok {
+		return row
+	}
+	mean := ensembleMean(members)
+	if math.IsNaN(mean) {
+		return row
+	}
+	mu, sigma, ok := coeffs.Predict(station, tk.Date, tempVarString(tk.TempVar), mean)
+	if !ok {
+		return row
+	}
+	var calP float64
+	switch tk.Type {
+	case market.BracketBelow:
+		calP = mos.ProbBelow(tk.TempF, mu, sigma)
+	case market.BracketAbove:
+		calP = mos.ProbAbove(tk.TempF, mu, sigma)
+	}
+	calCents := calP * 100.0
+	row.CalibratedP = calP
+	row.CalibratedYesEdgeCents = calCents - float64(mid) - float64(feeCents)
+	row.CalibratedNoEdgeCents = float64(mid) - calCents - float64(feeCents)
+	row.CalibratedMu = mu
+	row.CalibratedSigma = sigma
+	return row
 }
 
-// computeEdge produces an EdgeRow for one (ticker, book) pair using polls.
-// Returns ok=false if the row should be skipped:
-//   - unparseable ticker (non-weather series, malformed)
-//   - one-sided book (mid undefined)
-//   - no matching poll within maxGap for the ticker's location
-//   - bracket date outside any poll's forecast window
-func computeEdge(ticker string, book *replay.Book, wall int64, polls []*pollEntry, maxGap time.Duration) (EdgeRow, bool) {
+// computeEdge produces an EdgeRow for one (ticker, book) pair using polls
+// and (optionally) MOS coefficients. Returns ok=false if the row should be
+// skipped: unparseable ticker, one-sided book, no matching poll within
+// maxGap, or bracket date outside any poll's forecast window.
+//
+// coeffs may be nil; when nil, EdgeRow.Calibrated* fields are NaN.
+func computeEdge(ticker string, book *replay.Book, wall int64, polls []*pollEntry, maxGap time.Duration, coeffs *mos.Coefficients) (EdgeRow, bool) {
 	tk, err := market.ParseTicker(ticker)
 	if err != nil {
 		return EdgeRow{}, false
@@ -174,7 +263,7 @@ func computeEdge(ticker string, book *replay.Book, wall int64, polls []*pollEntr
 	case market.DailyLow:
 		members = minTemps
 	}
-	return edgeFromExtremes(tk, mid, book.SpreadYesCents(), members, gap), true
+	return edgeFromExtremes(tk, mid, book.SpreadYesCents(), members, gap, coeffs), true
 }
 
 // edgeCSVHeader returns the header row for edge-scan CSV output.
@@ -186,7 +275,20 @@ func edgeCSVHeader() []string {
 		"yes_edge_cents", "no_edge_cents",
 		"ensemble_min_f", "ensemble_max_f", "ensemble_spread_f",
 		"members_in_bracket", "poll_age_seconds",
+		// MOS-calibrated columns. Empty when --mos coefficients aren't loaded
+		// or no fitted bin matches.
+		"calibrated_p", "calibrated_mu_f", "calibrated_sigma_f",
+		"calibrated_yes_edge_cents", "calibrated_no_edge_cents",
 	}
+}
+
+// fmtNaN renders math.NaN as the empty string and a float as "%.<prec>f"
+// otherwise. Used to emit MOS columns as blank when no bin matched.
+func fmtNaN(v float64, prec int) string {
+	if math.IsNaN(v) {
+		return ""
+	}
+	return fmt.Sprintf("%.*f", prec, v)
 }
 
 // writeEdgeRow writes one EdgeRow as a CSV line under the given date.
@@ -205,5 +307,10 @@ func writeEdgeRow(w *csv.Writer, date string, r EdgeRow) error {
 		fmt.Sprintf("%.1f", r.EnsembleSpreadF),
 		fmt.Sprintf("%d", r.MembersInBracket),
 		fmt.Sprintf("%.0f", r.PollAgeSeconds),
+		fmtNaN(r.CalibratedP, 4),
+		fmtNaN(r.CalibratedMu, 1),
+		fmtNaN(r.CalibratedSigma, 2),
+		fmtNaN(r.CalibratedYesEdgeCents, 2),
+		fmtNaN(r.CalibratedNoEdgeCents, 2),
 	})
 }
