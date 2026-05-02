@@ -22,6 +22,8 @@ build-all: build
 	@mkdir -p $(BIN_DIR)
 	$(GO) build $(GOFLAGS) -o $(BIN_DIR)/peek ./cmd/peek
 	$(GO) build $(GOFLAGS) -o $(BIN_DIR)/analyze ./cmd/analyze
+	$(GO) build $(GOFLAGS) -o $(BIN_DIR)/calibrate-parse-cli ./cmd/calibrate-parse-cli
+	$(GO) build $(GOFLAGS) -o $(BIN_DIR)/edge-scan ./cmd/edge-scan
 
 .PHONY: run-tape
 run-tape: build
@@ -34,6 +36,10 @@ run-peek:
 .PHONY: run-analyze
 run-analyze:
 	$(GO) run ./cmd/analyze
+
+.PHONY: run-edge-scan
+run-edge-scan:
+	$(GO) run ./cmd/edge-scan
 
 .PHONY: test
 test:
