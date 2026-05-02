@@ -18,7 +18,9 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"syscall"
+	"time"
 
 	"golang.org/x/sync/errgroup"
 
@@ -124,7 +126,89 @@ func startKalshi(ctx context.Context, logger *slog.Logger, cfg config.Config) er
 		Logger:  logger,
 		OnFrame: makeWSFrameHandler(jrn, "kalshi"),
 	})
+
+	if cfg.Kalshi.RediscoverInterval > 0 {
+		go runRediscovery(ctx, logger, rest, sub, cfg.Kalshi.Series, cfg.Kalshi.RediscoverInterval)
+	}
+
 	return sub.Run(ctx)
+}
+
+// runRediscovery periodically re-runs DiscoverOpenTickers and reloads the
+// subscriber if the open-ticker set changed. This prevents the recorder
+// from going dead after configured series' brackets settle (the next-day
+// markets exist in Kalshi's catalog but were not in the initial
+// subscription). Returns when ctx is cancelled.
+func runRediscovery(ctx context.Context, logger *slog.Logger, rest *kalshi.Client, sub *kalshi.Subscriber, series []string, interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	logger.Info("kalshi: rediscovery started", "interval", interval)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			fresh, err := rest.DiscoverOpenTickers(ctx, series, logger)
+			if err != nil {
+				logger.Warn("kalshi: rediscovery failed", "err", err)
+				continue
+			}
+			current := sub.Tickers()
+			if sameTickerSet(current, fresh) {
+				logger.Debug("kalshi: rediscovery — no change", "n", len(current))
+				continue
+			}
+			added := diffTickers(fresh, current)
+			removed := diffTickers(current, fresh)
+			logger.Info("kalshi: rediscovery — set changed",
+				"before", len(current), "after", len(fresh),
+				"added", len(added), "removed", len(removed),
+				"added_sample", sample(added, 3))
+			sub.SetTickers(fresh)
+			sub.Reload()
+		}
+	}
+}
+
+// sameTickerSet returns true iff a and b contain the same elements (order
+// irrelevant). O(n+m).
+func sameTickerSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	set := make(map[string]struct{}, len(a))
+	for _, x := range a {
+		set[x] = struct{}{}
+	}
+	for _, x := range b {
+		if _, ok := set[x]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// diffTickers returns elements of a not in b, sorted.
+func diffTickers(a, b []string) []string {
+	bset := make(map[string]struct{}, len(b))
+	for _, x := range b {
+		bset[x] = struct{}{}
+	}
+	var out []string
+	for _, x := range a {
+		if _, ok := bset[x]; !ok {
+			out = append(out, x)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func sample(s []string, n int) []string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
 }
 
 func startOpenMeteo(ctx context.Context, logger *slog.Logger, cfg config.Config) error {
