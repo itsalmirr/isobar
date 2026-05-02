@@ -231,6 +231,80 @@ func TestSubscriberDefaultOnFrameIsSafe(t *testing.T) {
 	s.opts.OnFrame([]byte("ok"))
 }
 
+// TestSubscriberReloadResubscribesWithNewTickers verifies that calling
+// SetTickers + Reload causes the subscriber to disconnect and re-subscribe
+// with the new ticker list. This is the core mechanism for handling daily
+// bracket settlement: when old markets close at midnight, we discover new
+// ones and Reload to subscribe without losing the WS lifecycle benefits
+// of retry.Do (auto-reconnect, backoff).
+func TestSubscriberReloadResubscribesWithNewTickers(t *testing.T) {
+	w := newKalshiWSServer(t, nil)
+	_, pem := testKeyPair(t)
+	signer, err := NewSigner("keyid", pem)
+	require.NoError(t, err)
+
+	sub := NewSubscriber(SubscriberOptions{
+		WSURL:    w.wsURL(),
+		Signer:   signer,
+		Channels: []string{"orderbook_delta"},
+		Tickers:  []string{"OLD-TICKER"},
+		Logger:   discardLogger(),
+		Reconnect: ReconnectOptions{
+			InitialBackoff: 5 * time.Millisecond,
+			MaxBackoff:     10 * time.Millisecond,
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = sub.Run(ctx) }()
+
+	// First subscribe carries OLD-TICKER.
+	select {
+	case s := <-w.subscribes:
+		var msg subscribeMessage
+		require.NoError(t, json.Unmarshal([]byte(s), &msg))
+		require.Equal(t, []string{"OLD-TICKER"}, msg.Params.MarketTickers)
+	case <-time.After(2 * time.Second):
+		t.Fatal("first subscribe never observed")
+	}
+
+	// Swap tickers and trigger reload.
+	sub.SetTickers([]string{"NEW-TICKER-A", "NEW-TICKER-B"})
+	sub.Reload()
+
+	// After reload the subscriber should reconnect and re-subscribe with
+	// the new tickers.
+	select {
+	case s := <-w.subscribes:
+		var msg subscribeMessage
+		require.NoError(t, json.Unmarshal([]byte(s), &msg))
+		require.Equal(t, []string{"NEW-TICKER-A", "NEW-TICKER-B"}, msg.Params.MarketTickers)
+	case <-time.After(3 * time.Second):
+		t.Fatal("reload did not trigger resubscribe")
+	}
+}
+
+// TestSubscriberTickersIsCopySafe verifies that the public Tickers()
+// returns a defensive copy and SetTickers doesn't share state with caller.
+func TestSubscriberTickersIsCopySafe(t *testing.T) {
+	sub := NewSubscriber(SubscriberOptions{
+		WSURL:   "wss://unused",
+		Tickers: []string{"A", "B"},
+	})
+
+	got := sub.Tickers()
+	require.Equal(t, []string{"A", "B"}, got)
+
+	got[0] = "MUTATED" // caller mutation must not affect internal state
+	require.Equal(t, []string{"A", "B"}, sub.Tickers())
+
+	caller := []string{"X", "Y"}
+	sub.SetTickers(caller)
+	caller[0] = "MUTATED" // caller mutation post-Set must not affect internal state
+	require.Equal(t, []string{"X", "Y"}, sub.Tickers())
+}
+
 // Ensure using the subscriber type plus its internal fields doesn't
 // introduce silent data races.
 func TestSubscriberConcurrentOnFrameIsLocal(t *testing.T) {
