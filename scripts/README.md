@@ -6,8 +6,6 @@ should be promoted to a proper Go subcommand under `cmd/`.
 | script                | purpose                                                |
 | --------------------- | ------------------------------------------------------ |
 | [tape-health.sh](./tape-health.sh) | Smoke-check the tape after the first ~1h run; prints a PASS/FAIL verdict answering "is it worth 48 hours?" |
-| [calibration-fetch-obs.sh](./calibration-fetch-obs.sh) | Pull 2y of paired-hourly ASOS temperature observations (NY/MIA/LAX/CHI) from Iowa Mesonet — ground truth for Phase 0.5 NGR/EMOS calibration. |
-| [loop-prompt.txt](./loop-prompt.txt) | Reusable prompt for `/loop 1h …` automated tape-health check-ins. Not executable — paste contents after `/loop 1h `. |
 
 ## Conventions
 
