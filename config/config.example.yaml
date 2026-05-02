@@ -58,7 +58,7 @@ openmeteo:
     - { name: NY,  series: [KXHIGHNY,  KXLOWTNYC], lat: 40.7794, lon: -73.9692 }   # Central Park
     - { name: MIA, series: [KXHIGHMIA, KXLOWTMIA], lat: 25.7617, lon: -80.1918 }   # Miami Intl
     - { name: LAX, series: [KXHIGHLAX, KXLOWTLAX], lat: 33.9416, lon: -118.4085 }  # LAX
-    - { name: CHI, series: [KXHIGHCHI, KXLOWTCHI], lat: 41.9742, lon: -87.9073 }   # ORD
+    - { name: CHI, series: [KXHIGHCHI, KXLOWTCHI], lat: 41.7861, lon: -87.7522 }   # KMDW (Chicago Midway — Kalshi resolves KXHIGHCHI/KXLOWTCHI here)
   variables:
     - temperature_2m
     - temperature_2m_max

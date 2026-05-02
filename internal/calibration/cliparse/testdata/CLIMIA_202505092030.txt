@@ -1,0 +1,98 @@
+390 
+CDUS42 KMFL 092030
+CLIMIA
+
+CLIMATE REPORT 
+NATIONAL WEATHER SERVICE MIAMI,FL
+430 PM EDT FRI MAY 09 2025
+
+...................................
+
+...THE MIAMI CLIMATE SUMMARY FOR MAY 9 2025...
+VALID TODAY AS OF 0400 PM LOCAL TIME.
+
+CLIMATE NORMAL PERIOD: 1991 TO 2020
+CLIMATE RECORD PERIOD: 1895 TO 2025
+
+
+WEATHER ITEM   OBSERVED TIME   RECORD YEAR NORMAL DEPARTURE LAST      
+                VALUE   (LST)  VALUE       VALUE  FROM      YEAR     
+                                                  NORMAL           
+...................................................................
+TEMPERATURE (F)                                                          
+ TODAY                                                               
+  MAXIMUM         86        MM  95    2010  86      0       87        
+  MINIMUM         75        MM  52    1898  73      2       77        
+  AVERAGE         81                        79      2       82     
+
+PRECIPITATION (IN)                                                    
+  TODAY            0.00          1.15 1956   0.16  -0.16     0.00     
+  MONTH TO DATE    1.08                      1.27  -0.19     1.37     
+  SINCE NOV 1      6.96                     17.04 -10.08    26.06     
+  SINCE JAN 1      5.31                     11.07  -5.76    12.85     
+
+SNOWFALL (IN)                                                              
+  TODAY            0.0                                                
+  MONTH TO DATE    0.0                                                
+  SINCE MAR 1      0.0                                                
+  SINCE JUL 1      0.0                                                
+  SNOW DEPTH       0                                                 
+
+DEGREE DAYS                                                           
+ HEATING                                                              
+  TODAY            0                         0      0        0        
+  MONTH TO DATE    0                         0      0        0        
+  SINCE MAR 1      0                         8     -8        0        
+  SINCE JUL 1     53                       103    -50       25        
+
+ COOLING                                                              
+  TODAY           16                        14      2       17        
+  MONTH TO DATE  131                       126      5      140        
+  SINCE MAR 1    775                       738     37      829        
+  SINCE JAN 1   1159                      1076     83     1158        
+...................................................................
+
+
+WIND (MPH)                                                            
+  HIGHEST WIND SPEED    16   HIGHEST WIND DIRECTION    SE (120)       
+  HIGHEST GUST SPEED    24   HIGHEST GUST DIRECTION     S (160)       
+  AVERAGE WIND SPEED     8.9                                        
+
+
+SKY COVER                                                             
+  AVERAGE SKY COVER 0.5                                                 
+
+
+WEATHER CONDITIONS                                                    
+THE FOLLOWING WEATHER WAS RECORDED TODAY.                             
+  NO SIGNIFICANT WEATHER WAS OBSERVED.                                  
+
+
+RELATIVE HUMIDITY (PERCENT)
+ HIGHEST    79                                                        
+ LOWEST     57                                                        
+ AVERAGE    68                                                        
+
+..........................................................
+
+
+THE MIAMI CLIMATE NORMALS FOR TOMORROW
+                         NORMAL    RECORD    YEAR                     
+ MAXIMUM TEMPERATURE (F)   86        94      1941                      
+ MINIMUM TEMPERATURE (F)   73        57      1923                      
+
+
+SUNRISE AND SUNSET                                                    
+MAY  9 2025...........SUNRISE   6:39 AM EDT   SUNSET   7:57 PM EDT     
+MAY 10 2025...........SUNRISE   6:38 AM EDT   SUNSET   7:57 PM EDT     
+
+
+-  INDICATES NEGATIVE NUMBERS.
+R  INDICATES RECORD WAS SET OR TIED.
+MM INDICATES DATA IS MISSING.
+T  INDICATES TRACE AMOUNT.
+
+
+
+
+$$

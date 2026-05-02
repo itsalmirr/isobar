@@ -1,0 +1,99 @@
+858 
+CDUS43 KLOT 010635
+CLIORD
+
+CLIMATE REPORT 
+NATIONAL WEATHER SERVICE CHICAGO IL
+1235 AM CST THU JAN 01 2026
+
+...................................
+
+...THE CHICAGO-OHARE CLIMATE SUMMARY FOR DECEMBER 31 2025...
+
+CLIMATE NORMAL PERIOD: 1991 TO 2020
+CLIMATE RECORD PERIOD: 1871 TO 2025
+
+
+WEATHER ITEM   OBSERVED TIME   RECORD YEAR NORMAL DEPARTURE LAST      
+                VALUE   (LST)  VALUE       VALUE  FROM      YEAR     
+                                                  NORMAL           
+...................................................................
+TEMPERATURE (F)                                                          
+ YESTERDAY                                                           
+  MAXIMUM         35   5:58 PM  68    1875  33      2       42        
+  MINIMUM         16  11:59 PM -10    1967  21     -5       34        
+  AVERAGE         26                        27     -1       38     
+
+PRECIPITATION (IN)                                                    
+  YESTERDAY        0.04          0.89 1978   0.07  -0.03     0.57     
+  MONTH TO DATE    2.07                      2.11  -0.04     1.93     
+  SINCE DEC 1      2.07                      2.11  -0.04     1.93     
+  SINCE JAN 1     29.79                     37.86  -8.07    34.92     
+
+SNOWFALL (IN)                                                              
+  YESTERDAY        T             7.6  1978   0.3   -0.3      0.0      
+  MONTH TO DATE    9.5                       7.6    1.9      2.4      
+  SINCE DEC 1      9.5                       7.6    1.9      2.4      
+  SINCE JUL 1     19.9                       9.6   10.3      5.3      
+  SNOW DEPTH       2                                                 
+
+DEGREE DAYS                                                           
+ HEATING                                                              
+  YESTERDAY       39                        38      1       27        
+  MONTH TO DATE 1172                      1069    103     1013        
+  SINCE DEC 1   1172                      1069    103     1013        
+  SINCE JUL 1   2141                      2220    -79     1780        
+
+ COOLING                                                              
+  YESTERDAY        0                         0      0        0        
+  MONTH TO DATE    0                         0      0        0        
+  SINCE DEC 1      0                         0      0        0        
+  SINCE JAN 1   1215                      1003    212     1212        
+...................................................................
+
+
+WIND (MPH)                                                            
+  HIGHEST WIND SPEED    25   HIGHEST WIND DIRECTION     N (360)       
+  HIGHEST GUST SPEED    33   HIGHEST GUST DIRECTION     N (360)       
+  AVERAGE WIND SPEED    12.3                                        
+
+
+SKY COVER                                                             
+  AVERAGE SKY COVER 0.9                                                 
+
+
+WEATHER CONDITIONS                                                    
+THE FOLLOWING WEATHER WAS RECORDED YESTERDAY.                         
+  LIGHT SNOW                                                          
+  SLEET                                                               
+  FOG                                                                 
+
+
+RELATIVE HUMIDITY (PERCENT)
+ HIGHEST    92           1:00 AM                                      
+ LOWEST     62          11:00 PM                                      
+ AVERAGE    77                                                        
+
+..........................................................
+
+
+THE CHICAGO-OHARE CLIMATE NORMALS FOR TODAY
+                         NORMAL    RECORD    YEAR                     
+ MAXIMUM TEMPERATURE (F)   33        65      1876                      
+ MINIMUM TEMPERATURE (F)   21       -10      1969                      
+
+
+SUNRISE AND SUNSET                                                    
+JANUARY  1 2026.......SUNRISE   7:20 AM CST   SUNSET   4:31 PM CST     
+JANUARY  2 2026.......SUNRISE   7:20 AM CST   SUNSET   4:32 PM CST     
+
+
+-  INDICATES NEGATIVE NUMBERS.
+R  INDICATES RECORD WAS SET OR TIED.
+MM INDICATES DATA IS MISSING.
+T  INDICATES TRACE AMOUNT.
+
+
+
+
+$$
