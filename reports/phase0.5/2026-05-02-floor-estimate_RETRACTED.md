@@ -1,3 +1,51 @@
+# Phase 0.5 Floor Estimate — 2026-05-02 — RETRACTED
+
+> **This report is retracted. Original text preserved unchanged below the line for reference.**
+> The honest successor is at [`2026-05-02-pipeline-validation.md`](./2026-05-02-pipeline-validation.md).
+
+## Retraction header — what was wrong and what we know now
+
+**Date of retraction:** 2026-05-02 (same day as original publication)
+**Retracted by:** isobar team, after methodology audit prompted by user pushback
+
+### What the original report claimed
+
+The TL;DR led with "MOS-calibrated Brier-skill is **+53.5%** vs market on the 73 verifiable bracket outcomes" and concluded "**Phase 0.5 gate is met.**" The decision table marked all three Phase 0.5 gate criteria from ADR-0001 as ✅.
+
+### Why that was wrong
+
+Three problems compound:
+
+1. **Selection bias toward OTM brackets.** The verification set of 73 rows is heavily skewed: 47% of mids are below 15¢, 76% below 35¢, almost none in 65-100¢. This is not the population of brackets a trader can actually act on. The full-set Brier comparison is dominated by deeply-OTM lottery-ticket brackets where the market correctly priced ~1¢ but the rare YES outcome blew up the squared error to ~0.98 per row. Selection mechanism (suspected): the ITM half of each bracket pair has no liquid YES bid (no one pays 99¢ for $1), so it goes one-sided and gets filtered by `mid <= 0 || mid >= 100`. The OTM half stays two-sided due to lottery-ticket buyers.
+2. **n=20 in the tradeable [30,70]¢ zone is statistically meaningless.** Stratifying to the actually-tradeable midrange (where the trading economics matter), the picture inverts: MOS Brier 0.412 vs market 0.271. But analytic SE on a Brier difference at n=20 is roughly `sqrt(2·0.25/20) ≈ 0.16`, so neither the +14pp original direction nor the −14pp stratified direction is one full standard error from zero. **The data is consistent with anything from MOS substantially better to MOS substantially worse.**
+3. **No naive-shrunk-to-climatology baseline.** MOS shrinks naive's overconfident extremes (100% → 95-99%); that's most of the +12pp Brier-skill MOS gets over naive. But a 5-line `0.2·climate_p + 0.8·naive_p` shrinkage estimator does the same thing at near-zero engineering cost. Without the climate baseline in the comparison, we don't know whether MOS earns its complexity.
+
+### Stratified Brier table (the part that's honest)
+
+| Mid range | n | Naive Brier | MOS Brier | Market Brier |
+|---|---:|---:|---:|---:|
+| Full [0,100]¢ | 73 | 0.226 | 0.181 | 0.389 |
+| [10,90]¢ | 41 | 0.366 | 0.314 | 0.353 |
+| [20,80]¢ | 32 | 0.376 | 0.324 | 0.314 |
+| **[30,70]¢ (tradeable)** | **20** | **0.447** | **0.412** | **0.271** |
+
+The market Brier 0.39 in the full set is artifact, not a real "market is worse than coin flip" finding. In the [30,70]¢ stratum (n=20, too small for any conclusion), the market is directionally better than both naive and MOS — but again, n=20 means we can't say this with statistical confidence.
+
+### What we still believe
+
+- The pipeline is built and tested end-to-end (recorder → calibration → edge-scan)
+- MOS does correctly shrink naive's overconfident extremes, and the per-station bias corrections (KMIA TMAX +2°F intercept) work as designed
+- The fee-symmetry identity holds across all 154 rows
+- The +12pp Brier improvement of MOS over naive is real but applies almost entirely to OTM tail-shrinkage, not to the tradeable midrange
+
+### What's gated on more data
+
+The honest verdict on Phase 0.5 is deferred to a v2 report when (a) we have ≥200 verifiable brackets, properly stratified by lead time, and (b) we add the naive-shrunk-to-climatology baseline. ETA: 2-3 weeks of continuous Vultr capture under the rolling-rediscovery fix shipped today.
+
+---
+
+> Original report below this line, preserved unchanged.
+
 # Phase 0.5 Floor Estimate — 2026-05-02
 
 **Status:** First-pass MOS calibration ships. Phase 0.5 gate criterion **MET** on the verifiable subset.
