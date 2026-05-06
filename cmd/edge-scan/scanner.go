@@ -6,6 +6,7 @@ import (
 	"math"
 	"time"
 
+	"github.com/wh0o0pz/isobar/internal/calibration/climate"
 	"github.com/wh0o0pz/isobar/internal/calibration/mos"
 	"github.com/wh0o0pz/isobar/internal/market"
 	"github.com/wh0o0pz/isobar/internal/openmeteo"
@@ -55,6 +56,11 @@ type EdgeRow struct {
 	MembersInBracket  int
 	PollAgeSeconds    float64
 
+	// LeadHours is the time from the book-state snapshot to bracket
+	// settlement (settlement = midnight local on bracket_date+1). Used
+	// for lead-time stratification at analysis time.
+	LeadHours float64
+
 	// Calibrated (MOS) fields. NaN when no coefficients are loaded or no
 	// matching bin exists.
 	CalibratedP            float64
@@ -62,6 +68,15 @@ type EdgeRow struct {
 	CalibratedNoEdgeCents  float64
 	CalibratedMu           float64 // °F, post-bias-correction forecast mean
 	CalibratedSigma        float64 // °F, residual stdev of the bin
+
+	// Climate-shrunk-naive baseline. Uses historical bracket frequency
+	// from CLI obs as a shrinkage target: p_shrunk = w·climate + (1-w)·naive.
+	// NaN when no climate lookup is loaded or no historical observations
+	// match the season window. See Pass 3 §4.b.
+	ClimateP             float64 // raw climatological frequency, no naive blend
+	ClimateShrunkP       float64 // 0.2·climate + 0.8·naive
+	ClimateShrunkYesEdge float64
+	ClimateShrunkNoEdge  float64
 }
 
 // pollEntry is an ensemble poll with metadata for time-based pairing.
@@ -159,20 +174,26 @@ func ensembleMean(members [openmeteo.NumMembers]float64) float64 {
 	return sum / float64(n)
 }
 
+// settlementUTC returns the UTC timestamp at which a bracket settles.
+// Settlement = end of bracket day in local time = start of (bracket_date+1)
+// in local TZ, converted to UTC.
+func settlementUTC(bracketDate time.Time, utcOffsetHours int) time.Time {
+	endOfDayLocal := bracketDate.Add(24 * time.Hour)
+	return endOfDayLocal.Add(time.Duration(-utcOffsetHours) * time.Hour)
+}
+
 // edgeFromExtremes is the pure edge-computation kernel: given a parsed
 // ticker, the orderbook's mid + spread + ticker-side daily-extreme members,
-// the poll's age, and optional MOS coefficients, return a fully-populated
-// EdgeRow.
+// the poll's age, optional MOS coefficients, and optional climate lookup,
+// return a fully-populated EdgeRow.
 //
-// When coeffs is nil OR no fitted bin matches the (station, season, var),
-// the Calibrated* fields are NaN. When a bin matches, the calibrated
-// probability is Φ((threshold − μ_calibrated) / σ_residual) for "below"
-// brackets, 1 − Φ for "above" brackets, and the calibrated edge is
-// computed identically to the naive one.
+// When coeffs is nil OR no fitted bin matches, Calibrated* fields are NaN.
+// When climate is nil OR no historical match, ClimateP and Climate*Edge
+// fields are NaN.
 //
 // This is the testable core. The caller (computeEdge below) handles the
 // I/O of looking up a poll and extracting daily extremes.
-func edgeFromExtremes(tk market.Ticker, mid, spread int, members [openmeteo.NumMembers]float64, pollAge time.Duration, coeffs *mos.Coefficients) EdgeRow {
+func edgeFromExtremes(tk market.Ticker, mid, spread int, members [openmeteo.NumMembers]float64, pollAge time.Duration, leadHours float64, coeffs *mos.Coefficients, clim *climate.Lookup) EdgeRow {
 	naiveP, inBracket := naiveProbability(members, tk.Type, tk.TempF)
 	feeCents := market.RoundTripFeeCents(mid)
 	naiveCents := naiveP * 100.0
@@ -195,51 +216,68 @@ func edgeFromExtremes(tk market.Ticker, mid, spread int, members [openmeteo.NumM
 		EnsembleSpreadF:        eMax - eMin,
 		MembersInBracket:       inBracket,
 		PollAgeSeconds:         pollAge.Seconds(),
+		LeadHours:              leadHours,
 		CalibratedP:            math.NaN(),
 		CalibratedYesEdgeCents: math.NaN(),
 		CalibratedNoEdgeCents:  math.NaN(),
 		CalibratedMu:           math.NaN(),
 		CalibratedSigma:        math.NaN(),
+		ClimateP:               math.NaN(),
+		ClimateShrunkP:         math.NaN(),
+		ClimateShrunkYesEdge:   math.NaN(),
+		ClimateShrunkNoEdge:    math.NaN(),
 	}
 
-	if coeffs == nil {
-		return row
+	station, hasStation := locationToStation[tk.Location()]
+
+	// MOS calibration path.
+	if coeffs != nil && hasStation {
+		mean := ensembleMean(members)
+		if !math.IsNaN(mean) {
+			if mu, sigma, ok := coeffs.Predict(station, tk.Date, tempVarString(tk.TempVar), mean); ok {
+				var calP float64
+				switch tk.Type {
+				case market.BracketBelow:
+					calP = mos.ProbBelow(tk.TempF, mu, sigma)
+				case market.BracketAbove:
+					calP = mos.ProbAbove(tk.TempF, mu, sigma)
+				}
+				calCents := calP * 100.0
+				row.CalibratedP = calP
+				row.CalibratedYesEdgeCents = calCents - float64(mid) - float64(feeCents)
+				row.CalibratedNoEdgeCents = float64(mid) - calCents - float64(feeCents)
+				row.CalibratedMu = mu
+				row.CalibratedSigma = sigma
+			}
+		}
 	}
-	station, ok := locationToStation[tk.Location()]
-	if !ok {
-		return row
+
+	// Climate-shrunk-naive baseline. Per Pass 3 §4.b, this tests whether
+	// MOS earns its complexity vs trivial shrinkage.
+	if clim != nil && hasStation {
+		bracketAbove := tk.Type == market.BracketAbove
+		climP := clim.BracketProb(station, tempVarString(tk.TempVar), tk.Date, tk.TempF, bracketAbove)
+		if !math.IsNaN(climP) {
+			row.ClimateP = climP
+			shrunkP := climate.ShrinkP(naiveP, climP, climate.DefaultShrinkage)
+			row.ClimateShrunkP = shrunkP
+			shrunkCents := shrunkP * 100.0
+			row.ClimateShrunkYesEdge = shrunkCents - float64(mid) - float64(feeCents)
+			row.ClimateShrunkNoEdge = float64(mid) - shrunkCents - float64(feeCents)
+		}
 	}
-	mean := ensembleMean(members)
-	if math.IsNaN(mean) {
-		return row
-	}
-	mu, sigma, ok := coeffs.Predict(station, tk.Date, tempVarString(tk.TempVar), mean)
-	if !ok {
-		return row
-	}
-	var calP float64
-	switch tk.Type {
-	case market.BracketBelow:
-		calP = mos.ProbBelow(tk.TempF, mu, sigma)
-	case market.BracketAbove:
-		calP = mos.ProbAbove(tk.TempF, mu, sigma)
-	}
-	calCents := calP * 100.0
-	row.CalibratedP = calP
-	row.CalibratedYesEdgeCents = calCents - float64(mid) - float64(feeCents)
-	row.CalibratedNoEdgeCents = float64(mid) - calCents - float64(feeCents)
-	row.CalibratedMu = mu
-	row.CalibratedSigma = sigma
 	return row
 }
 
 // computeEdge produces an EdgeRow for one (ticker, book) pair using polls
-// and (optionally) MOS coefficients. Returns ok=false if the row should be
-// skipped: unparseable ticker, one-sided book, no matching poll within
-// maxGap, or bracket date outside any poll's forecast window.
+// and (optionally) MOS coefficients + climate lookup. Returns ok=false if
+// the row should be skipped: unparseable ticker, one-sided book, no
+// matching poll within maxGap, or bracket date outside any poll's
+// forecast window.
 //
-// coeffs may be nil; when nil, EdgeRow.Calibrated* fields are NaN.
-func computeEdge(ticker string, book *replay.Book, wall int64, polls []*pollEntry, maxGap time.Duration, coeffs *mos.Coefficients) (EdgeRow, bool) {
+// coeffs and clim may both be nil; when nil, the corresponding CSV
+// columns render as empty cells.
+func computeEdge(ticker string, book *replay.Book, wall int64, polls []*pollEntry, maxGap time.Duration, coeffs *mos.Coefficients, clim *climate.Lookup) (EdgeRow, bool) {
 	tk, err := market.ParseTicker(ticker)
 	if err != nil {
 		return EdgeRow{}, false
@@ -263,7 +301,10 @@ func computeEdge(ticker string, book *replay.Book, wall int64, polls []*pollEntr
 	case market.DailyLow:
 		members = minTemps
 	}
-	return edgeFromExtremes(tk, mid, book.SpreadYesCents(), members, gap, coeffs), true
+	settle := settlementUTC(tk.Date, tk.UTCOffset())
+	bookTime := time.Unix(0, wall).UTC()
+	leadHours := settle.Sub(bookTime).Hours()
+	return edgeFromExtremes(tk, mid, book.SpreadYesCents(), members, gap, leadHours, coeffs, clim), true
 }
 
 // edgeCSVHeader returns the header row for edge-scan CSV output.
@@ -275,10 +316,15 @@ func edgeCSVHeader() []string {
 		"yes_edge_cents", "no_edge_cents",
 		"ensemble_min_f", "ensemble_max_f", "ensemble_spread_f",
 		"members_in_bracket", "poll_age_seconds",
+		"lead_hours",
 		// MOS-calibrated columns. Empty when --mos coefficients aren't loaded
 		// or no fitted bin matches.
 		"calibrated_p", "calibrated_mu_f", "calibrated_sigma_f",
 		"calibrated_yes_edge_cents", "calibrated_no_edge_cents",
+		// Climate-shrunk-naive baseline columns. Empty when no historical
+		// observations match. See Pass 3 §4.b.
+		"climate_p", "climate_shrunk_p",
+		"climate_shrunk_yes_edge_cents", "climate_shrunk_no_edge_cents",
 	}
 }
 
@@ -307,10 +353,15 @@ func writeEdgeRow(w *csv.Writer, date string, r EdgeRow) error {
 		fmt.Sprintf("%.1f", r.EnsembleSpreadF),
 		fmt.Sprintf("%d", r.MembersInBracket),
 		fmt.Sprintf("%.0f", r.PollAgeSeconds),
+		fmt.Sprintf("%.2f", r.LeadHours),
 		fmtNaN(r.CalibratedP, 4),
 		fmtNaN(r.CalibratedMu, 1),
 		fmtNaN(r.CalibratedSigma, 2),
 		fmtNaN(r.CalibratedYesEdgeCents, 2),
 		fmtNaN(r.CalibratedNoEdgeCents, 2),
+		fmtNaN(r.ClimateP, 4),
+		fmtNaN(r.ClimateShrunkP, 4),
+		fmtNaN(r.ClimateShrunkYesEdge, 2),
+		fmtNaN(r.ClimateShrunkNoEdge, 2),
 	})
 }

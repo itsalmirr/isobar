@@ -135,7 +135,7 @@ func TestEdgeFromExtremes_BracketAboveStrongYes(t *testing.T) {
 	// Market mid = 30¢. Round-trip fee at 30¢ = 2 * ceil(7*0.3*0.7) = 2*ceil(1.47) = 4¢.
 	// YES edge = 100 - 30 - 4 = +66. NO edge = 30 - 100 - 4 = -74.
 	tk, _ := market.ParseTicker("KXHIGHNY-26APR22-T70")
-	row := edgeFromExtremes(tk, 30, 2, constMembers(80), 60*time.Second, nil)
+	row := edgeFromExtremes(tk, 30, 2, constMembers(80), 60*time.Second, 0, nil, nil)
 	if row.NaiveP != 1.0 {
 		t.Errorf("naive_p = %v, want 1.0", row.NaiveP)
 	}
@@ -158,7 +158,7 @@ func TestEdgeFromExtremes_BracketBelowStrongNo(t *testing.T) {
 	// Market mid = 60¢. Round-trip fee at 60¢ = 2 * ceil(7*0.6*0.4) = 2*ceil(1.68) = 4¢.
 	// YES edge = 0 - 60 - 4 = -64. NO edge = 60 - 0 - 4 = +56.
 	tk, _ := market.ParseTicker("KXHIGHNY-26APR22-B70")
-	row := edgeFromExtremes(tk, 60, 1, constMembers(80), 60*time.Second, nil)
+	row := edgeFromExtremes(tk, 60, 1, constMembers(80), 60*time.Second, 0, nil, nil)
 	if row.NaiveP != 0 {
 		t.Errorf("naive_p = %v, want 0", row.NaiveP)
 	}
@@ -176,7 +176,7 @@ func TestEdgeFromExtremes_FeeSymmetry(t *testing.T) {
 	// minus fees, regardless of probability disagreement.)
 	tk, _ := market.ParseTicker("KXHIGHNY-26APR22-T70")
 	for mid := 5; mid <= 95; mid += 10 {
-		row := edgeFromExtremes(tk, mid, 1, constMembers(80), 0, nil)
+		row := edgeFromExtremes(tk, mid, 1, constMembers(80), 0, 0, nil, nil)
 		sum := row.YesEdgeCents + row.NoEdgeCents
 		want := -2.0 * float64(row.FeeRoundTripCents)
 		if math.Abs(sum-want) > 1e-9 {
@@ -187,7 +187,7 @@ func TestEdgeFromExtremes_FeeSymmetry(t *testing.T) {
 
 func TestComputeEdge_SkipsBadTicker(t *testing.T) {
 	book := mockBook(45, 55)
-	if _, ok := computeEdge("NOT-A-TICKER", book, 0, nil, time.Hour, nil); ok {
+	if _, ok := computeEdge("NOT-A-TICKER", book, 0, nil, time.Hour, nil, nil); ok {
 		t.Error("expected ok=false for unparseable ticker")
 	}
 }
@@ -196,7 +196,7 @@ func TestComputeEdge_SkipsOneSidedBook(t *testing.T) {
 	book := replay.NewBook()
 	// Only yes side populated → BestNoBid()=0, MidYesCents()=0, ask=100.
 	book.Yes[45] = 100
-	if _, ok := computeEdge("KXHIGHNY-26APR22-T70", book, 0, nil, time.Hour, nil); ok {
+	if _, ok := computeEdge("KXHIGHNY-26APR22-T70", book, 0, nil, time.Hour, nil, nil); ok {
 		t.Error("expected ok=false for one-sided book")
 	}
 }
@@ -204,7 +204,7 @@ func TestComputeEdge_SkipsOneSidedBook(t *testing.T) {
 func TestComputeEdge_SkipsWhenNoPollsForLocation(t *testing.T) {
 	book := mockBook(45, 55)
 	polls := []*pollEntry{} // empty
-	if _, ok := computeEdge("KXHIGHNY-26APR22-T70", book, 0, polls, time.Hour, nil); ok {
+	if _, ok := computeEdge("KXHIGHNY-26APR22-T70", book, 0, polls, time.Hour, nil, nil); ok {
 		t.Error("expected ok=false when no polls available")
 	}
 }
@@ -220,12 +220,12 @@ func mockBook(yesBid, noBid int) *replay.Book {
 
 func TestEdgeCSVHeaderAndRow(t *testing.T) {
 	hdr := edgeCSVHeader()
-	if got := len(hdr); got != 22 {
-		t.Errorf("header has %d cols, want 22 (17 base + 5 calibrated)", got)
+	if got := len(hdr); got != 27 {
+		t.Errorf("header has %d cols, want 27 (17 base + 1 lead + 5 calibrated + 4 climate)", got)
 	}
 
 	tk, _ := market.ParseTicker("KXHIGHNY-26APR22-T70")
-	row := edgeFromExtremes(tk, 30, 2, constMembers(80), 60*time.Second, nil)
+	row := edgeFromExtremes(tk, 30, 2, constMembers(80), 60*time.Second, 0, nil, nil)
 
 	var buf bytes.Buffer
 	w := csv.NewWriter(&buf)
@@ -276,7 +276,7 @@ func TestComputeEdge_HappyPathIntegration(t *testing.T) {
 	// Daily max 25°C ≈ 77°F. Bracket "high ≥ 70" → all 31 members above.
 	tk, _ := market.ParseTicker("KXHIGHNY-26APR22-T70")
 	book := mockBook(45, 55) // mid=45, spread=0
-	row, ok := computeEdge(tk.Raw, book, 1000, []*pollEntry{pe}, time.Hour, nil)
+	row, ok := computeEdge(tk.Raw, book, 1000, []*pollEntry{pe}, time.Hour, nil, nil)
 	if !ok {
 		t.Fatal("computeEdge returned ok=false")
 	}
@@ -308,7 +308,7 @@ func TestEdgeFromExtremes_CalibratedPathProducesValues(t *testing.T) {
 			"KNYC|MAM|tmax": {A: 0, B: 1, Sigma: 2.0, NTrain: 100},
 		},
 	}
-	row := edgeFromExtremes(tk, 50, 2, constMembers(80), 0, c)
+	row := edgeFromExtremes(tk, 50, 2, constMembers(80), 0, 0, c, nil)
 	if math.IsNaN(row.CalibratedP) {
 		t.Fatal("expected calibrated_p to be populated")
 	}
@@ -328,7 +328,7 @@ func TestEdgeFromExtremes_CalibratedPathProducesValues(t *testing.T) {
 
 func TestEdgeFromExtremes_NoCalibrationWhenNilCoeffs(t *testing.T) {
 	tk, _ := market.ParseTicker("KXHIGHNY-26APR22-T75")
-	row := edgeFromExtremes(tk, 50, 2, constMembers(80), 0, nil)
+	row := edgeFromExtremes(tk, 50, 2, constMembers(80), 0, 0, nil, nil)
 	if !math.IsNaN(row.CalibratedP) {
 		t.Errorf("calibrated_p should be NaN when coeffs is nil; got %v", row.CalibratedP)
 	}
@@ -342,7 +342,7 @@ func TestEdgeFromExtremes_NoCalibrationWhenBinMissing(t *testing.T) {
 			"KNYC|JJA|tmax": {A: 0, B: 1, Sigma: 2.0, NTrain: 100},
 		},
 	}
-	row := edgeFromExtremes(tk, 50, 2, constMembers(80), 0, c)
+	row := edgeFromExtremes(tk, 50, 2, constMembers(80), 0, 0, c, nil)
 	if !math.IsNaN(row.CalibratedP) {
 		t.Errorf("calibrated_p should be NaN when no matching bin; got %v", row.CalibratedP)
 	}
