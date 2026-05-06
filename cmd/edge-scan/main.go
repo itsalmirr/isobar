@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/wh0o0pz/isobar/internal/calibration/climate"
 	"github.com/wh0o0pz/isobar/internal/calibration/mos"
 	"github.com/wh0o0pz/isobar/internal/obs"
 	"github.com/wh0o0pz/isobar/internal/openmeteo"
@@ -32,6 +33,7 @@ func main() {
 	outPath := flag.String("out", "", "CSV output path (default: stdout)")
 	maxGap := flag.Duration("max-gap", 60*time.Minute, "max time gap between Kalshi snapshot and Open-Meteo poll for pairing")
 	mosPath := flag.String("mos", "", "path to MOS coefficients JSON (from cmd/calibrate-fit); when set, adds calibrated_* columns")
+	climDir := flag.String("climate", "", "path to obs CSVs for climate-shrunk baseline (e.g. data/calibration/obs); when set, adds climate_* columns")
 	flag.Parse()
 
 	logger := obs.Init(os.Getenv("ISOBAR_LOG_LEVEL"))
@@ -45,6 +47,16 @@ func main() {
 		}
 		coeffs = c
 		logger.Info("mos coefficients loaded", "path", *mosPath, "bins", len(c.Bins))
+	}
+
+	var clim *climate.Lookup
+	if *climDir != "" {
+		clim = climate.New()
+		if err := clim.Load(*climDir, []string{"KNYC", "KMIA", "KLAX", "KMDW"}); err != nil {
+			logger.Error("load climate", "dir", *climDir, "err", err)
+			os.Exit(1)
+		}
+		logger.Info("climate lookup loaded", "dir", *climDir)
 	}
 
 	dates, err := findDates(*dataDir, *date)
@@ -72,7 +84,7 @@ func main() {
 	defer w.Flush()
 	_ = w.Write(edgeCSVHeader())
 
-	var totalRows, calibratedRows int
+	var totalRows, calibratedRows, climateRows int
 	for _, d := range dates {
 		polls, err := loadEnsemblePolls(*dataDir, d)
 		if err != nil {
@@ -91,7 +103,7 @@ func main() {
 		}
 
 		for ticker, book := range books {
-			row, ok := computeEdge(ticker, book, walls[ticker], polls, *maxGap, coeffs)
+			row, ok := computeEdge(ticker, book, walls[ticker], polls, *maxGap, coeffs, clim)
 			if !ok {
 				continue
 			}
@@ -100,10 +112,13 @@ func main() {
 			if !isNaN(row.CalibratedP) {
 				calibratedRows++
 			}
+			if !isNaN(row.ClimateShrunkP) {
+				climateRows++
+			}
 		}
 	}
 
-	logger.Info("edge-scan complete", "rows", totalRows, "calibrated_rows", calibratedRows, "dates", len(dates))
+	logger.Info("edge-scan complete", "rows", totalRows, "calibrated_rows", calibratedRows, "climate_rows", climateRows, "dates", len(dates))
 }
 
 func loadCoefficients(path string) (*mos.Coefficients, error) {
