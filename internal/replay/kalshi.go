@@ -1,6 +1,10 @@
 package replay
 
-import "encoding/json"
+import (
+	"encoding/json"
+
+	"github.com/bytedance/sonic"
+)
 
 // KalshiFrame is the decoded top-level shape of a Kalshi WS frame as
 // stored in our journal Payload. Consumers typically discriminate on
@@ -27,7 +31,7 @@ func (f KalshiFrame) MarketTicker() string {
 		return ""
 	}
 	var ref KalshiMarketRef
-	if err := json.Unmarshal(f.Msg, &ref); err != nil {
+	if err := sonic.Unmarshal(f.Msg, &ref); err != nil {
 		return ""
 	}
 	return ref.MarketTicker

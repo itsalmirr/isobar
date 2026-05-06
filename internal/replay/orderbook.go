@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+
+	"github.com/bytedance/sonic"
 )
 
 // Book is the reconstructable state of one Kalshi market's two-sided
@@ -49,7 +51,7 @@ type deltaMsg struct {
 // authoritative.
 func (b *Book) ApplySnapshot(msg json.RawMessage) error {
 	var s snapshotMsg
-	if err := json.Unmarshal(msg, &s); err != nil {
+	if err := sonic.Unmarshal(msg, &s); err != nil {
 		return fmt.Errorf("parse snapshot: %w", err)
 	}
 	b.Yes = make(map[int]float64, len(s.YesDollarsFP))
@@ -75,7 +77,7 @@ func (b *Book) ApplySnapshot(msg json.RawMessage) error {
 // that drives a level to zero (or below) removes that level.
 func (b *Book) ApplyDelta(msg json.RawMessage) error {
 	var d deltaMsg
-	if err := json.Unmarshal(msg, &d); err != nil {
+	if err := sonic.Unmarshal(msg, &d); err != nil {
 		return fmt.Errorf("parse delta: %w", err)
 	}
 	pc, err := priceDollarsToCents(d.Price)
