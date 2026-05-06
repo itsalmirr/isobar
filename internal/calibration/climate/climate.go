@@ -51,7 +51,9 @@ func New() *Lookup {
 //	valid_date,tmax_f,tmin_f,issued_at,bulletin_id
 //
 // Days with empty tmax_f or tmin_f are dropped from that variable's
-// historical set but still count toward the other variable.
+// historical set but still count toward the other variable. Required
+// columns (valid_date, tmax_f, tmin_f) are validated against the header;
+// a missing column fails loudly rather than silently reading column 0.
 func (l *Lookup) Load(obsDir string, stations []string) error {
 	for _, sta := range stations {
 		path := filepath.Join(obsDir, sta+".csv")
@@ -65,7 +67,12 @@ func (l *Lookup) Load(obsDir string, stations []string) error {
 			_ = f.Close()
 			return fmt.Errorf("climate: header %s: %w", path, err)
 		}
-		col := indexOf(header)
+		col, err := requireColumns(header, "valid_date", "tmax_f", "tmin_f")
+		if err != nil {
+			_ = f.Close()
+			return fmt.Errorf("climate: %s: %w", path, err)
+		}
+		minCols := maxIndex(col) + 1
 		if l.obs[sta] == nil {
 			l.obs[sta] = map[string][]obsPoint{}
 		}
@@ -77,6 +84,10 @@ func (l *Lookup) Load(obsDir string, stations []string) error {
 			if err != nil {
 				_ = f.Close()
 				return fmt.Errorf("climate: read %s: %w", path, err)
+			}
+			if len(rec) < minCols {
+				_ = f.Close()
+				return fmt.Errorf("climate: %s: short record (%d cols, need %d)", path, len(rec), minCols)
 			}
 			d, err := time.Parse("2006-01-02", rec[col["valid_date"]])
 			if err != nil {
@@ -152,11 +163,36 @@ func ShrinkP(naive, climate, weight float64) float64 {
 	return weight*climate + (1-weight)*naive
 }
 
-// indexOf maps each header name to its column index.
-func indexOf(header []string) map[string]int {
-	m := make(map[string]int, len(header))
+// requireColumns returns a header→index map containing exactly the
+// requested columns, or an error naming any that are missing.
+func requireColumns(header []string, names ...string) (map[string]int, error) {
+	idx := make(map[string]int, len(header))
 	for i, h := range header {
-		m[h] = i
+		idx[h] = i
+	}
+	out := make(map[string]int, len(names))
+	var missing []string
+	for _, n := range names {
+		i, ok := idx[n]
+		if !ok {
+			missing = append(missing, n)
+			continue
+		}
+		out[n] = i
+	}
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("missing required columns: %v (got header %v)", missing, header)
+	}
+	return out, nil
+}
+
+// maxIndex returns the largest column index in the map.
+func maxIndex(col map[string]int) int {
+	m := -1
+	for _, i := range col {
+		if i > m {
+			m = i
+		}
 	}
 	return m
 }

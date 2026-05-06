@@ -28,10 +28,9 @@ import (
 	"time"
 
 	"github.com/wh0o0pz/isobar/internal/calibration/mos"
+	"github.com/wh0o0pz/isobar/internal/market"
 	"github.com/wh0o0pz/isobar/internal/obs"
 )
-
-var stations = []string{"KNYC", "KMIA", "KLAX", "KMDW"}
 
 func main() {
 	forecastDir := flag.String("forecast-dir", "data/calibration/forecast", "directory of K{STA}.csv forecasts")
@@ -72,7 +71,7 @@ func main() {
 // Days where either side is missing are dropped silently.
 func loadAllPairs(ctx context.Context, fcDir, obsDir string, logger interface{ Info(string, ...any) }) ([]mos.Pair, error) {
 	var all []mos.Pair
-	for _, sta := range stations {
+	for _, sta := range market.AllStationCodes() {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -112,7 +111,11 @@ func readForecastCSV(path string) ([]forecastRow, error) {
 	if err != nil {
 		return nil, fmt.Errorf("header: %w", err)
 	}
-	col := indexOf(header)
+	col, err := requireColumns(header, "valid_date", "gfs_tmax_f", "gfs_tmin_f")
+	if err != nil {
+		return nil, fmt.Errorf("forecast %s: %w", path, err)
+	}
+	minCols := maxIndex(col) + 1
 	out := []forecastRow{}
 	for {
 		rec, err := r.Read()
@@ -121,6 +124,9 @@ func readForecastCSV(path string) ([]forecastRow, error) {
 		}
 		if err != nil {
 			return nil, err
+		}
+		if len(rec) < minCols {
+			return nil, fmt.Errorf("forecast %s: short record (%d cols, need %d)", path, len(rec), minCols)
 		}
 		d, err := time.Parse("2006-01-02", rec[col["valid_date"]])
 		if err != nil {
@@ -147,7 +153,11 @@ func readObsCSV(path string) ([]obsRow, error) {
 	if err != nil {
 		return nil, fmt.Errorf("header: %w", err)
 	}
-	col := indexOf(header)
+	col, err := requireColumns(header, "valid_date", "tmax_f", "tmin_f")
+	if err != nil {
+		return nil, fmt.Errorf("obs %s: %w", path, err)
+	}
+	minCols := maxIndex(col) + 1
 	out := []obsRow{}
 	for {
 		rec, err := r.Read()
@@ -156,6 +166,9 @@ func readObsCSV(path string) ([]obsRow, error) {
 		}
 		if err != nil {
 			return nil, err
+		}
+		if len(rec) < minCols {
+			return nil, fmt.Errorf("obs %s: short record (%d cols, need %d)", path, len(rec), minCols)
 		}
 		d, err := time.Parse("2006-01-02", rec[col["valid_date"]])
 		if err != nil {
@@ -207,11 +220,39 @@ func pairByDate(station string, fc []forecastRow, ob []obsRow) []mos.Pair {
 	return out
 }
 
-// indexOf maps each header name to its column index.
-func indexOf(header []string) map[string]int {
-	m := make(map[string]int, len(header))
+// requireColumns returns a header→index map containing exactly the
+// requested columns, or an error naming any that are missing. This
+// closes the latent bug where map[string]int returned 0 (zero value)
+// for absent keys, silently reading column 0 instead of failing loudly.
+func requireColumns(header []string, names ...string) (map[string]int, error) {
+	idx := make(map[string]int, len(header))
 	for i, h := range header {
-		m[h] = i
+		idx[h] = i
+	}
+	out := make(map[string]int, len(names))
+	var missing []string
+	for _, n := range names {
+		i, ok := idx[n]
+		if !ok {
+			missing = append(missing, n)
+			continue
+		}
+		out[n] = i
+	}
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("missing required columns: %v (got header %v)", missing, header)
+	}
+	return out, nil
+}
+
+// maxIndex returns the largest column index in the map. Used to validate
+// that records have at least that many fields.
+func maxIndex(col map[string]int) int {
+	m := -1
+	for _, i := range col {
+		if i > m {
+			m = i
+		}
 	}
 	return m
 }
