@@ -17,8 +17,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bytedance/sonic"
@@ -38,6 +40,7 @@ func main() {
 	maxGap := flag.Duration("max-gap", 60*time.Minute, "max time gap between Kalshi snapshot and Open-Meteo poll for pairing")
 	mosPath := flag.String("mos", "", "path to MOS coefficients JSON (from cmd/calibrate-fit); when set, adds calibrated_* columns")
 	climDir := flag.String("climate", "", "path to obs CSVs for climate-shrunk baseline (e.g. data/calibration/obs); when set, adds climate_* columns")
+	workers := flag.Int("workers", 0, "parallel workers (each processes one UTC date); 0 = runtime.NumCPU()")
 	flag.Parse()
 
 	logger := obs.Init(os.Getenv("ISOBAR_LOG_LEVEL"))
@@ -95,41 +98,100 @@ func main() {
 	defer w.Flush()
 	_ = w.Write(edgeCSVHeader())
 
-	var totalRows, calibratedRows, climateRows int
-	for _, d := range dates {
-		polls, err := loadEnsemblePolls(*dataDir, d)
-		if err != nil {
-			logger.Warn("load ensemble polls", "date", d, "err", err)
-			continue
-		}
-		if len(polls) == 0 {
-			logger.Warn("no ensemble polls", "date", d)
-			continue
-		}
-
-		books, walls, err := loadBooks(*dataDir, d)
-		if err != nil {
-			logger.Warn("load books", "date", d, "err", err)
-			continue
-		}
-
-		for ticker, book := range books {
-			row, ok := computeEdge(ticker, book, walls[ticker], polls, *maxGap, coeffs, clim)
-			if !ok {
-				continue
-			}
-			_ = writeEdgeRow(w, d, row)
-			totalRows++
-			if !isNaN(row.CalibratedP) {
-				calibratedRows++
-			}
-			if !isNaN(row.ClimateShrunkP) {
-				climateRows++
-			}
-		}
+	// Parallelize per UTC date — each date is fully independent: it loads
+	// its own polls + books, computes edges, and never touches another
+	// date's state. We bound concurrency, then write rows back in date
+	// order so CSV output stays deterministic across worker counts.
+	nWorkers := *workers
+	if nWorkers <= 0 {
+		nWorkers = runtime.NumCPU()
+	}
+	if nWorkers > len(dates) {
+		nWorkers = len(dates)
 	}
 
-	logger.Info("edge-scan complete", "rows", totalRows, "calibrated_rows", calibratedRows, "climate_rows", climateRows, "dates", len(dates))
+	results := make([]dateResult, len(dates))
+	sem := make(chan struct{}, nWorkers)
+	var wg sync.WaitGroup
+	for i, d := range dates {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(idx int, date string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			results[idx] = processDate(*dataDir, date, *maxGap, coeffs, clim)
+		}(i, d)
+	}
+	wg.Wait()
+
+	var totalRows, calibratedRows, climateRows int
+	for _, r := range results {
+		if r.skipReason != "" {
+			logger.Warn(r.skipReason, "date", r.date, "err", r.err)
+			continue
+		}
+		for _, row := range r.rows {
+			_ = writeEdgeRow(w, r.date, row)
+		}
+		totalRows += r.totalRows
+		calibratedRows += r.calibratedRows
+		climateRows += r.climateRows
+	}
+
+	logger.Info("edge-scan complete", "rows", totalRows, "calibrated_rows", calibratedRows, "climate_rows", climateRows, "dates", len(dates), "workers", nWorkers)
+}
+
+// dateResult holds one worker's per-date output. rows are written by the
+// main goroutine in input-date order; skipReason is the log message kind
+// when the date couldn't be processed (empty when processing succeeded).
+type dateResult struct {
+	date           string
+	rows           []EdgeRow
+	totalRows      int
+	calibratedRows int
+	climateRows    int
+	skipReason     string
+	err            error
+}
+
+// processDate is the per-date compute kernel run by each worker. It loads
+// the date's ensemble polls and reconstructed orderbooks, then computes
+// one EdgeRow per (ticker, book-snapshot, paired-poll). All inputs are
+// read-only from the worker's perspective: coeffs/clim are loaded once
+// and shared by reference; date directories don't overlap.
+func processDate(dataDir, date string, maxGap time.Duration, coeffs *mos.Coefficients, clim *climate.Lookup) dateResult {
+	out := dateResult{date: date}
+	polls, err := loadEnsemblePolls(dataDir, date)
+	if err != nil {
+		out.skipReason = "load ensemble polls"
+		out.err = err
+		return out
+	}
+	if len(polls) == 0 {
+		out.skipReason = "no ensemble polls"
+		return out
+	}
+	books, walls, err := loadBooks(dataDir, date)
+	if err != nil {
+		out.skipReason = "load books"
+		out.err = err
+		return out
+	}
+	for ticker, book := range books {
+		row, ok := computeEdge(ticker, book, walls[ticker], polls, maxGap, coeffs, clim)
+		if !ok {
+			continue
+		}
+		out.rows = append(out.rows, row)
+		out.totalRows++
+		if !isNaN(row.CalibratedP) {
+			out.calibratedRows++
+		}
+		if !isNaN(row.ClimateShrunkP) {
+			out.climateRows++
+		}
+	}
+	return out
 }
 
 func loadCoefficients(path string) (*mos.Coefficients, error) {
