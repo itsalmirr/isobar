@@ -84,10 +84,21 @@ for src_dir in "$DATA_DIR"/*/; do
   fi
   total_lines=$((total_lines + lines))
 
-  # Most recent file modification time → freshness.
-  newest_file=$(find "$src_dir" -type f \( -name '*.jsonl' -o -name '*.jsonl.gz' \) -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | awk '{print $2}')
+  # Most recent file modification time → freshness. Portable across
+  # macOS BSD find and GNU find: list paths first, then sort by mtime
+  # via stat (BSD `-f %m`, GNU `-c %Y`), pick the highest.
+  newest_file=""
+  newest_mtime=0
+  while IFS= read -r path; do
+    [ -z "$path" ] && continue
+    mtime=$(stat -f %m "$path" 2>/dev/null || stat -c %Y "$path" 2>/dev/null || echo 0)
+    if [ "$mtime" -gt "$newest_mtime" ]; then
+      newest_mtime=$mtime
+      newest_file=$path
+    fi
+  done < <(find "$src_dir" -type f \( -name '*.jsonl' -o -name '*.jsonl.gz' \) 2>/dev/null)
   if [ -n "$newest_file" ]; then
-    age_sec=$(( $(date +%s) - $(stat -c %Y "$newest_file" 2>/dev/null || stat -f %m "$newest_file") ))
+    age_sec=$(( $(date +%s) - newest_mtime ))
   else
     age_sec=99999
   fi
