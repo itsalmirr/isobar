@@ -37,30 +37,24 @@ type Ticker struct {
 	TempVar TempVar
 }
 
-// Location returns the Open-Meteo location name for this ticker's series.
-var seriesToLocation = map[string]string{
-	"KXHIGHNY":  "NY",
-	"KXHIGHMIA": "MIA",
-	"KXHIGHLAX": "LAX",
-	"KXHIGHCHI": "CHI",
-	"KXLOWTNYC": "NY",
-	"KXLOWTMIA": "MIA",
-	"KXLOWTLAX": "LAX",
-	"KXLOWTCHI": "CHI",
+// Location returns the Open-Meteo location tag for this ticker's series,
+// or empty string if the series is unrecognised. Backed by the canonical
+// station registry (see stations.go).
+func (t Ticker) Location() string {
+	if s, ok := StationBySeries(t.Series); ok {
+		return s.Location
+	}
+	return ""
 }
 
-// UTCOffset returns hours behind UTC for each location during US daylight
-// saving time (March–November). Edge-scan runs on April–May data.
-var locationUTCOffset = map[string]int{
-	"NY":  -4, // EDT
-	"MIA": -4, // EDT
-	"LAX": -7, // PDT
-	"CHI": -5, // CDT
+// UTCOffset returns the hours-behind-UTC for this ticker's local civil
+// date during US daylight time. Returns 0 if the series is unrecognised.
+func (t Ticker) UTCOffset() int {
+	if s, ok := StationBySeries(t.Series); ok {
+		return s.UTCOffsetHours
+	}
+	return 0
 }
-
-func (t Ticker) Location() string { return seriesToLocation[t.Series] }
-
-func (t Ticker) UTCOffset() int { return locationUTCOffset[t.Location()] }
 
 func ParseTicker(raw string) (Ticker, error) {
 	parts := strings.SplitN(raw, "-", 3)
@@ -79,7 +73,7 @@ func ParseTicker(raw string) (Ticker, error) {
 		return Ticker{}, fmt.Errorf("market: unknown series prefix in %q", raw)
 	}
 
-	if _, ok := seriesToLocation[series]; !ok {
+	if _, ok := StationBySeries(series); !ok {
 		return Ticker{}, fmt.Errorf("market: unknown series %q", series)
 	}
 

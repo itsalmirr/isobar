@@ -13,14 +13,14 @@ import (
 	"github.com/wh0o0pz/isobar/internal/replay"
 )
 
-// locationToStation maps the ticker's location code (used in
-// config/config.example.yaml) to the CLI station identifier MOS uses.
-// LAX uses the airport (KLAX), CHI uses Midway (KMDW per ADR-0007).
-var locationToStation = map[string]string{
-	"NY":  "KNYC",
-	"MIA": "KMIA",
-	"LAX": "KLAX",
-	"CHI": "KMDW",
+// stationCodeFor returns the CLI station code (KNYC etc.) for a ticker's
+// location tag, via the canonical registry in internal/market.
+func stationCodeFor(loc string) (string, bool) {
+	s, ok := market.StationByLocation(loc)
+	if !ok {
+		return "", false
+	}
+	return s.Code, true
 }
 
 func tempVarString(v market.TempVar) string {
@@ -228,7 +228,7 @@ func edgeFromExtremes(tk market.Ticker, mid, spread int, members [openmeteo.NumM
 		ClimateShrunkNoEdge:    math.NaN(),
 	}
 
-	station, hasStation := locationToStation[tk.Location()]
+	station, hasStation := stationCodeFor(tk.Location())
 
 	// MOS calibration path.
 	if coeffs != nil && hasStation {

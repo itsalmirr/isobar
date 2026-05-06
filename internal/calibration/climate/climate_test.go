@@ -4,6 +4,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -61,6 +62,36 @@ func TestLookupLoadAndBracketProb(t *testing.T) {
 	p = l.BracketProb("KNYC", "tmax", target, 59, false)
 	if p != 0 {
 		t.Errorf("P(tmax <= 59) = %v, want 0", p)
+	}
+}
+
+// TestLoadFailsLoudlyOnMissingColumn proves the audit's P2.5 finding is
+// fixed: a CSV without a required column must error, not silently read
+// the wrong field. Pre-fix this would have read column 0 (returning the
+// zero-value index from a `map[string]int` lookup) and corrupted output.
+func TestLoadFailsLoudlyOnMissingColumn(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "KNYC.csv")
+	// Write a CSV with valid_date but missing tmax_f.
+	f, err := os.Create(path) //nolint:gosec // test fixture writing to t.TempDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, werr := f.WriteString("valid_date,wrong_col,tmin_f\n2024-04-15,99,40\n"); werr != nil {
+		t.Fatal(werr)
+	}
+	_ = f.Close()
+
+	l := New()
+	if err := l.Load(dir, []string{"KNYC"}); err == nil {
+		t.Fatal("expected error on missing tmax_f column, got nil")
+	} else {
+		if !strings.Contains(err.Error(), "missing required columns") {
+			t.Errorf("error should name missing columns; got %v", err)
+		}
+		if !strings.Contains(err.Error(), "tmax_f") {
+			t.Errorf("error should name the specific missing column tmax_f; got %v", err)
+		}
 	}
 }
 

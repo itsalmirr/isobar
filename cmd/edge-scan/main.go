@@ -23,6 +23,7 @@ import (
 
 	"github.com/wh0o0pz/isobar/internal/calibration/climate"
 	"github.com/wh0o0pz/isobar/internal/calibration/mos"
+	"github.com/wh0o0pz/isobar/internal/market"
 	"github.com/wh0o0pz/isobar/internal/obs"
 	"github.com/wh0o0pz/isobar/internal/openmeteo"
 	"github.com/wh0o0pz/isobar/internal/replay"
@@ -53,7 +54,7 @@ func main() {
 	var clim *climate.Lookup
 	if *climDir != "" {
 		clim = climate.New()
-		if err := clim.Load(*climDir, []string{"KNYC", "KMIA", "KLAX", "KMDW"}); err != nil {
+		if err := clim.Load(*climDir, market.AllStationCodes()); err != nil {
 			logger.Error("load climate", "dir", *climDir, "err", err)
 			os.Exit(1)
 		}
