@@ -231,6 +231,30 @@ func TestFitHandlesBiasCorrectly(t *testing.T) {
 	}
 }
 
+// TestFitEmitsSchemaVersion asserts the fitted Coefficients carry the
+// current schema version so downstream loaders can validate compatibility.
+func TestFitEmitsSchemaVersion(t *testing.T) {
+	rng := rand.New(rand.NewPCG(1, 1))
+	startDate, _ := time.Parse("2006-01-02", "2024-04-01")
+	pairs := make([]Pair, 50)
+	for i := range pairs {
+		pairs[i] = Pair{
+			Station:   "KNYC",
+			ValidDate: startDate.AddDate(0, 0, i%60),
+			Variable:  "tmax",
+			Forecast:  60 + rng.Float64()*20,
+			Observed:  60 + rng.Float64()*20,
+		}
+	}
+	c, err := Fit(pairs, 0)
+	if err != nil {
+		t.Fatalf("Fit: %v", err)
+	}
+	if c.SchemaVersion != CoefficientsSchemaVersion {
+		t.Errorf("SchemaVersion = %q, want %q", c.SchemaVersion, CoefficientsSchemaVersion)
+	}
+}
+
 func TestSortedBinKeys(t *testing.T) {
 	c := Coefficients{
 		Bins: map[string]BinCoeffs{

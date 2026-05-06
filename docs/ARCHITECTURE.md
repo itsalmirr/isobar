@@ -6,9 +6,8 @@
 
 ## Guiding constraints
 
-- **Single binary per concern.** `cmd/tape` records; `cmd/analyze` (Phase
-  0.5) replays; `cmd/bot` (Phase 1) trades; `cmd/peek` is an ops-only
-  Kalshi REST probe. No god-binary with subcommands for everything.
+- **Single binary per concern.** Six binaries today, none of them a
+  god-binary. Each command does one thing and exits.
 - **`internal/` only.** No `pkg/` until there is a second binary that needs
   to import outside this module. The compiler enforces the boundary.
 - **Stdlib first.** Every third-party dep is an audit burden. Current deps
@@ -21,54 +20,74 @@
   socket are stamped + journaled, and decoding happens in the analyzer
   where latency doesn't matter and schema changes are cheap to fix.
 
-## Directory layout
+## Directory layout (current)
 
 ```
 cmd/
-  tape/                Phase 0 recorder (main.go today)
-  analyze/             Phase 0.5 sanity report — MVP today (counts,
-                       gaps, monotonicity). Orderbook replay + gate
-                       numbers arrive at W10 once calibration lands.
-  peek/                Ops probe — reads Kalshi /series and /markets
-                       to confirm series-name correctness when the
-                       catalog changes (W6 hurricane series discovery).
-  calibrate/           Phase 0.5 NGR fit + reliability plots (W2)
-  bot/                 Phase 1+ live bot (W11–12)
+  tape/                       Phase 0 recorder. Live on Vultr with rolling
+                              ticker re-discovery (4h cycle).
+  analyze/                    Sanity report over recorded journals (frame
+                              counts, gaps, monotonicity, type histogram).
+  peek/                       Kalshi REST probe — confirms series-name
+                              correctness when the catalog changes.
+  calibrate-parse-cli/        NWS CLI bulletin zip → daily TMAX/TMIN CSV.
+  calibrate-fit/              OLS-fit MOS coefficients per (station,
+                              season, variable) bin → JSON output.
+  edge-scan/                  Joins recorded book state to ensemble polls,
+                              applies all probability models (naive, MOS,
+                              climate-shrunk, market), emits per-bracket
+                              edge CSV with full provenance.
 
 internal/
-  clock/               (Wall, Mono) stamp pair
-  config/              YAML + env overlay + validation
-  env/                 Stdlib-only .env loader
-  journal/             Append-only rotating JSONL writer
-  kalshi/              REST client + signer + authenticated WS subscriber
-  obs/                 slog JSON bootstrap
-  openmeteo/           GFS + ECMWF ensemble REST poller
-  replay/              Reads back JSONL journals (plain + gz) for
-                       offline analysis. Shared input layer for
-                       cmd/analyze and any future backtest/calibration
-                       tool; 94.9% covered.
-  retry/               Context-aware exponential backoff with jitter
-  calibration/         NGR, conformal, EVT, T-3h Bayesian (W2–5)
-  nhc/                 NHC ATCF a-deck/b-deck advisory parser (W6)
-  hurricanemodel/      HAFS/HWRF + NDBC SST (W7–8)
-  microstructure/      Reservation price, half-spread, OFI, CUSUM (W9)
-  risk/                L0–L4 pre/post-trade controls (W9)
-  signal/              Signal interface + weather + hurricane (W5, W8)
-  busevents/           In-process pub/sub for dashboard (W11)
-  dashboard/           SSE + htmx server (W11)
-  controlstore/        modernc.org/sqlite WAL for control plane (W11)
-  state/               Warm-start + reconciliation (W12)
-  exec/                Paper + Kalshi exec adapters (W11–12)
+  clock/                      (Wall, Mono) stamp pair.
+  config/                     YAML + env overlay + validation. Field
+                              `kalshi.rediscover_interval` controls the
+                              recorder's rolling re-discovery cadence.
+  env/                        Stdlib-only .env loader.
+  journal/                    Append-only rotating JSONL writer with
+                              size + age rotation, batched fsync, gzip
+                              on rotate.
+  kalshi/                     RSA-signed REST client + signer +
+                              authenticated WS subscriber with
+                              SetTickers/Reload for graceful re-subscribe.
+  market/                     Ticker parsing, fee model (Kalshi parabolic),
+                              station/location/timezone metadata.
+  obs/                        slog JSON bootstrap.
+  openmeteo/                  31-member GFS ensemble REST poller (live)
+                              + ensemble decoder for recorded polls.
+  replay/                     JSONL journal reader (plain + gz) +
+                              orderbook reconstruction. Shared input
+                              layer for cmd/analyze, cmd/edge-scan.
+  retry/                      Context-aware exponential backoff with
+                              jitter. Used by ws subscriber + any other
+                              reconnect-style consumer.
+  calibration/
+    cliparse/                 NWS CLI bulletin parser; emits canonical
+                              daily TMAX/TMIN CSV per station.
+    mos/                      OLS bias correction per (station, season,
+                              variable) + ProbBelow/ProbAbove via Φ.
+    climate/                  Historical bracket-frequency lookup with
+                              ±30-day seasonal window + ShrinkP helper
+                              (`p = w·climate + (1-w)·naive`).
 
 config/
-  config.example.yaml  Canonical example; copy to config.yaml
+  config.example.yaml         Canonical example; copy to config.yaml.
 
-web/
-  templates/           html/template fragments (W11)
-  static/              htmx, lightweight-charts vendored (W11)
+scripts/
+  calibration-fetch-cli.sh    Pull NWS CLI bulletin zips (IEM AFOS).
+  calibration-fetch-obs.sh    Pull hourly ASOS observations (IEM).
+  calibration-fetch-forecast.sh   Pull deterministic GFS historical
+                              forecasts (Open-Meteo historical-forecast-api).
+  tape-health.sh              Operational smoke check.
+  loop-prompt.txt             Health-check playbook.
+
+reports/
+  phase0.5/                   Phase 0.5 evaluation artifacts.
+  INDEX.md                    Chain-of-reports index.
 
 docs/
-  research/            8 research reports + SYNTHESIS.md
+  research/                   8 research reports + SYNTHESIS.md.
+  decisions/                  9 ADRs.
 ```
 
 *Historical note:* `internal/coinbase` (public Coinbase WS subscriber)
@@ -187,6 +206,52 @@ produces a clean drain.
 - Validates `poll_interval >= 1m` at construction.
 - First fetch fires *immediately* in `Run` so Phase 0 does not wait for
   the first tick to get data.
+- `EnsemblePoll` decoder extracts 31 ensemble members (control + 30
+  perturbations) from recorded poll JSON. `temperature_2m_max` is daily-
+  only and returns null under hourly variables, so `DailyExtremes`
+  derives daily max/min from hourly `temperature_2m_memberNN` values
+  windowed to the requested local civil date via `utcOffsetHours`.
+
+### `internal/market`
+
+- Ticker parser handles Kalshi's asymmetric naming: `KXHIGH{2-3-letter}`
+  vs `KXLOWT{3-letter}`. Date format `YYMMMDD`, bracket-type prefix
+  `T` (above-or-equal threshold) or `B` (below-or-equal threshold).
+- Per-location UTC offsets hardcoded for the spring/summer DST window
+  (US daylight time across all four cities). Re-validate before
+  recording in winter months.
+- Fee model implements Kalshi's parabolic taker fee
+  `ceil(7·P·(1-P))` cents per side. Maker fee schedule (since
+  Feb 2026) is **not yet modeled** — see open-items in the v2 floor
+  report.
+
+### `internal/calibration/cliparse`
+
+- Parses NWS CLI bulletin text from IEM AFOS archive zips.
+- Contract: `valid_date` from bulletin header (not `YESTERDAY`/`TODAY`
+  label). Multiple issuances per civil date dedupe to latest;
+  ties break on lexicographically latest filename.
+- `MM` temperature value → empty CSV field with gap report on stderr.
+
+### `internal/calibration/mos`
+
+- `Fit(pairs, holdoutDays)` performs closed-form OLS per (station,
+  season, variable) bin. Bins below `MinTrainPerBin = 10` are dropped.
+- `Predict` applies `μ_calibrated = a + b·forecast`; `σ` is residual
+  stdev on the training fold, **not** ensemble spread (this is MOS,
+  not full NGR — see ADR-0008).
+- `ProbBelow(threshold, μ, σ)` = Φ((threshold − μ) / σ) via `math.Erf`.
+
+### `internal/calibration/climate`
+
+- `BracketProb` returns historical empirical frequency of the bracket
+  condition restricted to a ±30-day calendar window around the target
+  date.
+- `ShrinkP(naive, climate, w)` = `w·climate + (1-w)·naive`. NaN climate
+  falls back to naive.
+- Used as a baseline against MOS per Pass 3 critique: if MOS doesn't
+  beat naive-shrunk-to-climate in the tradeable midrange, MOS doesn't
+  earn its complexity.
 
 ### `internal/obs`
 
@@ -217,32 +282,43 @@ produces a clean drain.
 - Channels either have a documented sender/receiver contract in the
   package docstring or they're considered a bug waiting to happen.
 
-## Future (Phase 1+) shape
+## Future (post-Phase-0.5) shape — only after the gate clears
 
-Phase 1 adds these packages without altering the Phase 0 boundaries:
+The Phase 0.5 v2 report (May 2026) found the current MOS calibration
+does not clear the gate criterion in the tradeable midrange. The
+sequencing of next packages depends on the next-iteration verdict
+(see ADR-0009 for the trigger). Tentative future layout, conditional
+on a passing gate:
 
 ```
 internal/
+  calibration/
+    ngr/               Full NGR with σ² = c + d·ensvar (requires GEFS
+                       ensemble historical backfill — ADR-0009)
+    conformal/         Empirical-coverage prediction intervals
+    bayesian/          T−3h posterior update from observed ASOS
+                       trajectory
   signal/              Signal interface + implementations
     weather/           Calibrated-ensemble-vs-bracket strategy
     hurricane/         NHC advisory + HAFS/HWRF + NDBC SST strategy
-  calibration/         NGR, conformal, EVT, T-3h Bayesian update
   nhc/                 NHC ATCF a-deck/b-deck advisory parser
   hurricanemodel/      HAFS/HWRF fetch + NDBC SST feed
   microstructure/      Reservation price, half-spread, OFI, CUSUM
   risk/                Pre-trade caps + kill-switch + Kelly-with-ρ
   exec/                Exec interface + PaperExec + KalshiExec
   state/               SQLite WAL warm-start + reconciliation
-  busevents/           In-process pub/sub
-  dashboard/           SSE + htmx server
-  controlstore/        modernc.org/sqlite WAL control plane
 ```
 
-The `cmd/bot` entrypoint wires:
+A `cmd/bot` entrypoint would wire:
 `feeds → signal.Tick → risk.Gate → exec.Submit`.
 
-`cmd/tape` stays exactly as today — recording is a Phase 0 tool, not a
-runtime dependency of the bot.
+`cmd/tape` stays exactly as today — recording is a research tool, not
+a runtime dependency of the bot.
+
+If the gate continues to fail after the methodology improvements above,
+the project pivots from "trading bot" to "forecasting research artifact"
+per the v2 report's recommendation. None of the future packages would
+be built in that scenario.
 
 ## Why it's laid out this way
 

@@ -38,9 +38,17 @@ type BinCoeffs struct {
 	NHoldout int     `json:"n_holdout"` // holdout pair count (recorded but not used in fit)
 }
 
+// CoefficientsSchemaVersion identifies the on-disk shape of a
+// Coefficients JSON. Bump on any change to bin-key format, BinCoeffs
+// fields, or the math interpretation of the fitted parameters.
+// Loaders should refuse mismatched versions rather than silently
+// reading old files into new code.
+const CoefficientsSchemaVersion = "isobar.mos/v1"
+
 // Coefficients is the full fitted model: one BinCoeffs per
 // (station, season, variable) bin keyed as "STA|SEASON|VAR".
 type Coefficients struct {
+	SchemaVersion      string               `json:"schema_version"`
 	FittedAt           time.Time            `json:"fitted_at"`
 	TrainingWindowEnd  string               `json:"training_window_end"`  // YYYY-MM-DD inclusive
 	HoldoutWindowStart string               `json:"holdout_window_start"` // YYYY-MM-DD inclusive
@@ -95,6 +103,7 @@ func Fit(pairs []Pair, holdoutDays int) (Coefficients, error) {
 	}
 
 	out := Coefficients{
+		SchemaVersion:      CoefficientsSchemaVersion,
 		FittedAt:           time.Now().UTC(),
 		TrainingWindowEnd:  trainEnd.Format("2006-01-02"),
 		HoldoutWindowStart: holdoutStart.Format("2006-01-02"),
