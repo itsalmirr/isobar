@@ -27,7 +27,8 @@ the old one rather than editing history.
 | [0005](./0005-extract-retry.md)         | 2026-04-18 | Extract `internal/retry`; fix kalshi throttle; promote DiscoverOpenTickers | Accepted |
 | [0006](./0006-peek-probe-kalshi-naming.md) | 2026-04-22 | Keep `cmd/peek` as an ongoing Kalshi catalog probe | Accepted |
 | [0007](./0007-calibration-ground-truth-cli.md) | 2026-04-29 | Use NWS CLI bulletins as the calibration y-target | Accepted |
-| [0008](./0008-deterministic-historical-forecast.md) | 2026-05-02 | Use deterministic GFS historical forecasts for first-pass NGR/MOS | Accepted |
+| [0008](./0008-deterministic-historical-forecast.md) | 2026-05-02 | Use deterministic GFS historical forecasts for first-pass NGR/MOS | Accepted (canary fired — see 0009) |
+| [0009](./0009-mos-canary-fired-escalate-calibration.md) | 2026-05-05 | MOS canary fired; escalate calibration via ECMWF blend or T−3h Bayesian | Accepted |
 
 ## Template
 

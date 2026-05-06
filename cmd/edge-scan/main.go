@@ -14,6 +14,7 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -71,13 +72,20 @@ func main() {
 
 	out := os.Stdout
 	if *outPath != "" {
-		f, err := os.Create(*outPath)
+		f, err := os.Create(*outPath) //nolint:gosec // path is operator-supplied output flag
 		if err != nil {
 			logger.Error("create output", "err", err)
 			os.Exit(1)
 		}
 		defer f.Close()
 		out = f
+	}
+
+	// Schema-version comment first, then CSV header. Downstream parsers
+	// must validate the schema line and refuse mismatched versions.
+	if _, err := out.Write([]byte(EdgeCSVSchemaComment + "\n")); err != nil {
+		logger.Error("write schema header", "err", err)
+		os.Exit(1)
 	}
 
 	w := csv.NewWriter(out)
@@ -130,6 +138,12 @@ func loadCoefficients(path string) (*mos.Coefficients, error) {
 	var c mos.Coefficients
 	if err := json.NewDecoder(f).Decode(&c); err != nil {
 		return nil, err
+	}
+	// Schema-version check: refuse to load coefficients from a different
+	// version of the algorithm. Old files with no version field (pre-v1)
+	// also fail closed; refit with current binary.
+	if c.SchemaVersion != mos.CoefficientsSchemaVersion {
+		return nil, fmt.Errorf("mos coefficients schema mismatch: got %q, want %q (refit with current cmd/calibrate-fit)", c.SchemaVersion, mos.CoefficientsSchemaVersion)
 	}
 	return &c, nil
 }

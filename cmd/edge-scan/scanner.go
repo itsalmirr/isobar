@@ -307,6 +307,17 @@ func computeEdge(ticker string, book *replay.Book, wall int64, polls []*pollEntr
 	return edgeFromExtremes(tk, mid, book.SpreadYesCents(), members, gap, leadHours, coeffs, clim), true
 }
 
+// EdgeCSVSchemaVersion identifies the column shape this binary emits.
+// Bump on any column add, remove, rename, or semantic change. Downstream
+// consumers (analysis scripts, future tools) should validate this and
+// refuse to parse mismatched versions.
+const EdgeCSVSchemaVersion = "edge-scan/v2"
+
+// EdgeCSVSchemaComment is the leading line emitted before the header.
+// Comma-separated CSV parsers tolerate an unparsed-then-skipped header
+// line; pandas needs `comment='#'` or `skiprows=1`.
+var EdgeCSVSchemaComment = "# schema: " + EdgeCSVSchemaVersion
+
 // edgeCSVHeader returns the header row for edge-scan CSV output.
 func edgeCSVHeader() []string {
 	return []string{
