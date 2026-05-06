@@ -22,6 +22,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/bytedance/sonic"
 )
 
 // Envelope is the on-disk shape of one recorded frame. Payload is the
@@ -127,7 +129,9 @@ func forEachFrameInFile(path string, fn func(env Envelope, bytes int, firstInFil
 	for sc.Scan() {
 		line := sc.Bytes()
 		var env Envelope
-		if err := json.Unmarshal(line, &env); err != nil {
+		// sonic.Unmarshal: ~3-5x stdlib on this hot path. Replays of
+		// multi-million-frame tapes spend most of their wall time here.
+		if err := sonic.Unmarshal(line, &env); err != nil {
 			continue // tolerate malformed frames
 		}
 		if err := fn(env, len(line), firstInFile); err != nil {

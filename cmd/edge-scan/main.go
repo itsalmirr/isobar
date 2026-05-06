@@ -21,6 +21,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bytedance/sonic"
+
 	"github.com/wh0o0pz/isobar/internal/calibration/climate"
 	"github.com/wh0o0pz/isobar/internal/calibration/mos"
 	"github.com/wh0o0pz/isobar/internal/market"
@@ -182,7 +184,7 @@ func loadBooks(dataDir, date string) (map[string]*replay.Book, map[string]int64,
 	walls := map[string]int64{}
 	_ = replay.ForEachFrame(files, func(env replay.Envelope, _ int, _ bool) error {
 		var f replay.KalshiFrame
-		if err := json.Unmarshal(env.Payload, &f); err != nil {
+		if err := sonic.Unmarshal(env.Payload, &f); err != nil {
 			return nil //nolint:nilerr // skip malformed frame, don't abort the scan
 		}
 		replay.ApplyFrameToBooks(books, walls, env, f)

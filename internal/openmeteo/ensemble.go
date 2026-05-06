@@ -6,6 +6,8 @@ import (
 	"math"
 	"strconv"
 	"time"
+
+	"github.com/bytedance/sonic"
 )
 
 const NumMembers = 31 // control + 30 perturbations
@@ -76,7 +78,7 @@ func ParseEnsemblePoll(payload json.RawMessage) (*EnsemblePoll, error) {
 	var resp struct {
 		Hourly json.RawMessage `json:"hourly"`
 	}
-	if err := json.Unmarshal(payload, &resp); err != nil {
+	if err := sonic.Unmarshal(payload, &resp); err != nil {
 		return nil, fmt.Errorf("ensemble: unmarshal top: %w", err)
 	}
 	if resp.Hourly == nil {
@@ -84,13 +86,13 @@ func ParseEnsemblePoll(payload json.RawMessage) (*EnsemblePoll, error) {
 	}
 
 	hourly := make(map[string]json.RawMessage)
-	if err := json.Unmarshal(resp.Hourly, &hourly); err != nil {
+	if err := sonic.Unmarshal(resp.Hourly, &hourly); err != nil {
 		return nil, fmt.Errorf("ensemble: unmarshal hourly: %w", err)
 	}
 
 	var times []string
 	if raw, ok := hourly["time"]; ok {
-		if err := json.Unmarshal(raw, &times); err != nil {
+		if err := sonic.Unmarshal(raw, &times); err != nil {
 			return nil, fmt.Errorf("ensemble: unmarshal times: %w", err)
 		}
 	}
@@ -122,7 +124,7 @@ func ParseEnsemblePoll(payload json.RawMessage) (*EnsemblePoll, error) {
 // parseNullableFloats decodes a JSON array that may contain null entries.
 func parseNullableFloats(raw json.RawMessage) ([]float64, error) {
 	var mixed []json.RawMessage
-	if err := json.Unmarshal(raw, &mixed); err != nil {
+	if err := sonic.Unmarshal(raw, &mixed); err != nil {
 		return nil, err
 	}
 	out := make([]float64, len(mixed))
