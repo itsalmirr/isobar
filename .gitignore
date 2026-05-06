@@ -38,3 +38,4 @@ trace.out
 # Coverage
 coverage.out
 coverage.html
+.claude/
