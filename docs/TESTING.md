@@ -29,15 +29,20 @@
    it's too trivial to exist — fold it into its caller.
 2. **`go test -race` is the canonical runner.** We never commit code whose
    tests pass only without `-race`. Hidden races ship as flaky fills.
-3. **Zero sleeps where synchronization works.** A test that uses
+3. **No sleeps as goroutine synchronization.** A test that uses
    `time.Sleep` to "wait for the goroutine to do the thing" is a bug
    report waiting to happen. Use channels, `sync.WaitGroup`, or
-   `Wait(ctx)` methods.
-4. **Timeouts on every test that could hang.** All tests run under
-   `-timeout=60s` (`-timeout=30s` for short mode). CI enforces both.
-5. **Fast by default.** `make test-short` must finish in under 30s so the
-   pre-commit hook can run it without friction. Slow tests gate behind
-   `testing.Short()`.
+   `Wait(ctx)` methods. *Real-time validation* sleeps (rotation timers,
+   clock monotonicity) are legitimate when the asserted behavior is
+   itself time-driven; keep them ≤100 ms and document why.
+4. **Timeouts on every test that could hang.** CI runs
+   `go test -race -count=1 -timeout=120s ./...`. Local equivalent should
+   match.
+5. **Fast by default.** Full race suite finishes in under ~30s on a
+   modern laptop (current: ~25s, dominated by `internal/kalshi` mocked
+   WS handshakes). When the suite passes 60s wall-time, gate the slow
+   half behind `testing.Short()` and add a `make test-short` target.
+   Today no test uses `testing.Short()` because none needs to.
 6. **No test reaches the real network.** Any test that talks to
    `api.kalshi.com` or `ensemble-api.open-meteo.com` fails CI by design
    — mock the server with `httptest` / `websocket.Accept`.
@@ -48,6 +53,10 @@
    either seed with a fixed value or use `testing/quick` with a
    documented count. Flakes are filed, bisected, and fixed — never
    retried.
+9. **Benchmarks live alongside tests.** Hot paths (orderbook
+   reconstruction, journal write, ensemble decode, calibration lookup)
+   have `_bench_test.go` files. Run with
+   `go test -run='^$' -bench=. -benchmem -benchtime=2s ./...`.
 
 ## Coverage targets
 
@@ -57,11 +66,15 @@
 | `internal/env`         | 95%                  | Multi-line quote paths included.   |
 | `internal/obs`         | 90%                  | Level parsing + handler shape.     |
 | `internal/config`      | 95%                  | Every `Validate` branch.           |
-| `internal/journal`     | 90%                  | Rotation, drop, roundtrip, shutdown. *Currently 85.9% — fault-injection gap tracked in CHANGELOG.* |
-| `internal/kalshi`      | 85%                  | All REST verbs + signer + ws subscribe msg + DiscoverOpenTickers + throttle. |
-| `internal/openmeteo`   | 85%                  | URL build + error propagation.     |
-| `internal/replay`      | 90%                  | Journal read + Kalshi frame decode + orderbook apply. |
+| `internal/journal`     | 90%                  | Rotation, drop, roundtrip, shutdown. *Currently ~86%.* |
+| `internal/kalshi`      | 85%                  | All REST verbs + signer + ws subscribe msg + DiscoverOpenTickers + throttle + SetTickers/Reload. |
+| `internal/market`      | 90%                  | Ticker parser + fee model + station registry round-trip. |
+| `internal/openmeteo`   | 80%                  | URL build, error propagation, ensemble decoder. |
+| `internal/replay`      | 90%                  | Journal read + Kalshi frame decode + orderbook apply + ApplyFrameToBooks helper. |
 | `internal/retry`       | 95%                  | Jitter, Next, Do happy-path + ctx + max-attempts. |
+| `internal/calibration/cliparse` | 85%         | NWS bulletin parser + dedupe + gap report. |
+| `internal/calibration/mos`      | 90%         | OLS fit + Predict + ProbBelow + degenerate sigma. |
+| `internal/calibration/climate`  | 85%         | Frequency lookup + season window + ShrinkP + missing-column failure. |
 
 Coverage is a floor, not a ceiling, and not a substitute for
 thinking — a 100%-covered function can still be wrong. But a package under
