@@ -25,6 +25,39 @@ build-all: build
 	$(GO) build $(GOFLAGS) -o $(BIN_DIR)/calibrate-parse-cli ./cmd/calibrate-parse-cli
 	$(GO) build $(GOFLAGS) -o $(BIN_DIR)/calibrate-fit ./cmd/calibrate-fit
 	$(GO) build $(GOFLAGS) -o $(BIN_DIR)/edge-scan ./cmd/edge-scan
+	$(GO) build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/paper-trader ./cmd/paper-trader
+	$(GO) build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/settle ./cmd/settle
+	$(GO) build $(GOFLAGS) -o $(BIN_DIR)/score ./cmd/score
+	$(GO) build $(GOFLAGS) -o $(BIN_DIR)/fillability ./cmd/fillability
+
+# Cross-compile for the production Vultr box (linux/amd64). Output goes
+# under bin/linux-amd64/. Pair with deploy/install.sh on the target host.
+.PHONY: build-linux
+build-linux:
+	@mkdir -p $(BIN_DIR)/linux-amd64
+	GOOS=linux GOARCH=amd64 $(GO) build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/linux-amd64/tape ./cmd/tape
+	GOOS=linux GOARCH=amd64 $(GO) build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/linux-amd64/paper-trader ./cmd/paper-trader
+	GOOS=linux GOARCH=amd64 $(GO) build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/linux-amd64/settle ./cmd/settle
+
+# Bundle linux binaries + deploy units + config example into a tarball
+# ready for scp. The .env is NOT included (deploy script expects it
+# staged separately on the host). Climate obs CSVs are bundled IF
+# present locally — they're optional for the trader (falls back to
+# naive per-bracket) but required for the climate_shrunk model.
+.PHONY: release
+release: build-linux
+	@mkdir -p dist
+	@INCLUDES="bin/linux-amd64 deploy config/config.example.yaml"; \
+	if [[ -d data/calibration/obs ]]; then \
+	  INCLUDES="$$INCLUDES data/calibration/obs"; \
+	fi; \
+	tar -czf dist/isobar-deploy.tar.gz $$INCLUDES
+	@echo
+	@echo "release artifact: dist/isobar-deploy.tar.gz"
+	@echo "deploy:"
+	@echo "  scp dist/isobar-deploy.tar.gz HOST:/tmp/"
+	@echo "  scp .env HOST:/tmp/isobar.env"
+	@echo "  ssh HOST 'cd /tmp && tar -xzf isobar-deploy.tar.gz && cp /tmp/isobar.env .env && sudo bash deploy/install.sh /tmp'"
 
 .PHONY: run-tape
 run-tape: build

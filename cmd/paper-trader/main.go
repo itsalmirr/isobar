@@ -54,6 +54,8 @@ func main() {
 	climDir := flag.String("climate", "", "obs CSVs dir for climate-shrunk baseline (required for climate_shrunk model; falls back to naive when empty)")
 	minEdge := flag.Float64("min-edge", 3.0, "minimum fee-aware edge cents to trigger a bet")
 	maxSpread := flag.Int("max-spread", 5, "maximum book spread cents to trade through")
+	minMid := flag.Int("min-mid", 5, "minimum book mid in cents; bets below this are corner-of-the-book and unfillable in practice")
+	maxMid := flag.Int("max-mid", 95, "maximum book mid in cents; symmetric corner filter")
 	maxPollAge := flag.Duration("max-poll-age", 4*time.Hour, "ignore signals when latest poll is older than this")
 	minLeadHours := flag.Float64("min-lead-hours", 2.0, "minimum hours from decision to settlement")
 	modelFlag := flag.String("model", "climate_shrunk", "probability path: naive | climate_shrunk | mos_calibrated")
@@ -125,6 +127,8 @@ func main() {
 	tr := newTrader(logger, led, clim, papertrade.Trigger{
 		MinEdgeCents:   *minEdge,
 		MaxSpreadCents: *maxSpread,
+		MinMidCents:    *minMid,
+		MaxMidCents:    *maxMid,
 		MaxPollAge:     *maxPollAge,
 		MinLeadHours:   *minLeadHours,
 		Model:          model,

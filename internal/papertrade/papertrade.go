@@ -203,6 +203,18 @@ type Trigger struct {
 	// observed median for KXHIGH/KXLOW NY around midday.
 	MaxSpreadCents int
 
+	// MinMidCents and MaxMidCents bound the price range we're willing
+	// to bet on. Corner-of-the-book markets (mid ≤ 5 or mid ≥ 95) are
+	// thinly populated — a single resting cent-tick at the corner can
+	// move the mid drastically and the printed mid is rarely a fillable
+	// price. The first live paper-trader run (May 7 2026) flagged 30
+	// bets, ~80% at mid ≤ 10 with edges of 60–90¢ — paper signals that
+	// would not survive any realistic slippage model. 5/95 is a
+	// defensive default; tighten with --min-mid / --max-mid to study
+	// the distribution.
+	MinMidCents int
+	MaxMidCents int
+
 	// MaxPollAge skips signals based on stale forecasts. Open-Meteo
 	// updates every ~6h on the GFS run schedule; 4h is comfortably
 	// inside that window.
@@ -222,11 +234,14 @@ type Trigger struct {
 }
 
 // TriggerDefaults returns the recommended live-trading thresholds —
-// 3¢ minimum edge, 5¢ max spread, 4h max poll age, 2h min lead.
+// 3¢ minimum edge, 5¢ max spread, 5–95¢ mid range, 4h max poll age,
+// 2h min lead.
 func TriggerDefaults() Trigger {
 	return Trigger{
 		MinEdgeCents:   3.0,
 		MaxSpreadCents: 5,
+		MinMidCents:    5,
+		MaxMidCents:    95,
 		MaxPollAge:     4 * time.Hour,
 		MinLeadHours:   2.0,
 		Model:          ModelClimateShrunk,
@@ -263,6 +278,12 @@ func Decide(snap Snapshot, trig Trigger, clim *climate.Lookup) (bet Bet, reasonS
 	}
 	if snap.MidCents <= 0 || snap.MidCents >= 100 {
 		return Bet{}, "one-sided book", false
+	}
+	if trig.MinMidCents > 0 && snap.MidCents < trig.MinMidCents {
+		return Bet{}, "mid in lower corner", false
+	}
+	if trig.MaxMidCents > 0 && snap.MidCents > trig.MaxMidCents {
+		return Bet{}, "mid in upper corner", false
 	}
 	if trig.MaxSpreadCents > 0 && snap.SpreadCents > trig.MaxSpreadCents {
 		return Bet{}, "spread too wide", false

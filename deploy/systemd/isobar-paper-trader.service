@@ -1,0 +1,46 @@
+[Unit]
+Description=isobar paper-trader (live edge engine, no real orders)
+Documentation=https://github.com/nolmelabs/isobar
+After=network-online.target
+Wants=network-online.target
+# Tape (the recorder) is independent — paper-trader opens its own
+# Kalshi WS + Open-Meteo connections per the deploy plan. Don't bind
+# them with Requires=; either can fail without taking the other down.
+
+[Service]
+Type=simple
+User=isobar
+Group=isobar
+WorkingDirectory=/opt/isobar
+EnvironmentFile=/opt/isobar/.env
+ExecStart=/opt/isobar/bin/paper-trader \
+  -config /opt/isobar/config/config.yaml \
+  -climate /opt/isobar/data/calibration/obs
+
+# Restart policy — paper-trader has internal reconnect with backoff
+# (internal/retry); systemd only kicks in if the process itself dies.
+Restart=on-failure
+RestartSec=10s
+# Don't restart-loop if the binary is broken.
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+# Resource caps. Paper-trader holds books (~50KB) + polls (~5MB) +
+# climate lookup (~1.5MB) — generous.
+MemoryMax=512M
+TasksMax=64
+
+# Security hardening (no special privileges needed).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/isobar/data/papertrade /opt/isobar/data/papertrade-bets /opt/isobar/var
+
+# Log to journald — query via `journalctl -u isobar-paper-trader -f`.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=isobar-paper-trader
+
+[Install]
+WantedBy=multi-user.target

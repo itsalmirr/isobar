@@ -88,10 +88,13 @@ func TestDecide_StrongYesEdge(t *testing.T) {
 }
 
 func TestDecide_NoEdgeBelowThreshold(t *testing.T) {
-	// All members forecast 25°C ≈ 77°F. Bracket "high ≥ 70". Naive P=1,
-	// mid=97 → yes_edge = 100-97-fee. At mid=97, fee ≈ 0 → yes_edge ≈ 3,
-	// at threshold; mid=98 pushes it below.
-	mid, spread := midSpreadFromBids(97, 1) // mid=98
+	// Construct a sub-threshold edge that survives the corner filter.
+	// All members at 25°C ≈ 77°F → naive=1 for "high ≥ 70". Mid=92 sits
+	// inside [5,95]. Fee at mid=92: ceil(7·0.92·0.08)·2 = 2.
+	// yes_edge = 100 − 92 − 2 = 6¢. Threshold=7 in this trigger pushes
+	// it below; the trigger should reject for "no side clears threshold"
+	// rather than for being in a corner.
+	mid, spread := midSpreadFromBids(91, 5) // mid = (91 + 95)/2 = 93 — inside [5,95]
 	snap := Snapshot{
 		Ticker:      "KXHIGHNY-26APR22-T70",
 		MidCents:    mid,
@@ -100,7 +103,9 @@ func TestDecide_NoEdgeBelowThreshold(t *testing.T) {
 		PollWall:    fixedDecidedAt,
 		DecidedAt:   fixedDecidedAt,
 	}
-	_, skip, ok := Decide(snap, TriggerDefaults(), nil)
+	trig := TriggerDefaults()
+	trig.MinEdgeCents = 7 // push the 5–6¢ yes_edge below threshold
+	_, skip, ok := Decide(snap, trig, nil)
 	if ok {
 		t.Errorf("expected skip when edge < threshold; got ok")
 	}
@@ -126,6 +131,73 @@ func TestDecide_SkipsOneSidedBook(t *testing.T) {
 	}
 	if !strings.Contains(skip, "one-sided") {
 		t.Errorf("skip = %q", skip)
+	}
+}
+
+func TestDecide_SkipsLowerCornerMid(t *testing.T) {
+	// Mid=2 is below the 5¢ default floor — corner-of-the-book bet,
+	// unfillable in practice, must reject before edge math runs.
+	mid, spread := midSpreadFromBids(1, 97) // mid = (1 + 3)/2 = 2
+	snap := Snapshot{
+		Ticker:      "KXHIGHNY-26APR22-T70",
+		MidCents:    mid,
+		SpreadCents: spread,
+		Poll:        makePoll("NY", fixedDecidedAt, 25),
+		PollWall:    fixedDecidedAt,
+		DecidedAt:   fixedDecidedAt,
+	}
+	_, skip, ok := Decide(snap, TriggerDefaults(), nil)
+	if ok {
+		t.Errorf("expected skip on lower-corner mid")
+	}
+	if !strings.Contains(skip, "lower corner") {
+		t.Errorf("skip = %q, want 'lower corner' mention", skip)
+	}
+}
+
+func TestDecide_SkipsUpperCornerMid(t *testing.T) {
+	// Mid=98 is above the 95¢ default ceiling — symmetric corner.
+	mid, spread := midSpreadFromBids(97, 1) // mid = (97 + 99)/2 = 98
+	snap := Snapshot{
+		Ticker:      "KXHIGHNY-26APR22-T70",
+		MidCents:    mid,
+		SpreadCents: spread,
+		Poll:        makePoll("NY", fixedDecidedAt, 25),
+		PollWall:    fixedDecidedAt,
+		DecidedAt:   fixedDecidedAt,
+	}
+	_, skip, ok := Decide(snap, TriggerDefaults(), nil)
+	if ok {
+		t.Errorf("expected skip on upper-corner mid")
+	}
+	if !strings.Contains(skip, "upper corner") {
+		t.Errorf("skip = %q, want 'upper corner' mention", skip)
+	}
+}
+
+func TestDecide_CornerFilterDisabledByZero(t *testing.T) {
+	// MinMidCents=0 disables the lower bound (still rejects mid<=0 via
+	// the one-sided guard). Use a permissive trigger and verify a
+	// mid=2 snapshot now passes the corner check.
+	mid, spread := midSpreadFromBids(1, 97) // mid=2
+	snap := Snapshot{
+		Ticker:      "KXHIGHNY-26APR22-T70",
+		MidCents:    mid,
+		SpreadCents: spread,
+		Poll:        makePoll("NY", fixedDecidedAt, 25),
+		PollWall:    fixedDecidedAt,
+		DecidedAt:   fixedDecidedAt,
+	}
+	trig := TriggerDefaults()
+	trig.MinMidCents = 0
+	trig.MaxMidCents = 0
+	trig.MaxSpreadCents = 0 // would otherwise reject — wide synthetic book
+	_, skip, _ := Decide(snap, trig, nil)
+	// The corner-filter must not be the rejection reason now; it can
+	// still reject for other reasons (here the mid=2 + naive=1.0 is
+	// such a strong yes-edge that the bet WILL fire).
+	if strings.Contains(skip, "corner") {
+		t.Errorf("corner filter should be off; got %q", skip)
 	}
 }
 

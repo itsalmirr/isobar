@@ -1,0 +1,27 @@
+[Unit]
+Description=isobar settle — reconcile paper bets against Kalshi resolutions
+Documentation=https://github.com/nolmelabs/isobar
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=isobar
+Group=isobar
+WorkingDirectory=/opt/isobar
+EnvironmentFile=/opt/isobar/.env
+ExecStart=/opt/isobar/bin/settle \
+  -config /opt/isobar/config/config.yaml \
+  -lookback 168h
+
+# settle is one-shot. If it crashes during the Kalshi REST calls,
+# the next timer fire will retry — idempotent on already-resolved bets.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=isobar-settle
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/isobar/data/papertrade

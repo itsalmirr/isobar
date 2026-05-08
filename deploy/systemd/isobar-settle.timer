@@ -1,0 +1,16 @@
+[Unit]
+Description=isobar settle — daily reconciliation timer
+Documentation=https://github.com/nolmelabs/isobar
+
+[Timer]
+# Run daily at 09:30 UTC. NY brackets settle ~04:00 UTC, MIA ~04:00,
+# CHI ~05:00, LAX ~07:00 — 09:30 leaves a safe margin past all of them.
+# AccuracySec keeps the wake within a 1-minute window (default 1min is
+# fine for this).
+OnCalendar=*-*-* 09:30:00 UTC
+# Survive missed firings (host was down at scheduled time).
+Persistent=true
+Unit=isobar-settle.service
+
+[Install]
+WantedBy=timers.target
