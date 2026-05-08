@@ -24,7 +24,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/wh0o0pz/isobar/internal/clock"
@@ -164,7 +163,7 @@ func run(ctx context.Context, logger *slog.Logger, rest *kalshi.Client, dataDir 
 			return nil // continue walking other bets
 		}
 
-		res := classifyResolution(market.Status, market.Result)
+		res := papertrade.ClassifyResolution(market.Status, market.Result)
 		if res == papertrade.ResolutionUnsettled {
 			logger.Debug("market still pending", "ticker", b.Ticker, "status", market.Status, "result", market.Result)
 			stats.kalshiPending++
@@ -219,36 +218,6 @@ func run(ctx context.Context, logger *slog.Logger, rest *kalshi.Client, dataDir 
 		return stats, fmt.Errorf("scan bets: %w", err)
 	}
 	return stats, nil
-}
-
-// classifyResolution maps a Kalshi (status, result) pair to a normalised
-// papertrade Resolution. The string vocabulary comes from the Kalshi
-// API but is not formally documented; we observe:
-//
-//   - status == "settled"  + result in {"yes","no"} → resolved
-//   - status == "settled"  + result == ""             → likely void
-//   - status == "active"   / "open" / ""              → still trading
-//
-// Anything else is conservatively treated as Unsettled — settle will
-// retry the same bet next run.
-func classifyResolution(status, result string) papertrade.Resolution {
-	s := strings.ToLower(strings.TrimSpace(status))
-	r := strings.ToLower(strings.TrimSpace(result))
-	switch s {
-	case "settled", "finalized", "expired":
-		switch r {
-		case "yes":
-			return papertrade.ResolutionYes
-		case "no":
-			return papertrade.ResolutionNo
-		case "":
-			return papertrade.ResolutionVoid
-		default:
-			return papertrade.ResolutionVoid
-		}
-	default:
-		return papertrade.ResolutionUnsettled
-	}
 }
 
 // outcomePath builds the per-run outcome file path under the bracket-

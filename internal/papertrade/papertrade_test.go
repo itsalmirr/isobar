@@ -435,6 +435,36 @@ func TestLedger_RecoverHandlesMissingDir(t *testing.T) {
 	}
 }
 
+func TestClassifyResolution(t *testing.T) {
+	cases := []struct {
+		status, result string
+		want           Resolution
+	}{
+		{"settled", "yes", ResolutionYes},
+		{"settled", "no", ResolutionNo},
+		{"finalized", "yes", ResolutionYes},
+		{"expired", "no", ResolutionNo},
+		{"settled", "", ResolutionVoid},
+		// case + whitespace tolerance
+		{"SETTLED", " Yes ", ResolutionYes},
+		// in-flight markets
+		{"open", "", ResolutionUnsettled},
+		{"active", "", ResolutionUnsettled},
+		{"", "", ResolutionUnsettled},
+		// unknown status → conservatively unsettled (caller retries)
+		{"weird-state", "yes", ResolutionUnsettled},
+		// settled with unknown result → defensive void
+		{"settled", "maybe", ResolutionVoid},
+	}
+	for _, c := range cases {
+		got := ClassifyResolution(c.status, c.result)
+		if got != c.want {
+			t.Errorf("ClassifyResolution(%q, %q) = %q, want %q",
+				c.status, c.result, got, c.want)
+		}
+	}
+}
+
 func TestPnLFromBet(t *testing.T) {
 	b := Bet{
 		Side:              SideYes,

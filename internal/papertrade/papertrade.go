@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -157,6 +158,40 @@ type Outcome struct {
 	// Void resolutions refund the mid (paper assumption); fees still hit.
 	Won      bool `json:"won"`
 	PnLCents int  `json:"pnl_cents"`
+}
+
+// ClassifyResolution maps a Kalshi (status, result) pair to a normalised
+// Resolution. The string vocabulary comes from the Kalshi API but is
+// not formally documented; observed values:
+//
+//   - status == "settled"  | "finalized" | "expired"
+//     - result "yes"  → ResolutionYes
+//     - result "no"   → ResolutionNo
+//     - result ""     → ResolutionVoid (defensive — no winning side recorded)
+//     - other         → ResolutionVoid
+//   - everything else → ResolutionUnsettled (caller retries later)
+//
+// Whitespace and case are tolerated so this works against raw API
+// responses without normalisation upstream. Used by cmd/settle (live)
+// and cmd/backfill-score (historical).
+func ClassifyResolution(status, result string) Resolution {
+	s := strings.ToLower(strings.TrimSpace(status))
+	r := strings.ToLower(strings.TrimSpace(result))
+	switch s {
+	case "settled", "finalized", "expired":
+		switch r {
+		case "yes":
+			return ResolutionYes
+		case "no":
+			return ResolutionNo
+		case "":
+			return ResolutionVoid
+		default:
+			return ResolutionVoid
+		}
+	default:
+		return ResolutionUnsettled
+	}
 }
 
 // PnLFromBet computes per-contract paper P&L in cents from a Bet and
