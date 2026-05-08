@@ -363,6 +363,139 @@ func TestLedger_RecoverHandlesMissingDir(t *testing.T) {
 	}
 }
 
+func TestPnLFromBet(t *testing.T) {
+	b := Bet{
+		Side:              SideYes,
+		MidCents:          30,
+		FeeRoundTripCents: 4,
+	}
+	cases := []struct {
+		name     string
+		side     Side
+		mid      int
+		fee      int
+		res      Resolution
+		wantWon  bool
+		wantPnL  int
+	}{
+		{"yes-bet-yes-resolves-win", SideYes, 30, 4, ResolutionYes, true, 100 - 30 - 4},
+		{"yes-bet-no-resolves-lose", SideYes, 30, 4, ResolutionNo, false, -30 - 4},
+		{"no-bet-no-resolves-win", SideNo, 60, 4, ResolutionNo, true, 100 - 60 - 4},
+		{"no-bet-yes-resolves-lose", SideNo, 60, 4, ResolutionYes, false, -60 - 4},
+		{"void-eats-fee-only", SideYes, 30, 4, ResolutionVoid, false, -4},
+		{"unsettled-no-pnl", SideYes, 30, 4, ResolutionUnsettled, false, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b.Side = tc.side
+			b.MidCents = tc.mid
+			b.FeeRoundTripCents = tc.fee
+			won, pnl := PnLFromBet(b, tc.res)
+			if won != tc.wantWon {
+				t.Errorf("won = %v, want %v", won, tc.wantWon)
+			}
+			if pnl != tc.wantPnL {
+				t.Errorf("pnl = %v, want %v", pnl, tc.wantPnL)
+			}
+		})
+	}
+}
+
+func TestIterBetsSkipsOldDates(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	led, err := OpenLedger(LedgerOptions{
+		Dir: dir, FlushEvery: 5 * time.Millisecond, QueueSize: 16,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Two bets — the journal will write them under today's UTC date dir.
+	for i, id := range []string{"K|yes|2026-04-22", "K|no|2026-04-22"} {
+		_, _ = led.Record(Bet{
+			SchemaVersion: SchemaVersion, ID: id, Ticker: "K",
+			Side:               Side([]string{"yes", "no"}[i]),
+			SettlementUnixNano: now.AddDate(0, 0, 2).UnixNano(),
+		})
+	}
+	if err := led.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	count := 0
+	if err := IterBets(dir, now, func(b Bet) error {
+		count++
+		if b.Ticker != "K" {
+			t.Errorf("unexpected ticker %q", b.Ticker)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Errorf("iter count = %d, want 2", count)
+	}
+
+	// since = far future → cutoff > today → no dirs match.
+	count = 0
+	if err := IterBets(dir, now.AddDate(0, 0, 30), func(_ Bet) error {
+		count++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Errorf("future-since count = %d, want 0", count)
+	}
+}
+
+func TestAppendAndIterOutcomes(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	dateDir := now.UTC().Format("2006-01-02")
+	path := filepath.Join(dir, dateDir, "outcomes-test.jsonl")
+
+	o1 := Outcome{
+		SchemaVersion: OutcomeSchemaVersion,
+		BetID:         "K|yes|2026-04-22",
+		Ticker:        "K",
+		Resolution:    ResolutionYes,
+		BetSide:       SideYes,
+		Won:           true,
+		PnLCents:      66,
+	}
+	o2 := o1
+	o2.BetID = "K|no|2026-04-22"
+	o2.BetSide = SideNo
+	o2.Won = false
+	o2.PnLCents = -34
+
+	if _, err := AppendOutcome(path, o1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := AppendOutcome(path, o2); err != nil {
+		t.Fatal(err)
+	}
+
+	seen := map[string]Outcome{}
+	if err := IterOutcomes(dir, now, func(o Outcome) error {
+		seen[o.BetID] = o
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(seen) != 2 {
+		t.Fatalf("seen %d, want 2: %v", len(seen), seen)
+	}
+	if seen[o1.BetID].PnLCents != 66 {
+		t.Errorf("o1 pnl = %d, want 66", seen[o1.BetID].PnLCents)
+	}
+	if !seen[o2.BetID].Won == false { // double-negate intentionally for clarity
+		t.Errorf("o2 should be lost")
+	}
+}
+
 func TestLedger_PersistsToJSONL(t *testing.T) {
 	dir := t.TempDir()
 	led, err := OpenLedger(LedgerOptions{

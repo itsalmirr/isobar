@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -39,6 +40,11 @@ import (
 // add/remove/rename so cmd/settle and cmd/score can refuse mismatched
 // ledger files instead of silently misreading them.
 const SchemaVersion = "papertrade-bet/v1"
+
+// OutcomeSchemaVersion identifies the on-disk Outcome shape (cmd/settle
+// output). Independent from SchemaVersion: the bet schema can evolve
+// without forcing an outcome reformat and vice versa.
+const OutcomeSchemaVersion = "papertrade-outcome/v1"
 
 // Side is YES or NO — which side of the binary contract we'd buy.
 type Side string
@@ -105,6 +111,84 @@ type Bet struct {
 	// always size 1 contract; this field exists so cmd/score can
 	// compute P&L without re-deriving the policy.
 	SizingContracts int `json:"sizing_contracts"`
+}
+
+// Resolution is the normalised outcome of a bracket: which side
+// settled in-the-money, or "void"/"unsettled" for edge cases.
+type Resolution string
+
+const (
+	ResolutionYes       Resolution = "yes"
+	ResolutionNo        Resolution = "no"
+	ResolutionVoid      Resolution = "void"
+	ResolutionUnsettled Resolution = "unsettled"
+)
+
+// Outcome is the on-disk record of one bet's resolution. cmd/settle
+// produces these by joining ledger Bets against Kalshi market
+// settlement state. P&L is computed in the same fee-aware units as the
+// bet's predicted edge so cmd/score can compare prediction to outcome
+// in like terms.
+//
+// One Outcome per Bet. Idempotency: settle skips bet IDs already
+// present in any outcomes-*.jsonl[.gz] file under the bracket date.
+type Outcome struct {
+	SchemaVersion string `json:"schema_version"`
+	BetID         string `json:"bet_id"`
+	SettledAt     int64  `json:"settled_at"` // unix nanos when WE recorded the outcome
+	Ticker        string `json:"ticker"`
+
+	// Raw Kalshi state — kept verbatim for forensics on resolution
+	// disputes (Kalshi has flipped market resolutions in the past).
+	KalshiStatus string `json:"kalshi_status"`
+	KalshiResult string `json:"kalshi_result"`
+
+	// Normalised resolution.
+	Resolution Resolution `json:"resolution"`
+
+	// Bet recap — duplicated so an Outcome row is self-contained for
+	// cmd/score without needing to re-join against the bet ledger.
+	BetSide      Side    `json:"bet_side"`
+	BetMidCents  int     `json:"bet_mid_cents"`
+	BetEdgeCents float64 `json:"bet_edge_cents"`
+	BetFeeCents  int     `json:"bet_fee_cents"`
+
+	// P&L in cents per contract: (100 if won else 0) - mid - fee.
+	// Void resolutions refund the mid (paper assumption); fees still hit.
+	Won      bool `json:"won"`
+	PnLCents int  `json:"pnl_cents"`
+}
+
+// PnLFromBet computes per-contract paper P&L in cents from a Bet and
+// the resolved Resolution. Returns (won, pnl).
+//
+//   - Win:    payout 100 → +100 - mid - fee
+//   - Lose:   payout 0   → -mid - fee
+//   - Void:   refund mid → 0 - fee  (fees still incurred at venue)
+//   - Other:  treated as still-unsettled — caller should not Record an
+//     Outcome until resolution lands.
+//
+// The fee used here is the same RoundTripFeeCents the Bet's edge
+// prediction used; this preserves prediction/outcome unit parity for
+// cmd/score's analytics.
+func PnLFromBet(b Bet, res Resolution) (won bool, pnl int) {
+	fee := b.FeeRoundTripCents
+	switch res {
+	case ResolutionVoid:
+		return false, -fee
+	case ResolutionYes:
+		if b.Side == SideYes {
+			return true, 100 - b.MidCents - fee
+		}
+		return false, -b.MidCents - fee
+	case ResolutionNo:
+		if b.Side == SideNo {
+			return true, 100 - b.MidCents - fee
+		}
+		return false, -b.MidCents - fee
+	default:
+		return false, 0
+	}
 }
 
 // Trigger configures when a snapshot should produce a bet. All fields
@@ -403,6 +487,186 @@ func (l *Ledger) Close() error {
 		return nil
 	}
 	return l.jrn.Close()
+}
+
+// IterBets walks ledger JSONL files under dir for date subdirs >=
+// since (cushioned by one day for cross-midnight brackets) and calls
+// fn for each decoded Bet. Returns the first traversal error; per-line
+// decode failures are silently skipped so one corrupt frame doesn't
+// poison the run.
+//
+// This is the read-side counterpart to OpenLedger+Record: cmd/settle
+// uses it to find bets that need outcome resolution, and cmd/score
+// uses it to walk the historical ledger.
+func IterBets(dir string, since time.Time, fn func(Bet) error) error {
+	cutoff := since.AddDate(0, 0, -1).UTC().Format("2006-01-02")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("papertrade: iter read %s: %w", dir, err)
+	}
+	var dateDirs []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if len(name) != 10 {
+			continue
+		}
+		if _, parseErr := time.Parse("2006-01-02", name); parseErr != nil {
+			continue
+		}
+		if name < cutoff {
+			continue
+		}
+		dateDirs = append(dateDirs, name)
+	}
+	sort.Strings(dateDirs)
+
+	for _, dd := range dateDirs {
+		files, err := replay.ListJournals(filepath.Join(dir, dd))
+		if err != nil {
+			return fmt.Errorf("papertrade: iter list %s: %w", dd, err)
+		}
+		// Filter to bet files only — we co-locate outcomes in the same
+		// directory but those are walked via IterOutcomes.
+		bets := make([]string, 0, len(files))
+		for _, f := range files {
+			base := filepath.Base(f)
+			if startsWith(base, "papertrade-") {
+				bets = append(bets, f)
+			}
+		}
+		var iterErr error
+		_ = replay.ForEachFrame(bets, func(env replay.Envelope, _ int, _ bool) error {
+			if env.Source != "papertrade" || env.Kind != "bet" {
+				return nil
+			}
+			var b Bet
+			if err := json.Unmarshal(env.Payload, &b); err != nil {
+				return nil
+			}
+			if iterErr = fn(b); iterErr != nil {
+				return iterErr
+			}
+			return nil
+		})
+		if iterErr != nil {
+			return iterErr
+		}
+	}
+	return nil
+}
+
+// IterOutcomes walks outcome JSONL files under dir for date subdirs
+// >= since (with the same one-day cushion as IterBets) and calls fn
+// for each decoded Outcome. Used by cmd/settle to skip already-
+// resolved bets and by cmd/score to read the resolution stream.
+func IterOutcomes(dir string, since time.Time, fn func(Outcome) error) error {
+	cutoff := since.AddDate(0, 0, -1).UTC().Format("2006-01-02")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("papertrade: iter outcomes read %s: %w", dir, err)
+	}
+	var dateDirs []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if len(name) != 10 {
+			continue
+		}
+		if _, parseErr := time.Parse("2006-01-02", name); parseErr != nil {
+			continue
+		}
+		if name < cutoff {
+			continue
+		}
+		dateDirs = append(dateDirs, name)
+	}
+	sort.Strings(dateDirs)
+
+	for _, dd := range dateDirs {
+		files, err := replay.ListJournals(filepath.Join(dir, dd))
+		if err != nil {
+			return fmt.Errorf("papertrade: iter outcomes list %s: %w", dd, err)
+		}
+		outs := make([]string, 0, len(files))
+		for _, f := range files {
+			base := filepath.Base(f)
+			if startsWith(base, "outcomes-") {
+				outs = append(outs, f)
+			}
+		}
+		// outcomes files are written by cmd/settle directly (not via
+		// internal/journal), so they are plain NDJSON of Outcome
+		// records — not journal-wrapped. Open + line-read each.
+		for _, f := range outs {
+			if err := decodeOutcomeFile(f, fn); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func decodeOutcomeFile(path string, fn func(Outcome) error) error {
+	rc, err := replay.Open(path)
+	if err != nil {
+		return fmt.Errorf("papertrade: open outcome %s: %w", path, err)
+	}
+	defer rc.Close()
+	dec := json.NewDecoder(rc)
+	for {
+		var o Outcome
+		if err := dec.Decode(&o); err != nil {
+			if err.Error() == "EOF" || err == io.EOF {
+				return nil
+			}
+			// Tolerate one bad line — skip and continue.
+			continue
+		}
+		if err := fn(o); err != nil {
+			return err
+		}
+	}
+}
+
+func startsWith(s, prefix string) bool {
+	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
+}
+
+// AppendOutcome serializes o as a JSONL line and appends to a file in
+// dir/<bracket-date>/outcomes-<unix>.jsonl. The caller passes the
+// path; we don't manage rotation since cmd/settle is one-shot and
+// produces small files (a few hundred outcomes per run max). Returns
+// the bytes written (one line) for caller-side accounting.
+func AppendOutcome(path string, o Outcome) (int, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return 0, fmt.Errorf("papertrade: mkdir for outcome: %w", err)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return 0, fmt.Errorf("papertrade: open outcome %s: %w", path, err)
+	}
+	defer f.Close()
+	body, err := json.Marshal(o)
+	if err != nil {
+		return 0, fmt.Errorf("papertrade: marshal outcome: %w", err)
+	}
+	body = append(body, '\n')
+	n, err := f.Write(body)
+	if err != nil {
+		return 0, fmt.Errorf("papertrade: write outcome: %w", err)
+	}
+	return n, nil
 }
 
 // Recover scans existing ledger files under dir and seeds the dedup
