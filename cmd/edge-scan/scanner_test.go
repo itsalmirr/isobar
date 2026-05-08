@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/wh0o0pz/isobar/internal/calibration/mos"
+	"github.com/wh0o0pz/isobar/internal/edge"
 	"github.com/wh0o0pz/isobar/internal/market"
 	"github.com/wh0o0pz/isobar/internal/openmeteo"
 	"github.com/wh0o0pz/isobar/internal/replay"
@@ -38,7 +39,7 @@ func TestNaiveProbability(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			p, c := naiveProbability(members, tt.bt, tt.threshold)
+			p, c := edge.NaiveProbability(members, tt.bt, tt.threshold)
 			if math.Abs(p-tt.wantP) > 1e-6 {
 				t.Errorf("p = %v, want %v", p, tt.wantP)
 			}
@@ -54,7 +55,7 @@ func TestNaiveProbabilityHandlesNaN(t *testing.T) {
 	for i := range members {
 		members[i] = math.NaN()
 	}
-	p, c := naiveProbability(members, market.BracketAbove, 50)
+	p, c := edge.NaiveProbability(members, market.BracketAbove, 50)
 	if p != 0 || c != 0 {
 		t.Errorf("all-NaN: p=%v c=%d, want 0,0", p, c)
 	}
@@ -65,7 +66,7 @@ func TestEnsembleRange(t *testing.T) {
 	for i := range members {
 		members[i] = float64(i)
 	}
-	lo, hi := ensembleRange(members)
+	lo, hi := edge.EnsembleRange(members)
 	if lo != 0 || hi != 30 {
 		t.Errorf("range = (%v, %v), want (0, 30)", lo, hi)
 	}
@@ -76,7 +77,7 @@ func TestEnsembleRangeAllInvalid(t *testing.T) {
 	for i := range members {
 		members[i] = math.NaN()
 	}
-	lo, hi := ensembleRange(members)
+	lo, hi := edge.EnsembleRange(members)
 	if !math.IsInf(lo, 1) || !math.IsInf(hi, -1) {
 		t.Errorf("all-NaN range = (%v, %v), want (+Inf, -Inf)", lo, hi)
 	}
