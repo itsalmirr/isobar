@@ -99,8 +99,9 @@ func main() {
 		logger.Warn("climate_shrunk model selected but no --climate provided; will fall back to naive per-bracket")
 	}
 
+	ledgerDir := filepath.Join(cfg.DataDir, "papertrade")
 	led, err := papertrade.OpenLedger(papertrade.LedgerOptions{
-		Dir:              filepath.Join(cfg.DataDir, "papertrade"),
+		Dir:              ledgerDir,
 		MaxFileBytes:     cfg.Journal.MaxFileBytes,
 		MaxFileAge:       cfg.Journal.MaxFileAge,
 		FlushEvery:       cfg.Journal.FlushEvery,
@@ -112,6 +113,14 @@ func main() {
 		os.Exit(1)
 	}
 	defer func() { _ = led.Close() }()
+
+	// Boot-time dedup: scan ledger files for unsettled bets so a process
+	// restart mid-day doesn't re-fire bets we've already recorded.
+	restored, err := led.Recover(ledgerDir, time.Now())
+	if err != nil {
+		logger.Warn("ledger recover", "err", err)
+	}
+	logger.Info("ledger ready", "dir", ledgerDir, "recovered_dedup_keys", restored)
 
 	tr := newTrader(logger, led, clim, papertrade.Trigger{
 		MinEdgeCents:   *minEdge,
@@ -256,16 +265,25 @@ func (tr *trader) onWSFrame(raw []byte) {
 
 	now := clock.Now().Wall
 
+	// Apply the frame AND extract mid/spread atomically: the book maps
+	// can be mutated by future frames, so reading them outside the lock
+	// is a data race. Compute the snapshot scalars under the lock and
+	// hand them to evaluate().
 	tr.mu.Lock()
 	env := replay.Envelope{Wall: now}
 	replay.ApplyFrameToBooks(tr.books, tr.walls, env, f)
 	book := tr.books[ticker]
+	var mid, spread int
+	if book != nil {
+		mid = book.MidYesCents()
+		spread = book.SpreadYesCents()
+	}
 	tr.mu.Unlock()
 
 	if book == nil {
 		return
 	}
-	tr.evaluate(ticker, book, now)
+	tr.evaluate(ticker, mid, spread, now)
 }
 
 // runOpenMeteo polls Open-Meteo on a fixed interval. Each poll updates
@@ -330,23 +348,30 @@ func (tr *trader) onPoll(loc openmeteo.Location, raw []byte) {
 
 	tr.logger.Debug("poll received", "loc", loc.Name, "tickers_to_evaluate", len(tickers))
 	for _, ticker := range tickers {
+		// Same lock-safe extract as onWSFrame: pull scalars under the
+		// lock so a concurrent WS frame can't mutate the book mid-read.
 		tr.mu.RLock()
 		book := tr.books[ticker]
+		var mid, spread int
+		if book != nil {
+			mid = book.MidYesCents()
+			spread = book.SpreadYesCents()
+		}
 		tr.mu.RUnlock()
 		if book == nil {
 			continue
 		}
-		tr.evaluate(ticker, book, now)
+		tr.evaluate(ticker, mid, spread, now)
 	}
 }
 
 // evaluate is the trigger-evaluation kernel. Skips redundant work via
 // last-mid/last-spread tracking, then calls papertrade.Decide and, on
 // a positive trigger, records the bet.
-func (tr *trader) evaluate(ticker string, book *replay.Book, now int64) {
-	mid := book.MidYesCents()
-	spread := book.SpreadYesCents()
-
+//
+// mid and spread MUST be extracted under tr.mu by the caller — they are
+// passed in scalar so this function can run lock-free.
+func (tr *trader) evaluate(ticker string, mid, spread int, now int64) {
 	tr.lastMu.Lock()
 	prevMid, prevMidOK := tr.lastMid[ticker]
 	prevSpread, prevSpreadOK := tr.lastSpread[ticker]
@@ -373,11 +398,12 @@ func (tr *trader) evaluate(ticker string, book *replay.Book, now int64) {
 	tr.mu.RUnlock()
 
 	bet, _, ok := papertrade.Decide(papertrade.Snapshot{
-		Ticker:    ticker,
-		Book:      book,
-		Poll:      poll,
-		PollWall:  pollWall,
-		DecidedAt: now,
+		Ticker:      ticker,
+		MidCents:    mid,
+		SpreadCents: spread,
+		Poll:        poll,
+		PollWall:    pollWall,
+		DecidedAt:   now,
 	}, tr.trig, tr.clim)
 	if !ok {
 		return

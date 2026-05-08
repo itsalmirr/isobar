@@ -20,6 +20,9 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -146,16 +149,20 @@ func TriggerDefaults() Trigger {
 	}
 }
 
-// Snapshot is the input to Decide: one (ticker, current book, latest
-// matching poll) tuple at decision time. PollWall is the unix-nano wall
-// timestamp of the poll, used to compute PollAgeSeconds against
-// DecidedAt.
+// Snapshot is the input to Decide: one (ticker, market state, latest
+// matching poll) tuple at decision time. MidCents and SpreadCents are
+// extracted from a replay.Book by the caller — Decide is intentionally
+// race-safe given that the underlying book may be mutated by other
+// goroutines between extraction and decision. PollWall is the
+// unix-nano wall timestamp of the poll, used to compute PollAgeSeconds
+// against DecidedAt.
 type Snapshot struct {
-	Ticker     string
-	Book       *replay.Book
-	Poll       *openmeteo.EnsemblePoll
-	PollWall   int64
-	DecidedAt  int64 // unix nanos
+	Ticker      string
+	MidCents    int
+	SpreadCents int
+	Poll        *openmeteo.EnsemblePoll
+	PollWall    int64
+	DecidedAt   int64 // unix nanos
 }
 
 // Decide evaluates one snapshot against the trigger. It returns
@@ -170,15 +177,10 @@ func Decide(snap Snapshot, trig Trigger, clim *climate.Lookup) (bet Bet, reasonS
 	if err != nil {
 		return Bet{}, "unparseable ticker", false
 	}
-	if snap.Book == nil {
-		return Bet{}, "nil book", false
-	}
-	mid := snap.Book.MidYesCents()
-	if mid <= 0 || mid >= 100 {
+	if snap.MidCents <= 0 || snap.MidCents >= 100 {
 		return Bet{}, "one-sided book", false
 	}
-	spread := snap.Book.SpreadYesCents()
-	if trig.MaxSpreadCents > 0 && spread > trig.MaxSpreadCents {
+	if trig.MaxSpreadCents > 0 && snap.SpreadCents > trig.MaxSpreadCents {
 		return Bet{}, "spread too wide", false
 	}
 	if snap.Poll == nil {
@@ -208,7 +210,7 @@ func Decide(snap Snapshot, trig Trigger, clim *climate.Lookup) (bet Bet, reasonS
 		return Bet{}, "too close to settlement", false
 	}
 
-	row := edge.FromExtremes(tk, mid, spread, members, pollAge, leadHours, nil, clim)
+	row := edge.FromExtremes(tk, snap.MidCents, snap.SpreadCents, members, pollAge, leadHours, nil, clim)
 
 	// Pick the probability path. Climate-shrunk falls back to naive when
 	// no climate match exists — this matches edge-scan's behaviour and
@@ -276,8 +278,8 @@ func Decide(snap Snapshot, trig Trigger, clim *climate.Lookup) (bet Bet, reasonS
 		BracketDate:        tk.Date.Format("2006-01-02"),
 		Side:               side,
 		Model:              modelName,
-		MidCents:           mid,
-		SpreadCents:        spread,
+		MidCents:           snap.MidCents,
+		SpreadCents:        snap.SpreadCents,
 		ModelP:             modelP,
 		EdgeCents:          edgeCents,
 		FeeRoundTripCents:  row.FeeRoundTripCents,
@@ -401,4 +403,83 @@ func (l *Ledger) Close() error {
 		return nil
 	}
 	return l.jrn.Close()
+}
+
+// Recover scans existing ledger files under dir and seeds the dedup
+// set with bets whose settlement is at or after `since`. This makes
+// process restart safe: if paper-trader was killed and relaunched
+// mid-day, every bet we already recorded for an unsettled bracket
+// stays deduped.
+//
+// Returns the number of bets restored, plus the first error
+// encountered during file traversal (per-file decode errors are logged
+// to the journal source's logger, not returned, so a single corrupt
+// line doesn't poison the whole recovery).
+//
+// dir is the parent directory passed to OpenLedger; the journal nests
+// files under dir/<YYYY-MM-DD>/papertrade-*.jsonl[.gz]. We walk every
+// date subdir whose name parses as a date >= the date of `since` minus
+// one day (cushion for late-night brackets that stamp into the prior
+// UTC day).
+func (l *Ledger) Recover(dir string, since time.Time) (int, error) {
+	if l == nil {
+		return 0, errors.New("papertrade: nil ledger")
+	}
+	cutoff := since.AddDate(0, 0, -1) // walk one extra day for cross-midnight brackets
+	cutoffStr := cutoff.UTC().Format("2006-01-02")
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil // first run — nothing to recover
+		}
+		return 0, fmt.Errorf("papertrade: recover read %s: %w", dir, err)
+	}
+	var dateDirs []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if len(name) != 10 {
+			continue
+		}
+		if _, parseErr := time.Parse("2006-01-02", name); parseErr != nil {
+			continue
+		}
+		if name < cutoffStr {
+			continue
+		}
+		dateDirs = append(dateDirs, name)
+	}
+	sort.Strings(dateDirs)
+
+	restored := 0
+	for _, dd := range dateDirs {
+		files, err := replay.ListJournals(filepath.Join(dir, dd))
+		if err != nil {
+			return restored, fmt.Errorf("papertrade: recover list %s: %w", dd, err)
+		}
+		_ = replay.ForEachFrame(files, func(env replay.Envelope, _ int, _ bool) error {
+			if env.Source != "papertrade" || env.Kind != "bet" {
+				return nil
+			}
+			var b Bet
+			if err := json.Unmarshal(env.Payload, &b); err != nil {
+				return nil // tolerate corrupt line
+			}
+			if b.ID == "" {
+				return nil
+			}
+			// Skip bets whose settlement is already in the past — the
+			// market can't trade again, so we don't need a dedup entry.
+			if b.SettlementUnixNano > 0 && time.Unix(0, b.SettlementUnixNano).Before(since) {
+				return nil
+			}
+			l.MarkRecorded(b.ID)
+			restored++
+			return nil
+		})
+	}
+	return restored, nil
 }

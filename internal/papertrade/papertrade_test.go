@@ -9,8 +9,17 @@ import (
 	"time"
 
 	"github.com/wh0o0pz/isobar/internal/openmeteo"
-	"github.com/wh0o0pz/isobar/internal/replay"
 )
+
+// midSpreadFromBids returns the (mid, spread) the trader would extract
+// from a 1-deep two-sided book with the given yes-bid and no-bid prices.
+// Mirrors replay.Book.MidYesCents/SpreadYesCents semantics so tests
+// remain readable.
+func midSpreadFromBids(yesBid, noBid int) (int, int) {
+	yask := 100 - noBid
+	mid := (yesBid + yask) / 2
+	return mid, yask - yesBid
+}
 
 // constMembers returns 31 members all set to v.
 func constMembers(v float64) []float64 {
@@ -44,13 +53,6 @@ func makePoll(loc string, wallNanos int64, tempC float64) *openmeteo.EnsemblePol
 	return p
 }
 
-func mockBook(yesBid, noBid int) *replay.Book {
-	b := replay.NewBook()
-	b.Yes[yesBid] = 100
-	b.No[noBid] = 100
-	return b
-}
-
 // Decision time: 2026-04-22 06:00 UTC = 02:00 NY local on 04-22, so the
 // bracket day's settlement is ~22h out — comfortably above MinLeadHours.
 var fixedDecidedAt = time.Date(2026, 4, 22, 6, 0, 0, 0, time.UTC).UnixNano()
@@ -58,12 +60,14 @@ var fixedDecidedAt = time.Date(2026, 4, 22, 6, 0, 0, 0, time.UTC).UnixNano()
 func TestDecide_StrongYesEdge(t *testing.T) {
 	// All members forecast 25°C ≈ 77°F. Bracket "high ≥ 70" → naive P=1.
 	// Mid = 30¢, fee ≈ 4¢ → yes_edge ≈ +66¢ (way above 3¢ threshold).
+	mid, spread := midSpreadFromBids(28, 70) // mid = (28 + (100-70))/2 = 29
 	snap := Snapshot{
-		Ticker:    "KXHIGHNY-26APR22-T70",
-		Book:      mockBook(28, 70), // mid = (28 + (100-70))/2 = 29
-		Poll:      makePoll("NY", fixedDecidedAt-int64(60*time.Second), 25),
-		PollWall:  fixedDecidedAt - int64(60*time.Second),
-		DecidedAt: fixedDecidedAt,
+		Ticker:      "KXHIGHNY-26APR22-T70",
+		MidCents:    mid,
+		SpreadCents: spread,
+		Poll:        makePoll("NY", fixedDecidedAt-int64(60*time.Second), 25),
+		PollWall:    fixedDecidedAt - int64(60*time.Second),
+		DecidedAt:   fixedDecidedAt,
 	}
 	bet, skip, ok := Decide(snap, TriggerDefaults(), nil)
 	if !ok {
@@ -85,16 +89,16 @@ func TestDecide_StrongYesEdge(t *testing.T) {
 
 func TestDecide_NoEdgeBelowThreshold(t *testing.T) {
 	// All members forecast 25°C ≈ 77°F. Bracket "high ≥ 70". Naive P=1,
-	// mid=95 → yes_edge = 100-95-fee, no_edge = 95-100-fee = -negative.
-	// At mid=95, fee = ceil(7*0.95*0.05)*2 = ceil(0.33)*2 = 2.
-	// yes_edge = 100-95-2 = 3 — exactly at threshold, should fire.
-	// Bump mid to 97 to push edge below threshold.
+	// mid=97 → yes_edge = 100-97-fee. At mid=97, fee ≈ 0 → yes_edge ≈ 3,
+	// at threshold; mid=98 pushes it below.
+	mid, spread := midSpreadFromBids(97, 1) // mid=98
 	snap := Snapshot{
-		Ticker:    "KXHIGHNY-26APR22-T70",
-		Book:      mockBook(96, 2), // mid=97
-		Poll:      makePoll("NY", fixedDecidedAt, 25),
-		PollWall:  fixedDecidedAt,
-		DecidedAt: fixedDecidedAt,
+		Ticker:      "KXHIGHNY-26APR22-T70",
+		MidCents:    mid,
+		SpreadCents: spread,
+		Poll:        makePoll("NY", fixedDecidedAt, 25),
+		PollWall:    fixedDecidedAt,
+		DecidedAt:   fixedDecidedAt,
 	}
 	_, skip, ok := Decide(snap, TriggerDefaults(), nil)
 	if ok {
@@ -106,14 +110,15 @@ func TestDecide_NoEdgeBelowThreshold(t *testing.T) {
 }
 
 func TestDecide_SkipsOneSidedBook(t *testing.T) {
-	b := replay.NewBook()
-	b.Yes[45] = 100
+	// One-sided book → MidYesCents() returns 0; we model that by passing
+	// 0 directly. Decide rejects mid <= 0 OR mid >= 100.
 	snap := Snapshot{
-		Ticker:    "KXHIGHNY-26APR22-T70",
-		Book:      b,
-		Poll:      makePoll("NY", fixedDecidedAt, 25),
-		PollWall:  fixedDecidedAt,
-		DecidedAt: fixedDecidedAt,
+		Ticker:      "KXHIGHNY-26APR22-T70",
+		MidCents:    0,
+		SpreadCents: 100,
+		Poll:        makePoll("NY", fixedDecidedAt, 25),
+		PollWall:    fixedDecidedAt,
+		DecidedAt:   fixedDecidedAt,
 	}
 	_, skip, ok := Decide(snap, TriggerDefaults(), nil)
 	if ok {
@@ -126,12 +131,14 @@ func TestDecide_SkipsOneSidedBook(t *testing.T) {
 
 func TestDecide_SkipsWideSpread(t *testing.T) {
 	// yes_bid=20, no_bid=20 → yes_ask=80, spread=60. Way above 5¢ default.
+	mid, spread := midSpreadFromBids(20, 20)
 	snap := Snapshot{
-		Ticker:    "KXHIGHNY-26APR22-T70",
-		Book:      mockBook(20, 20),
-		Poll:      makePoll("NY", fixedDecidedAt, 25),
-		PollWall:  fixedDecidedAt,
-		DecidedAt: fixedDecidedAt,
+		Ticker:      "KXHIGHNY-26APR22-T70",
+		MidCents:    mid,
+		SpreadCents: spread,
+		Poll:        makePoll("NY", fixedDecidedAt, 25),
+		PollWall:    fixedDecidedAt,
+		DecidedAt:   fixedDecidedAt,
 	}
 	_, skip, ok := Decide(snap, TriggerDefaults(), nil)
 	if ok {
@@ -145,12 +152,14 @@ func TestDecide_SkipsWideSpread(t *testing.T) {
 func TestDecide_SkipsStalePoll(t *testing.T) {
 	// 5h old poll, default MaxPollAge = 4h.
 	old := fixedDecidedAt - int64(5*time.Hour)
+	mid, spread := midSpreadFromBids(28, 70)
 	snap := Snapshot{
-		Ticker:    "KXHIGHNY-26APR22-T70",
-		Book:      mockBook(28, 70),
-		Poll:      makePoll("NY", old, 25),
-		PollWall:  old,
-		DecidedAt: fixedDecidedAt,
+		Ticker:      "KXHIGHNY-26APR22-T70",
+		MidCents:    mid,
+		SpreadCents: spread,
+		Poll:        makePoll("NY", old, 25),
+		PollWall:    old,
+		DecidedAt:   fixedDecidedAt,
 	}
 	_, skip, ok := Decide(snap, TriggerDefaults(), nil)
 	if ok {
@@ -162,18 +171,17 @@ func TestDecide_SkipsStalePoll(t *testing.T) {
 }
 
 func TestDecide_SkipsNearSettlement(t *testing.T) {
-	// Decision time = 04-22 23:30 UTC = 19:30 NY-local on 04-22. Settlement
-	// = 04-23 00:00 NY-local = 04-23 04:00 UTC. Lead = ~4.5h... not skipped.
-	// Move decision to 04-23 01:00 UTC = 21:00 NY-local 04-22 → lead ~3h,
-	// still above 2h. Move to 04-23 03:00 UTC = 23:00 NY-local 04-22 →
-	// lead ~1h, BELOW 2h, expect skip.
+	// Decision = 04-23 03:00 UTC = 23:00 NY-local 04-22. Settlement at
+	// 04-23 00:00 NY-local = 04-23 04:00 UTC. Lead = ~1h < 2h floor.
 	tooLate := time.Date(2026, 4, 23, 3, 0, 0, 0, time.UTC).UnixNano()
+	mid, spread := midSpreadFromBids(28, 70)
 	snap := Snapshot{
-		Ticker:    "KXHIGHNY-26APR22-T70",
-		Book:      mockBook(28, 70),
-		Poll:      makePoll("NY", tooLate, 25),
-		PollWall:  tooLate,
-		DecidedAt: tooLate,
+		Ticker:      "KXHIGHNY-26APR22-T70",
+		MidCents:    mid,
+		SpreadCents: spread,
+		Poll:        makePoll("NY", tooLate, 25),
+		PollWall:    tooLate,
+		DecidedAt:   tooLate,
 	}
 	_, skip, ok := Decide(snap, TriggerDefaults(), nil)
 	if ok {
@@ -185,9 +193,11 @@ func TestDecide_SkipsNearSettlement(t *testing.T) {
 }
 
 func TestDecide_UnparseableTicker(t *testing.T) {
+	mid, spread := midSpreadFromBids(45, 55)
 	_, skip, ok := Decide(Snapshot{
-		Ticker: "NOT-A-TICKER",
-		Book:   mockBook(45, 55),
+		Ticker:      "NOT-A-TICKER",
+		MidCents:    mid,
+		SpreadCents: spread,
 	}, TriggerDefaults(), nil)
 	if ok {
 		t.Errorf("expected skip on bad ticker")
@@ -248,6 +258,108 @@ func TestLedger_MarkRecoveredSkipsRewrite(t *testing.T) {
 	wrote, _ := led.Record(Bet{ID: id})
 	if wrote {
 		t.Errorf("expected skip on recovered ID")
+	}
+}
+
+func TestLedger_RecoverDedupesAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+
+	// Session 1: write two bets, one for tomorrow (should recover) and
+	// one for last week (should be ignored — already settled).
+	led1, err := OpenLedger(LedgerOptions{
+		Dir:        dir,
+		FlushEvery: 5 * time.Millisecond,
+		QueueSize:  16,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	betFuture := Bet{
+		SchemaVersion:      SchemaVersion,
+		ID:                 "K|yes|2026-04-22",
+		Ticker:             "K",
+		Side:               SideYes,
+		SettlementUnixNano: now.AddDate(0, 0, 2).UnixNano(),
+	}
+	betPast := Bet{
+		SchemaVersion:      SchemaVersion,
+		ID:                 "K|yes|2026-01-01",
+		Ticker:             "K",
+		Side:               SideYes,
+		SettlementUnixNano: now.AddDate(0, 0, -7).UnixNano(),
+	}
+	if _, err := led1.Record(betFuture); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := led1.Record(betPast); err != nil {
+		t.Fatal(err)
+	}
+	if err := led1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Session 2: open a fresh ledger over the same dir, recover, and
+	// verify the future bet dedups while a non-recorded one writes.
+	led2, err := OpenLedger(LedgerOptions{
+		Dir:        dir,
+		FlushEvery: 5 * time.Millisecond,
+		QueueSize:  16,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer led2.Close()
+
+	restored, err := led2.Recover(dir, now)
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if restored != 1 {
+		t.Errorf("restored = %d, want 1 (the future bet only)", restored)
+	}
+	if c := led2.Count(); c != 1 {
+		t.Errorf("Count = %d, want 1", c)
+	}
+
+	// Re-recording the future bet must dedup; a new ID must write.
+	wrote, _ := led2.Record(betFuture)
+	if wrote {
+		t.Errorf("expected dedup hit on recovered future bet")
+	}
+	wrote, _ = led2.Record(Bet{
+		SchemaVersion:      SchemaVersion,
+		ID:                 "K|no|2026-04-22",
+		Ticker:             "K",
+		Side:               SideNo,
+		SettlementUnixNano: now.AddDate(0, 0, 2).UnixNano(),
+	})
+	if !wrote {
+		t.Errorf("expected new ID to write")
+	}
+}
+
+func TestLedger_RecoverHandlesMissingDir(t *testing.T) {
+	// First-run scenario: no papertrade dir yet. Recover must succeed
+	// silently, not fail, so the binary can boot cleanly.
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "does-not-exist")
+	led, err := OpenLedger(LedgerOptions{
+		Dir:        dir,
+		FlushEvery: 5 * time.Millisecond,
+		QueueSize:  16,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer led.Close()
+
+	restored, err := led.Recover(missing, time.Now())
+	if err != nil {
+		t.Errorf("expected nil err on missing dir, got %v", err)
+	}
+	if restored != 0 {
+		t.Errorf("restored = %d, want 0", restored)
 	}
 }
 
