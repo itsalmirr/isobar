@@ -189,11 +189,29 @@ func Scan(opts ScanOptions) (*Result, error) {
 		nMembers := len(extremes)
 		pFair := float64(nIn) / float64(nMembers)
 
-		priceDollars := msg.priceDollars()
-		if priceDollars < 0 {
+		// Canonical YES-perspective prices (cents). The trade-message price
+		// fields can come from either side, so we always normalise here so
+		// every downstream calculation is in the same frame. yes + no = 100.
+		yesPriceCents, ok := msg.yesPriceCents()
+		if !ok {
 			res.SkippedReason["bad_trade_price"]++
 			return nil
 		}
+		noPriceCents := 100 - yesPriceCents
+		yesPriceDollars := float64(yesPriceCents) / 100
+
+		// The actual price the recorded trade executed at, in cents — depends
+		// on the trade's side (yes-side trades fill at yes_price, etc.). We
+		// expose this for the CSV but never feed it into edge math.
+		var execPriceCents int
+		if msg.Side == "no" {
+			execPriceCents = noPriceCents
+		} else {
+			execPriceCents = yesPriceCents
+		}
+
+		// Fee is symmetric in (P, 1-P), so it's the same regardless of side.
+		fee := FeePerContractCents(yesPriceDollars)
 
 		row := EdgeRow{
 			TsMs:            msg.TsMs,
@@ -203,13 +221,16 @@ func Scan(opts ScanOptions) (*Result, error) {
 			BracketKind:     spec.Kind.String(),
 			BracketKey:      spec.Key,
 			Side:            msg.Side,
-			TradePriceCents: int(priceDollars*100 + 0.5),
+			TradePriceCents: execPriceCents,
 			PFairNaive:      pFair,
 			NMembers:        nMembers,
 			NMembersInBkt:   nIn,
 			PollAgeS:        int(age.Seconds()),
-			FeeCents:        FeePerContractCents(priceDollars),
-			EdgeCents:       EdgeAfterFeeCents(pFair, priceDollars),
+			FeeCents:        fee,
+			// EdgeCents is the YES-perspective post-fee mispricing magnitude
+			// — same number for either trade side because the underlying
+			// market is the same.
+			EdgeCents: EdgeAfterFeeCents(pFair, yesPriceDollars),
 		}
 
 		// Realized-PnL backtest path. If no truth available we skip with a
@@ -229,24 +250,24 @@ func Scan(opts ScanOptions) (*Result, error) {
 			row.ActualTempF = actual
 			row.YesResolved = resolution.Contains(float64(actual))
 
-			// Decide hypothetical action: take the side with the larger
-			// post-fee edge, if it clears the threshold.
-			noPriceDollars := 1 - priceDollars
-			fee := FeePerContractCents(priceDollars)
-			edgeYesCents := int(pFair*100+0.5) - row.TradePriceCents - fee
-			edgeNoCents := int((1-pFair)*100+0.5) - int(noPriceDollars*100+0.5) - fee
+			// Decide hypothetical action: take whichever side has the larger
+			// post-fee edge, if it clears the threshold. Both edges are
+			// computed in the canonical YES-perspective frame, so this works
+			// identically whether the recorded trade was yes-side or no-side.
+			pFairYesCents := int(pFair*100 + 0.5)
+			edgeYesCents := pFairYesCents - yesPriceCents - fee
+			edgeNoCents := (100 - pFairYesCents) - noPriceCents - fee
 
 			switch {
 			case edgeYesCents >= opts.EdgeThresholdCents && edgeYesCents >= edgeNoCents:
 				row.OurSide = "yes"
 				if row.YesResolved {
-					row.OurPnLCents = 100 - row.TradePriceCents - fee
+					row.OurPnLCents = 100 - yesPriceCents - fee
 				} else {
-					row.OurPnLCents = -row.TradePriceCents - fee
+					row.OurPnLCents = -yesPriceCents - fee
 				}
 			case edgeNoCents >= opts.EdgeThresholdCents:
 				row.OurSide = "no"
-				noPriceCents := 100 - row.TradePriceCents
 				if !row.YesResolved {
 					row.OurPnLCents = 100 - noPriceCents - fee
 				} else {

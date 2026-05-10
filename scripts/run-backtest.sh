@@ -20,8 +20,7 @@
 #
 # Exit codes: 0 = backtest produced output, 1 = a stage failed, 2 = usage error.
 
-set -u
-set -o pipefail
+set -euo pipefail
 
 TAPE_DIR=""
 START=""

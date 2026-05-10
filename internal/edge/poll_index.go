@@ -159,10 +159,57 @@ type tradeMsg struct {
 	TsMs         int64           `json:"ts_ms"`
 }
 
+// yesPriceCents returns the canonical YES-side price in integer cents,
+// derived from whichever trade-message fields are populated:
+//   - yes_price set → use directly
+//   - no_price set, yes_price absent → 100 - no_price
+//   - both absent → fall back to legacy price_dollars (interpreted as the
+//     trade's executed-side price; for no-side legacy frames we invert)
+//
+// Returns ok=false if no usable price could be derived, or the price is
+// outside the (0, 100) trading band.
+//
+// The math in [Scan] is always done in YES-perspective regardless of which
+// side the recorded trade was on, so callers should use this rather than
+// reading YesPrice/NoPrice directly.
+func (m tradeMsg) yesPriceCents() (int, bool) {
+	switch {
+	case m.YesPrice > 0:
+		c := m.YesPrice
+		if c <= 0 || c >= 100 {
+			return 0, false
+		}
+		return c, true
+	case m.NoPrice > 0:
+		c := 100 - m.NoPrice
+		if c <= 0 || c >= 100 {
+			return 0, false
+		}
+		return c, true
+	}
+	if len(m.PriceDollars) > 0 {
+		var s string
+		if err := json.Unmarshal(m.PriceDollars, &s); err == nil {
+			var v float64
+			if _, err := fmt.Sscanf(s, "%f", &v); err == nil && v > 0 && v < 1 {
+				c := int(v*100 + 0.5)
+				if m.Side == "no" {
+					c = 100 - c
+				}
+				if c <= 0 || c >= 100 {
+					return 0, false
+				}
+				return c, true
+			}
+		}
+	}
+	return 0, false
+}
+
 // priceDollars returns the executed trade price as a fraction in [0,1],
-// or -1 if it can't be derived. Prefers the integer cents (yes_price /
-// no_price) which is Kalshi's canonical v2 representation; falls back to
-// the legacy "0.1600"-style string in price_dollars.
+// or -1 if it can't be derived. Kept for backwards compatibility with
+// any callers; new code should use yesPriceCents() and derive the
+// no-side price as (100 - yesPriceCents) when needed.
 func (m tradeMsg) priceDollars() float64 {
 	if m.YesPrice > 0 || m.NoPrice > 0 {
 		var c int
