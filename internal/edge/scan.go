@@ -167,11 +167,14 @@ func Scan(opts ScanOptions) (*Result, error) {
 			return fmt.Errorf("daily extremes: %w", err)
 		}
 
-		// Resolution; T-bracket direction needs sibling context — a future
-		// pass over per-(series,date) ticker sets could populate this. For
-		// the v0 lower bound, default high-side is fine for the high-end T
-		// markets and gives a known-wrong p_fair for the low-end ones (we
-		// flag those in SkippedReason so the summary highlights the issue).
+		// Resolution. T-brackets default to high-side (≥ K). Low-side T
+		// markets — e.g. KXHIGHNY-T56 in a market whose B-brackets start
+		// at 56.5 — get a known-wrong p_fair under this default. Detection
+		// requires sibling-bracket context (see ResolveWithSiblings); the
+		// scanner doesn't yet pre-bucket trades by (series, valid_date),
+		// so this is a recognised limitation rather than something the
+		// scanner can flag per-trade today. Bracket convention itself is
+		// also still tagged FIXME in resolution.go.
 		resolution := spec.Resolve()
 
 		// p_fair = fraction of members whose daily extreme falls in the
@@ -189,6 +192,15 @@ func Scan(opts ScanOptions) (*Result, error) {
 		nMembers := len(extremes)
 		pFair := float64(nIn) / float64(nMembers)
 
+		// Reject malformed trade sides up front. Any value other than the
+		// two Kalshi v2 enums is suspicious and treating it as "yes" by
+		// default (the previous behavior) silently routed unknown messages
+		// into the wrong half of the edge math.
+		if msg.Side != "yes" && msg.Side != "no" {
+			res.SkippedReason["bad_trade_side"]++
+			return nil
+		}
+
 		// Canonical YES-perspective prices (cents). The trade-message price
 		// fields can come from either side, so we always normalise here so
 		// every downstream calculation is in the same frame. yes + no = 100.
@@ -203,11 +215,9 @@ func Scan(opts ScanOptions) (*Result, error) {
 		// The actual price the recorded trade executed at, in cents — depends
 		// on the trade's side (yes-side trades fill at yes_price, etc.). We
 		// expose this for the CSV but never feed it into edge math.
-		var execPriceCents int
+		execPriceCents := yesPriceCents
 		if msg.Side == "no" {
 			execPriceCents = noPriceCents
-		} else {
-			execPriceCents = yesPriceCents
 		}
 
 		// Fee is symmetric in (P, 1-P), so it's the same regardless of side.

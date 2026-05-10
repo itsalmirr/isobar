@@ -55,13 +55,10 @@ if [ ! -d "$TAPE_DIR/kalshi" ] || [ ! -d "$TAPE_DIR/openmeteo" ]; then
   exit 2
 fi
 
-# CLI bulletins for date D are issued on D+1 morning. We need bulletins
-# up to END+1 to cover trades for END's bracket; fetch a 1-day buffer.
-case "$(uname -s)" in
-  Darwin) BUFFER_END=$(date -j -v+1d -f "%Y-%m-%d" "$END" "+%Y-%m-%d") ;;
-  *)      BUFFER_END=$(date -d "$END + 1 day" "+%Y-%m-%d") ;;
-esac
-
+# calibration-fetch-cli.sh internally extends the AFOS query by +1 day to
+# capture the morning-after CLI bulletin for WINDOW_END. We pass the user's
+# END as-is and let the fetcher do the +1 — adding our own +1 here would
+# double-buffer and inflate the bulletin-count threshold by an extra day.
 CALIB_DIR="$TAPE_DIR/calibration"
 CLI_DIR="$CALIB_DIR/cli"
 OBS_DIR="$CALIB_DIR/obs"
@@ -72,11 +69,11 @@ mkdir -p "$CLI_DIR" "$OBS_DIR"
 # bulletin-count threshold even when the zips are perfectly fine, and on a
 # windowed re-run we only need new zips for the dates we don't already have.
 if [ "$SKIP_FETCH" -eq 0 ]; then
-  echo "===> 1/4 fetching NWS CLI bulletins ($START..$BUFFER_END) ..."
+  echo "===> 1/4 fetching NWS CLI bulletins ($START..$END +1d AFOS buffer applied internally) ..."
   ./scripts/calibration-fetch-cli.sh \
     --data  "$CALIB_DIR" \
     --start "$START" \
-    --end   "$BUFFER_END" || echo "  (fetch script returned non-zero; continuing if zips exist)"
+    --end   "$END" || echo "  (fetch script returned non-zero; continuing if zips exist)"
 else
   echo "===> 1/4 skipping CLI fetch (--skip-fetch); using existing $CLI_DIR"
 fi
