@@ -24,6 +24,17 @@ type ScanOptions struct {
 	// cadence); 1h is the upper bound at which an ensemble member's
 	// daily aggregate is still essentially the same number.
 	MaxPollAge time.Duration
+
+	// Truth, if non-nil, enables realized-PnL backtest mode. Trades whose
+	// resolution date is missing from Truth are skipped (counted as
+	// "no_truth_available") rather than scored against forecast-only
+	// p_fair — this is how we avoid "imaginary bets that close idk when".
+	Truth *TruthIndex
+
+	// EdgeThresholdCents is the minimum naive edge (cents, post-fee)
+	// required for our hypothetical strategy to take a trade. Default
+	// is 5 — matches Phase 0.5 fee-aware floor in STRATEGY.md.
+	EdgeThresholdCents int
 }
 
 // EdgeRow is one trade-event record in the output CSV.
@@ -42,16 +53,29 @@ type EdgeRow struct {
 	PollAgeS        int
 	FeeCents        int
 	EdgeCents       int
+
+	// Backtest fields — populated only when ScanOptions.Truth is set.
+	HasTruth     bool   // true iff truth was looked up successfully
+	ActualTempF  int    // observed TMAX (KXHIGH*) or TMIN (KXLOWT*) on valid_date
+	YesResolved  bool   // bracket would have paid YES
+	OurSide      string // "yes", "no", or "" (skipped — no edge band)
+	OurPnLCents  int    // realized PnL after entry fee (0 if OurSide=="")
 }
 
 // Result is the output of Scan: per-trade rows plus aggregate counters.
 type Result struct {
-	TotalFrames    int
-	TradeFrames    int
-	WeatherTrades  int
-	PairedTrades   int
-	Rows           []EdgeRow
-	SkippedReason  map[string]int
+	TotalFrames   int
+	TradeFrames   int
+	WeatherTrades int
+	PairedTrades  int
+	Rows          []EdgeRow
+	SkippedReason map[string]int
+
+	// Backtest aggregates — only populated when ScanOptions.Truth is set.
+	BacktestEnabled bool
+	TradesEntered   int // rows where OurSide != ""
+	TradesWon       int // rows where OurPnLCents > 0
+	TotalPnLCents   int // sum of OurPnLCents
 }
 
 // Scan walks the data tree, pairs each Kalshi trade event with the
@@ -67,6 +91,9 @@ func Scan(opts ScanOptions) (*Result, error) {
 	if opts.MaxPollAge <= 0 {
 		opts.MaxPollAge = time.Hour
 	}
+	if opts.EdgeThresholdCents == 0 {
+		opts.EdgeThresholdCents = 5
+	}
 	if opts.EndDate.Before(opts.StartDate) {
 		return nil, errors.New("edge: EndDate before StartDate")
 	}
@@ -76,7 +103,10 @@ func Scan(opts ScanOptions) (*Result, error) {
 		return nil, fmt.Errorf("load openmeteo: %w", err)
 	}
 
-	res := &Result{SkippedReason: map[string]int{}}
+	res := &Result{
+		SkippedReason:   map[string]int{},
+		BacktestEnabled: opts.Truth != nil,
+	}
 
 	kalshiFiles, err := dailyFiles(filepath.Join(opts.DataDir, "kalshi"), opts.StartDate, opts.EndDate)
 	if err != nil {
@@ -178,6 +208,60 @@ func Scan(opts ScanOptions) (*Result, error) {
 			FeeCents:        FeePerContractCents(priceDollars),
 			EdgeCents:       EdgeAfterFeeCents(pFair, priceDollars),
 		}
+
+		// Realized-PnL backtest path. If no truth available we skip with a
+		// reason — this is the user's "no imaginary bets" rule: never score
+		// a trade whose outcome we can't look up.
+		if opts.Truth != nil {
+			truth, ok := opts.Truth.Get(station, spec.ValidDate)
+			if !ok {
+				res.SkippedReason["no_truth_available"]++
+				return nil
+			}
+			row.HasTruth = true
+			actual := truth.TMaxF
+			if !spec.IsHigh() {
+				actual = truth.TMinF
+			}
+			row.ActualTempF = actual
+			row.YesResolved = resolution.Contains(float64(actual))
+
+			// Decide hypothetical action: take the side with the larger
+			// post-fee edge, if it clears the threshold.
+			noPriceDollars := 1 - priceDollars
+			fee := FeePerContractCents(priceDollars)
+			edgeYesCents := int(pFair*100+0.5) - row.TradePriceCents - fee
+			edgeNoCents := int((1-pFair)*100+0.5) - int(noPriceDollars*100+0.5) - fee
+
+			switch {
+			case edgeYesCents >= opts.EdgeThresholdCents && edgeYesCents >= edgeNoCents:
+				row.OurSide = "yes"
+				if row.YesResolved {
+					row.OurPnLCents = 100 - row.TradePriceCents - fee
+				} else {
+					row.OurPnLCents = -row.TradePriceCents - fee
+				}
+			case edgeNoCents >= opts.EdgeThresholdCents:
+				row.OurSide = "no"
+				noPriceCents := 100 - row.TradePriceCents
+				if !row.YesResolved {
+					row.OurPnLCents = 100 - noPriceCents - fee
+				} else {
+					row.OurPnLCents = -noPriceCents - fee
+				}
+			default:
+				// no edge — skip the trade (PnL = 0, OurSide = "")
+			}
+
+			if row.OurSide != "" {
+				res.TradesEntered++
+				if row.OurPnLCents > 0 {
+					res.TradesWon++
+				}
+				res.TotalPnLCents += row.OurPnLCents
+			}
+		}
+
 		res.Rows = append(res.Rows, row)
 		res.PairedTrades++
 		return nil
