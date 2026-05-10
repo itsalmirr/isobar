@@ -272,6 +272,96 @@ func TestScan_BacktestNoTruthSkipped(t *testing.T) {
 	}
 }
 
+// TestScan_BacktestRealizedPnL_NoSide: same setup as the yes-side test, but
+// the recorded trade is on the NO side. Locks in the canonical YES-perspective
+// price math — both sides should converge on identical OurSide/PnL because
+// they're trading the same market at the same yes/no prices.
+//
+// Trade: KXHIGHNY-26APR29-B62.5, no_price=75 (so yes_price=25), side=no.
+// Synthetic poll → all members TMAX ~80°F → p_fair = 0 for [61.5, 63.5).
+// edge_yes = 0 - 25 - 2 = -27 (skip)
+// edge_no  = 100 - 75 - 2 = 23 (take NO at 75¢)
+// Truth: TMAX=80°F → YES did NOT resolve → NO wins.
+// PnL_no   = (100 - 75) - 2 = 23¢.
+//
+// Critically: TradePriceCents in the row is the EXECUTED price (75¢ NO-side),
+// while the edge math used yes_price internally (25¢). The result row's
+// OurPnLCents must match the yes-side test (23¢).
+func TestScan_BacktestRealizedPnL_NoSide(t *testing.T) {
+	dir := t.TempDir()
+	pollPayload := synthPoll(t)
+	pollTime := time.Date(2026, 4, 29, 7, 30, 0, 0, time.UTC)
+	tradeTime := pollTime.Add(20 * time.Minute)
+
+	if err := writeJournal(t, filepath.Join(dir, "openmeteo", "2026-04-29"), "om.jsonl",
+		[]envelope{{
+			Wall: pollTime.UnixNano(), Source: "openmeteo", Kind: "rest:NY", Payload: pollPayload,
+		}}); err != nil {
+		t.Fatal(err)
+	}
+
+	tradeMsgRaw, _ := json.Marshal(map[string]interface{}{
+		"market_ticker": "KXHIGHNY-26APR29-B62.5",
+		"yes_price":     25,
+		"no_price":      75,
+		"side":          "no",
+		"count":         1,
+		"ts_ms":         tradeTime.UnixMilli(),
+	})
+	frame, _ := json.Marshal(map[string]interface{}{
+		"type": "trade", "msg": json.RawMessage(tradeMsgRaw),
+	})
+	if err := writeJournal(t, filepath.Join(dir, "kalshi", "2026-04-29"), "k.jsonl",
+		[]envelope{{Wall: tradeTime.UnixNano(), Source: "kalshi", Kind: "ws", Payload: frame}}); err != nil {
+		t.Fatal(err)
+	}
+
+	truthDir := filepath.Join(dir, "truth")
+	if err := os.MkdirAll(truthDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(truthDir, "KNYC.csv"),
+		[]byte("valid_date,tmax_f,tmin_f,issued_at,bulletin_id\n"+
+			"2026-04-29,80,40,2026-04-30T06:00:00Z,CLINYC_test.txt\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	truth, err := LoadTruth(truthDir)
+	if err != nil {
+		t.Fatalf("LoadTruth: %v", err)
+	}
+
+	res, err := Scan(ScanOptions{
+		DataDir:            dir,
+		StartDate:          time.Date(2026, 4, 29, 0, 0, 0, 0, time.UTC),
+		EndDate:            time.Date(2026, 4, 30, 0, 0, 0, 0, time.UTC),
+		MaxPollAge:         time.Hour,
+		Truth:              truth,
+		EdgeThresholdCents: 5,
+	})
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if res.TradesEntered != 1 || res.TradesWon != 1 || res.TotalPnLCents != 23 {
+		t.Fatalf("aggregates: entered=%d won=%d pnl=%d (want 1/1/23) skipped=%v",
+			res.TradesEntered, res.TradesWon, res.TotalPnLCents, res.SkippedReason)
+	}
+	row := res.Rows[0]
+	if row.Side != "no" {
+		t.Errorf("row.Side = %q, want \"no\"", row.Side)
+	}
+	if row.TradePriceCents != 75 {
+		t.Errorf("row.TradePriceCents = %d, want 75 (executed NO-side price)", row.TradePriceCents)
+	}
+	if row.OurSide != "no" || row.OurPnLCents != 23 {
+		t.Errorf("decision: side=%q pnl=%d, want no/23", row.OurSide, row.OurPnLCents)
+	}
+	// EdgeCents column is YES-perspective (so it matches a yes-side trade in
+	// the same market): |0 - 25| - 2 = 23.
+	if row.EdgeCents != 23 {
+		t.Errorf("EdgeCents = %d, want 23 (YES-perspective: |0 - 25| - 2)", row.EdgeCents)
+	}
+}
+
 // envelope mirrors internal/replay.Envelope for fixture writing.
 type envelope struct {
 	Wall    int64           `json:"t"`
