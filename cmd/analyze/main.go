@@ -110,25 +110,8 @@ func reportKalshi(dir string, files []string) {
 			}
 		}
 
-		// Orderbook reconstruction — snapshots reset; deltas adjust.
-		switch f.Type {
-		case "orderbook_snapshot":
-			if ticker == "" {
-				break
-			}
-			if books[ticker] == nil {
-				books[ticker] = replay.NewBook()
-			}
-			if err := books[ticker].ApplySnapshot(f.Msg); err != nil {
-				bookErrors++
-			}
-		case "orderbook_delta":
-			if ticker == "" || books[ticker] == nil {
-				break // deltas before a snapshot are undefined; skip
-			}
-			if err := books[ticker].ApplyDelta(f.Msg); err != nil {
-				bookErrors++
-			}
+		if replay.ApplyFrameToBooks(books, nil, env, f) {
+			bookErrors++
 		}
 		return nil
 	})

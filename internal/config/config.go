@@ -46,6 +46,11 @@ type Kalshi struct {
 	Series    []string  `yaml:"series"`
 	Channels  []string  `yaml:"channels"`
 	Reconnect Reconnect `yaml:"reconnect"`
+	// RediscoverInterval is how often the recorder re-runs DiscoverOpenTickers
+	// to pick up newly-opened markets (e.g. tomorrow's brackets that opened
+	// while we were recording today's). 0 disables (recorder dies after first
+	// settlement, as observed in the Apr 29-30 tape). Default: 4h.
+	RediscoverInterval time.Duration `yaml:"rediscover_interval"`
 
 	// Credentials are filled from env vars; not in YAML.
 	// Provide PrivateKey (inline PEM) OR PrivateKeyPath (file). At least one
@@ -94,6 +99,7 @@ func Defaults() Config {
 				InitialBackoff: 500 * time.Millisecond,
 				MaxBackoff:     30 * time.Second,
 			},
+			RediscoverInterval: 4 * time.Hour,
 		},
 		OpenMeteo: OpenMeteo{
 			BaseURL:      "https://ensemble-api.open-meteo.com/v1/ensemble",

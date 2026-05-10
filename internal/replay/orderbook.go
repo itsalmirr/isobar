@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+
+	"github.com/bytedance/sonic"
 )
 
 // Book is the reconstructable state of one Kalshi market's two-sided
@@ -49,7 +51,7 @@ type deltaMsg struct {
 // authoritative.
 func (b *Book) ApplySnapshot(msg json.RawMessage) error {
 	var s snapshotMsg
-	if err := json.Unmarshal(msg, &s); err != nil {
+	if err := sonic.Unmarshal(msg, &s); err != nil {
 		return fmt.Errorf("parse snapshot: %w", err)
 	}
 	b.Yes = make(map[int]float64, len(s.YesDollarsFP))
@@ -75,7 +77,7 @@ func (b *Book) ApplySnapshot(msg json.RawMessage) error {
 // that drives a level to zero (or below) removes that level.
 func (b *Book) ApplyDelta(msg json.RawMessage) error {
 	var d deltaMsg
-	if err := json.Unmarshal(msg, &d); err != nil {
+	if err := sonic.Unmarshal(msg, &d); err != nil {
 		return fmt.Errorf("parse delta: %w", err)
 	}
 	pc, err := priceDollarsToCents(d.Price)
@@ -102,6 +104,43 @@ func (b *Book) ApplyDelta(msg json.RawMessage) error {
 	}
 	side[pc] = newQty
 	return nil
+}
+
+// ApplyFrameToBooks updates the books map (and optional walls map) by
+// applying one Kalshi frame. Snapshots create or replace the book for a
+// ticker; deltas before any snapshot are silently skipped (book state is
+// undefined). Returns true if the frame was malformed and dropped.
+//
+// This is the shared book-reconstruction kernel used by cmd/analyze and
+// cmd/edge-scan. Pass walls=nil if you don't need per-ticker wall stamps.
+func ApplyFrameToBooks(books map[string]*Book, walls map[string]int64, env Envelope, f KalshiFrame) (malformed bool) {
+	ticker := f.MarketTicker()
+	if ticker == "" {
+		return false
+	}
+	switch f.Type {
+	case "orderbook_snapshot":
+		if books[ticker] == nil {
+			books[ticker] = NewBook()
+		}
+		if err := books[ticker].ApplySnapshot(f.Msg); err != nil {
+			return true
+		}
+		if walls != nil {
+			walls[ticker] = env.Wall
+		}
+	case "orderbook_delta":
+		if books[ticker] == nil {
+			return false
+		}
+		if err := books[ticker].ApplyDelta(f.Msg); err != nil {
+			return true
+		}
+		if walls != nil {
+			walls[ticker] = env.Wall
+		}
+	}
+	return false
 }
 
 // BestYesBid returns the highest yes-side price in cents, or 0 if the

@@ -37,10 +37,8 @@ jobs:
       - name: Test (race)
         run: go test -race -count=1 -timeout=120s ./...
 
-      - name: Build
-        run: |
-          mkdir -p bin
-          go build -trimpath -o bin/tape ./cmd/tape
+      - name: Build all binaries
+        run: make build-all
 
   lint:
     name: golangci-lint
