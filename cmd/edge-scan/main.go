@@ -1,282 +1,306 @@
-// Command edge-scan walks recorded Phase 0 journals, reconstructs
-// orderbooks, pairs each market snapshot to the nearest Open-Meteo
-// ensemble poll, and computes fee-aware naive edge per bracket.
+// Command edge-scan walks a recorded isobar tape, pairs every Kalshi
+// trade event with the most-recent Open-Meteo poll, computes a *naive*
+// p_fair = ensemble_member_fraction for each weather-bracket trade, and
+// emits a per-trade edge CSV plus a summary report.
 //
-// This is the Phase 0.5 floor estimate — uncalibrated ensemble fraction
-// vs market mid. If naive edge is positive anywhere, calibration only
-// helps. If negative everywhere, calibration is load-bearing.
+// This is the Phase 0.5 lower bound: no calibration, no ECMWF blend,
+// no T−3h Bayes. If positive expected-value trades exist at this
+// floor, calibration improves on it. If they don't, calibration is
+// the only path to having any.
 //
-// Input:  data/{kalshi,openmeteo}/{DATE}/*.jsonl[.gz]
-// Output: CSV to stdout (or --out file)
+// Output goes under <data>/calibration/edge-scan/ by default.
 package main
 
 import (
 	"encoding/csv"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
-	"strings"
-	"sync"
+	"strconv"
 	"time"
 
-	"github.com/bytedance/sonic"
-
-	"github.com/wh0o0pz/isobar/internal/calibration/climate"
-	"github.com/wh0o0pz/isobar/internal/calibration/mos"
-	"github.com/wh0o0pz/isobar/internal/market"
-	"github.com/wh0o0pz/isobar/internal/obs"
-	"github.com/wh0o0pz/isobar/internal/openmeteo"
-	"github.com/wh0o0pz/isobar/internal/replay"
+	"github.com/wh0o0pz/isobar/internal/edge"
 )
 
 func main() {
-	dataDir := flag.String("data", "./data", "root data dir")
-	date := flag.String("date", "", "YYYY-MM-DD (scans this date's journals; default: all dates)")
-	outPath := flag.String("out", "", "CSV output path (default: stdout)")
-	maxGap := flag.Duration("max-gap", 60*time.Minute, "max time gap between Kalshi snapshot and Open-Meteo poll for pairing")
-	mosPath := flag.String("mos", "", "path to MOS coefficients JSON (from cmd/calibrate-fit); when set, adds calibrated_* columns")
-	climDir := flag.String("climate", "", "path to obs CSVs for climate-shrunk baseline (e.g. data/calibration/obs); when set, adds climate_* columns")
-	workers := flag.Int("workers", 0, "parallel workers (each processes one UTC date); 0 = runtime.NumCPU()")
+	dataDir := flag.String("data", "./data", "data root containing kalshi/ and openmeteo/")
+	outDir := flag.String("out", "", "output dir (default: <data>/calibration/edge-scan)")
+	startStr := flag.String("start", "", "first date to scan, inclusive YYYY-MM-DD (UTC)")
+	endStr := flag.String("end", "", "last date to scan, inclusive YYYY-MM-DD (UTC)")
+	maxAgeStr := flag.String("max-poll-age", "1h", "max staleness between trade and paired poll")
+	truthDir := flag.String("truth", "", "(optional) dir with KSTATION.csv ground-truth files; "+
+		"enables realized-PnL backtest. Trades with no truth row are skipped.")
+	edgeThresh := flag.Int("edge-threshold-cents", 5,
+		"min naive edge (post-fee, cents) required to enter a hypothetical trade")
 	flag.Parse()
 
-	logger := obs.Init(os.Getenv("ISOBAR_LOG_LEVEL"))
-
-	var coeffs *mos.Coefficients
-	if *mosPath != "" {
-		c, err := loadCoefficients(*mosPath)
-		if err != nil {
-			logger.Error("load mos coefficients", "path", *mosPath, "err", err)
-			os.Exit(1)
-		}
-		coeffs = c
-		logger.Info("mos coefficients loaded", "path", *mosPath, "bins", len(c.Bins))
+	if *startStr == "" || *endStr == "" {
+		fmt.Fprintln(os.Stderr, "edge-scan: -start and -end required")
+		flag.Usage()
+		os.Exit(2)
 	}
-
-	var clim *climate.Lookup
-	if *climDir != "" {
-		clim = climate.New()
-		if err := clim.Load(*climDir, market.AllStationCodes()); err != nil {
-			logger.Error("load climate", "dir", *climDir, "err", err)
-			os.Exit(1)
-		}
-		logger.Info("climate lookup loaded", "dir", *climDir)
-	}
-
-	dates, err := findDates(*dataDir, *date)
+	start, err := time.Parse("2006-01-02", *startStr)
 	if err != nil {
-		logger.Error("find dates", "err", err)
-		os.Exit(1)
+		fmt.Fprintf(os.Stderr, "edge-scan: bad -start %q: %v\n", *startStr, err)
+		os.Exit(2)
 	}
-	if len(dates) == 0 {
-		logger.Error("no data found", "dir", *dataDir, "date", *date)
+	end, err := time.Parse("2006-01-02", *endStr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "edge-scan: bad -end %q: %v\n", *endStr, err)
+		os.Exit(2)
+	}
+	maxAge, err := time.ParseDuration(*maxAgeStr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "edge-scan: bad -max-poll-age %q: %v\n", *maxAgeStr, err)
+		os.Exit(2)
+	}
+
+	if *outDir == "" {
+		*outDir = filepath.Join(*dataDir, "calibration", "edge-scan")
+	}
+	if err := os.MkdirAll(*outDir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "edge-scan: mkdir %s: %v\n", *outDir, err)
 		os.Exit(1)
 	}
 
-	out := os.Stdout
-	if *outPath != "" {
-		f, err := os.Create(*outPath) //nolint:gosec // path is operator-supplied output flag
+	scanOpts := edge.ScanOptions{
+		DataDir:            *dataDir,
+		StartDate:          start,
+		EndDate:            end.AddDate(0, 0, 1), // make end inclusive on the CLI
+		MaxPollAge:         maxAge,
+		EdgeThresholdCents: *edgeThresh,
+	}
+	if *truthDir != "" {
+		truth, err := edge.LoadTruth(*truthDir)
 		if err != nil {
-			logger.Error("create output", "err", err)
+			fmt.Fprintln(os.Stderr, "edge-scan: load truth:", err)
 			os.Exit(1)
 		}
-		defer f.Close()
-		out = f
+		fmt.Fprintf(os.Stderr, "loaded truth: %d (station,date) rows from %s\n", truth.Len(), *truthDir)
+		scanOpts.Truth = truth
 	}
 
-	// Schema-version comment first, then CSV header. Downstream parsers
-	// must validate the schema line and refuse mismatched versions.
-	if _, err := out.Write([]byte(EdgeCSVSchemaComment + "\n")); err != nil {
-		logger.Error("write schema header", "err", err)
+	res, err := edge.Scan(scanOpts)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "edge-scan:", err)
 		os.Exit(1)
 	}
 
-	w := csv.NewWriter(out)
+	csvPath := filepath.Join(*outDir, fmt.Sprintf("edges-%s_%s.csv", *startStr, *endStr))
+	if err := writeCSV(csvPath, res.Rows); err != nil {
+		fmt.Fprintln(os.Stderr, "edge-scan: write csv:", err)
+		os.Exit(1)
+	}
+	mdPath := filepath.Join(*outDir, fmt.Sprintf("summary-%s_%s.md", *startStr, *endStr))
+	if err := writeSummary(mdPath, *startStr, *endStr, res); err != nil {
+		fmt.Fprintln(os.Stderr, "edge-scan: write summary:", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("# edge-scan %s..%s\n", *startStr, *endStr)
+	fmt.Printf("frames seen:        %d\n", res.TotalFrames)
+	fmt.Printf("trade frames:       %d\n", res.TradeFrames)
+	fmt.Printf("weather trades:     %d\n", res.WeatherTrades)
+	fmt.Printf("paired trades:      %d  (%.1f%% of weather)\n",
+		res.PairedTrades, pct(res.PairedTrades, res.WeatherTrades))
+	if res.BacktestEnabled {
+		fmt.Printf("\n# realized-PnL backtest (entry threshold = %d¢ post-fee)\n", *edgeThresh)
+		fmt.Printf("trades entered:     %d  (%.1f%% of paired)\n",
+			res.TradesEntered, pct(res.TradesEntered, res.PairedTrades))
+		fmt.Printf("trades won:         %d  (%.1f%% win rate)\n",
+			res.TradesWon, pct(res.TradesWon, res.TradesEntered))
+		fmt.Printf("total realized PnL: %+d¢  ($%+.2f)\n",
+			res.TotalPnLCents, float64(res.TotalPnLCents)/100)
+	}
+	fmt.Printf("\noutputs:\n  %s\n  %s\n", csvPath, mdPath)
+}
+
+func writeCSV(path string, rows []edge.EdgeRow) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	w := csv.NewWriter(f)
 	defer w.Flush()
-	_ = w.Write(edgeCSVHeader())
 
-	// Parallelize per UTC date — each date is fully independent: it loads
-	// its own polls + books, computes edges, and never touches another
-	// date's state. We bound concurrency, then write rows back in date
-	// order so CSV output stays deterministic across worker counts.
-	nWorkers := *workers
-	if nWorkers <= 0 {
-		nWorkers = runtime.NumCPU()
+	if err := w.Write([]string{
+		"ts_ms", "ticker", "series", "valid_date", "bracket_kind", "bracket_key",
+		"side", "trade_price_cents", "p_fair_naive", "n_members", "n_members_in_bkt",
+		"poll_age_s", "fee_cents", "edge_cents",
+		"has_truth", "actual_temp_f", "yes_resolved", "our_side", "our_pnl_cents",
+	}); err != nil {
+		return err
 	}
-	if nWorkers > len(dates) {
-		nWorkers = len(dates)
-	}
-
-	results := make([]dateResult, len(dates))
-	sem := make(chan struct{}, nWorkers)
-	var wg sync.WaitGroup
-	for i, d := range dates {
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(idx int, date string) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			results[idx] = processDate(*dataDir, date, *maxGap, coeffs, clim)
-		}(i, d)
-	}
-	wg.Wait()
-
-	var totalRows, calibratedRows, climateRows int
-	for _, r := range results {
-		if r.skipReason != "" {
-			logger.Warn(r.skipReason, "date", r.date, "err", r.err)
-			continue
+	for _, r := range rows {
+		actual := ""
+		if r.HasTruth {
+			actual = strconv.Itoa(r.ActualTempF)
 		}
-		for _, row := range r.rows {
-			_ = writeEdgeRow(w, r.date, row)
+		if err := w.Write([]string{
+			strconv.FormatInt(r.TsMs, 10),
+			r.Ticker,
+			r.Series,
+			r.ValidDate.Format("2006-01-02"),
+			r.BracketKind,
+			strconv.FormatFloat(r.BracketKey, 'f', -1, 64),
+			r.Side,
+			strconv.Itoa(r.TradePriceCents),
+			strconv.FormatFloat(r.PFairNaive, 'f', 4, 64),
+			strconv.Itoa(r.NMembers),
+			strconv.Itoa(r.NMembersInBkt),
+			strconv.Itoa(r.PollAgeS),
+			strconv.Itoa(r.FeeCents),
+			strconv.Itoa(r.EdgeCents),
+			boolStr(r.HasTruth),
+			actual,
+			boolStr(r.YesResolved),
+			r.OurSide,
+			strconv.Itoa(r.OurPnLCents),
+		}); err != nil {
+			return err
 		}
-		totalRows += r.totalRows
-		calibratedRows += r.calibratedRows
-		climateRows += r.climateRows
 	}
-
-	logger.Info("edge-scan complete", "rows", totalRows, "calibrated_rows", calibratedRows, "climate_rows", climateRows, "dates", len(dates), "workers", nWorkers)
+	return w.Error()
 }
 
-// dateResult holds one worker's per-date output. rows are written by the
-// main goroutine in input-date order; skipReason is the log message kind
-// when the date couldn't be processed (empty when processing succeeded).
-type dateResult struct {
-	date           string
-	rows           []EdgeRow
-	totalRows      int
-	calibratedRows int
-	climateRows    int
-	skipReason     string
-	err            error
+func writeSummary(path, startStr, endStr string, res *edge.Result) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	fmt.Fprintf(f, "# edge-scan summary — %s..%s\n\n", startStr, endStr)
+	fmt.Fprintf(f, "## Counts\n\n")
+	fmt.Fprintf(f, "- frames seen:        %d\n", res.TotalFrames)
+	fmt.Fprintf(f, "- trade frames:       %d\n", res.TradeFrames)
+	fmt.Fprintf(f, "- weather trades:     %d\n", res.WeatherTrades)
+	fmt.Fprintf(f, "- paired trades:      %d  (%.1f%% of weather)\n",
+		res.PairedTrades, pct(res.PairedTrades, res.WeatherTrades))
+
+	// Realized PnL section — only present when truth was loaded.
+	if res.BacktestEnabled {
+		fmt.Fprintf(f, "\n## Realized PnL backtest\n\n")
+		fmt.Fprintf(f, "- trades entered:    %d\n", res.TradesEntered)
+		fmt.Fprintf(f, "- trades won:        %d\n", res.TradesWon)
+		if res.TradesEntered > 0 {
+			fmt.Fprintf(f, "- win rate:          %.1f%%\n", pct(res.TradesWon, res.TradesEntered))
+			fmt.Fprintf(f, "- total realized:    %+d¢  ($%+.2f)\n",
+				res.TotalPnLCents, float64(res.TotalPnLCents)/100)
+			fmt.Fprintf(f, "- avg PnL per trade: %+.2f¢\n",
+				float64(res.TotalPnLCents)/float64(res.TradesEntered))
+		} else {
+			fmt.Fprintln(f, "- _no trades cleared the entry threshold — naive p_fair offers no edge band_")
+		}
+
+		// Daily PnL breakdown.
+		dayPnL := map[string]int{}
+		dayTrades := map[string]int{}
+		dayWins := map[string]int{}
+		for _, r := range res.Rows {
+			if r.OurSide == "" {
+				continue
+			}
+			d := r.ValidDate.Format("2006-01-02")
+			dayPnL[d] += r.OurPnLCents
+			dayTrades[d]++
+			if r.OurPnLCents > 0 {
+				dayWins[d]++
+			}
+		}
+		if len(dayPnL) > 0 {
+			fmt.Fprintf(f, "\n### Daily PnL (by bracket valid_date)\n\n")
+			fmt.Fprintln(f, "| valid_date | trades | wins | win_rate | pnl_cents | pnl_$ |")
+			fmt.Fprintln(f, "|---|---:|---:|---:|---:|---:|")
+			days := make([]string, 0, len(dayPnL))
+			for d := range dayPnL {
+				days = append(days, d)
+			}
+			sort.Strings(days)
+			for _, d := range days {
+				fmt.Fprintf(f, "| %s | %d | %d | %.1f%% | %+d | $%+.2f |\n",
+					d, dayTrades[d], dayWins[d], pct(dayWins[d], dayTrades[d]),
+					dayPnL[d], float64(dayPnL[d])/100)
+			}
+		}
+	}
+	fmt.Fprintf(f, "\n## Skipped reasons\n\n")
+	if len(res.SkippedReason) == 0 {
+		fmt.Fprintln(f, "_(none — every weather trade was paired)_")
+	} else {
+		for _, r := range sortedKeys(res.SkippedReason) {
+			fmt.Fprintf(f, "- %-30s  %d\n", r, res.SkippedReason[r])
+		}
+	}
+
+	// Edge histogram in 1¢ buckets.
+	hist := map[int]int{}
+	for _, r := range res.Rows {
+		hist[r.EdgeCents]++
+	}
+	keys := make([]int, 0, len(hist))
+	for k := range hist {
+		keys = append(keys, k)
+	}
+	sort.Ints(keys)
+	fmt.Fprintf(f, "\n## Edge distribution (cents)\n\n| edge_cents | trades |\n|---:|---:|\n")
+	for _, k := range keys {
+		fmt.Fprintf(f, "| %4d | %6d |\n", k, hist[k])
+	}
+
+	// Trades with edge ≥ 5¢ post-fee, by bracket.
+	type bktTotal struct {
+		key   string
+		count int
+	}
+	bkt := map[string]int{}
+	for _, r := range res.Rows {
+		if r.EdgeCents >= 5 {
+			bkt[r.Ticker]++
+		}
+	}
+	var bktList []bktTotal
+	for k, v := range bkt {
+		bktList = append(bktList, bktTotal{k, v})
+	}
+	sort.Slice(bktList, func(i, j int) bool { return bktList[i].count > bktList[j].count })
+	fmt.Fprintf(f, "\n## Top brackets with edge ≥ 5¢ post-fee\n\n")
+	if len(bktList) == 0 {
+		fmt.Fprintln(f, "_(no trade has positive edge ≥ 5¢ — naive p_fair offers no edge band over fees)_")
+	} else {
+		fmt.Fprintln(f, "| ticker | trades |\n|---|---:|")
+		for i, bt := range bktList {
+			if i >= 30 {
+				break
+			}
+			fmt.Fprintf(f, "| %s | %d |\n", bt.key, bt.count)
+		}
+	}
+	return nil
 }
 
-// processDate is the per-date compute kernel run by each worker. It loads
-// the date's ensemble polls and reconstructed orderbooks, then computes
-// one EdgeRow per (ticker, book-snapshot, paired-poll). All inputs are
-// read-only from the worker's perspective: coeffs/clim are loaded once
-// and shared by reference; date directories don't overlap.
-func processDate(dataDir, date string, maxGap time.Duration, coeffs *mos.Coefficients, clim *climate.Lookup) dateResult {
-	out := dateResult{date: date}
-	polls, err := loadEnsemblePolls(dataDir, date)
-	if err != nil {
-		out.skipReason = "load ensemble polls"
-		out.err = err
-		return out
+func pct(num, den int) float64 {
+	if den == 0 {
+		return 0
 	}
-	if len(polls) == 0 {
-		out.skipReason = "no ensemble polls"
-		return out
+	return 100 * float64(num) / float64(den)
+}
+
+func sortedKeys(m map[string]int) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
 	}
-	books, walls, err := loadBooks(dataDir, date)
-	if err != nil {
-		out.skipReason = "load books"
-		out.err = err
-		return out
-	}
-	for ticker, book := range books {
-		row, ok := computeEdge(ticker, book, walls[ticker], polls, maxGap, coeffs, clim)
-		if !ok {
-			continue
-		}
-		out.rows = append(out.rows, row)
-		out.totalRows++
-		if !isNaN(row.CalibratedP) {
-			out.calibratedRows++
-		}
-		if !isNaN(row.ClimateShrunkP) {
-			out.climateRows++
-		}
-	}
+	sort.Strings(out)
 	return out
 }
 
-func loadCoefficients(path string) (*mos.Coefficients, error) {
-	f, err := os.Open(path) //nolint:gosec // path is operator-supplied flag
-	if err != nil {
-		return nil, err
+func boolStr(b bool) string {
+	if b {
+		return "true"
 	}
-	defer f.Close()
-	var c mos.Coefficients
-	if err := json.NewDecoder(f).Decode(&c); err != nil {
-		return nil, err
-	}
-	// Schema-version check: refuse to load coefficients from a different
-	// version of the algorithm. Old files with no version field (pre-v1)
-	// also fail closed; refit with current binary.
-	if c.SchemaVersion != mos.CoefficientsSchemaVersion {
-		return nil, fmt.Errorf("mos coefficients schema mismatch: got %q, want %q (refit with current cmd/calibrate-fit)", c.SchemaVersion, mos.CoefficientsSchemaVersion)
-	}
-	return &c, nil
-}
-
-func isNaN(v float64) bool { return v != v }
-
-// findDates returns date directory names (YYYY-MM-DD) under dataDir/kalshi/.
-func findDates(dataDir, dateFilter string) ([]string, error) {
-	if dateFilter != "" {
-		return []string{dateFilter}, nil
-	}
-	kalshiRoot := filepath.Join(dataDir, "kalshi")
-	entries, err := os.ReadDir(kalshiRoot)
-	if err != nil {
-		return nil, err
-	}
-	var out []string
-	for _, e := range entries {
-		if e.IsDir() && len(e.Name()) == 10 {
-			out = append(out, e.Name())
-		}
-	}
-	sort.Strings(out)
-	return out, nil
-}
-
-// loadBooks walks a date's Kalshi journals and returns the end-of-window
-// book per ticker plus the wall timestamp of the last book-affecting frame.
-func loadBooks(dataDir, date string) (map[string]*replay.Book, map[string]int64, error) {
-	files, err := replay.ListJournals(filepath.Join(dataDir, "kalshi", date))
-	if err != nil {
-		return nil, nil, err
-	}
-	books := map[string]*replay.Book{}
-	walls := map[string]int64{}
-	_ = replay.ForEachFrame(files, func(env replay.Envelope, _ int, _ bool) error {
-		var f replay.KalshiFrame
-		if err := sonic.Unmarshal(env.Payload, &f); err != nil {
-			return nil //nolint:nilerr // skip malformed frame, don't abort the scan
-		}
-		replay.ApplyFrameToBooks(books, walls, env, f)
-		return nil
-	})
-	return books, walls, nil
-}
-
-// loadEnsemblePolls reads all Open-Meteo journal frames for a date and
-// returns parsed polls indexed by location.
-func loadEnsemblePolls(dataDir, date string) ([]*pollEntry, error) {
-	dir := filepath.Join(dataDir, "openmeteo", date)
-	files, err := replay.ListJournals(dir)
-	if err != nil {
-		return nil, err
-	}
-	var polls []*pollEntry
-	_ = replay.ForEachFrame(files, func(env replay.Envelope, _ int, _ bool) error {
-		loc := strings.TrimPrefix(env.Kind, "rest:")
-		if loc == "" || loc == env.Kind {
-			return nil
-		}
-		poll, err := openmeteo.ParseEnsemblePoll(env.Payload)
-		if err != nil {
-			return nil //nolint:nilerr // skip malformed poll, don't abort the scan
-		}
-		poll.Wall = env.Wall
-		poll.Location = loc
-		polls = append(polls, &pollEntry{poll: poll, loc: loc, wall: env.Wall})
-		return nil
-	})
-	return polls, nil
+	return "false"
 }
