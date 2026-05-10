@@ -44,6 +44,11 @@ kalshi:
     initial_backoff: 500ms
     max_backoff:     30s
     max_attempts:    0           # 0 = retry forever
+  # How often to re-run DiscoverOpenTickers and resubscribe. Without this,
+  # the recorder stops getting frames after the initially-subscribed
+  # brackets settle (typically end of local day) — see the Apr 29-30
+  # production tape post-mortem. 4h is the default; 0 disables.
+  rediscover_interval: 4h
 
 openmeteo:
   enabled: true

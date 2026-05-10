@@ -1,90 +1,147 @@
 # isobar
 
-Automated Kalshi trading bot — **calibrated weather brackets + hurricane
-landfall**. Phase 0: dual-source recorder (`cmd/tape`) for empirical
-edge measurement before strategy commitment.
+Probabilistic-forecaster vs prediction-market research project: calibrated
+weather-bracket pricing on Kalshi, with rigorous OOS verification and a
+documented failure-to-gate. The codebase ships an end-to-end pipeline
+(recorder → calibration → edge-scan) and a series of decision-gate
+reports built around it.
 
 The name `isobar` refers to lines of constant atmospheric pressure on
-weather maps — the bot's edge comes from pricing weather better than the
-market does.
+weather maps — the project's edge would come from pricing weather better
+than the market does. The current evidence (see Phase 0.5 v2 below) says
+we don't.
 
-## Status — Phase 0: data collection
+## Status — Phase 0.5 first verdict: gate NOT met by current MOS calibration
 
-The bot records synchronized market data from two sources (Kalshi WS +
-Open-Meteo REST) for ≥48h. Phase 0.5 produces a written
-**decision-gate report**: do tradeable edges survive on **calibrated**
-probabilities after Kalshi's parabolic fee schedule?
+The latest decision-gate report
+([`reports/phase0.5/2026-05-05-floor-estimate-v2.md`](./reports/phase0.5/2026-05-05-floor-estimate-v2.md))
+is the current source of truth on whether the project produces tradeable
+edge.
 
-**Research verdict (April 2026):** the naive `p_fair = members/31`
-thesis would lose money without NGR/EMOS calibration, a fee-aware edge
-floor, and a Lyapunov 8-day horizon gate. The current strategy is being
-rebuilt around these findings. See `docs/research/SYNTHESIS.md`.
+Headline (n=299 verifiable bracket outcomes, bootstrap 95% CIs in the
+tradeable [35,65)¢ midrange):
 
-**BTC-hourly was killed.** Coinbase integrated Kalshi Jan 2026,
-compressing lead-lag below our latency floor. `internal/coinbase` is
-removed.
+- **MOS calibration helps over naive ensemble fractions** (+5.96 pp Brier,
+  CI excludes zero) — calibration is real
+- **MOS does NOT earn its complexity over a 5-line climate-shrunk-naive
+  baseline** (statistically tied) — `0.2·climate + 0.8·naive` does the
+  same job for free
+- **Both calibrators LOSE to Kalshi market mid in the tradeable zone**
+  (-9 to -10 pp Brier, CI excludes zero) — market mid is genuinely better
+  informed than our model, most likely because it incorporates intraday
+  observed-temperature trajectory the daily forecast does not
 
-Decision gate (must pass before Phase 1 build):
-`>10 events/day with >5% calibrated edge after fees` on at least one
-signal, AND calibrated Brier-skill beats market-implied on OOS 90-day
-held-out data.
+The Phase 0.5 gate criterion ("calibrated Brier-skill > market-implied")
+is **not met**. The first iteration of the calibration thesis fails. The
+report enumerates next steps (T−3h Bayesian update, ECMWF IFS blend,
+ensemble NGR via NOAA GEFS backfill — see ADR-0009) before any further
+gate evaluation.
 
-## Architecture
+The project is currently positioned as a **forecasting-research artifact
+with a documented failed-trading-gate**, not as a deployed bot. No
+capital has been committed.
+
+## What's shipped
+
+Six binaries plus three calibration / verification packages:
 
 ```
-cmd/tape          Recorder. One goroutine per source, errgroup-managed,
-                  signal-cancellable. Each source writes to its own journal.
-cmd/analyze       Phase-0.5 sanity report over recorded journals (MVP —
-                  frame counts, gaps, monotonicity; edge math TBD).
-cmd/peek          One-off Kalshi REST probe for series/market discovery.
+cmd/tape                    Recorder (Kalshi WS + Open-Meteo REST → JSONL).
+                            Live on Vultr HF Chicago with rolling
+                            ticker re-discovery (4h cycle).
+cmd/peek                    Kalshi REST probe for series/market discovery.
+cmd/analyze                 Phase-0.5 sanity report over recorded journals.
+cmd/calibrate-parse-cli     NWS CLI bulletin zip → daily TMAX/TMIN CSV.
+cmd/calibrate-fit           OLS-fit MOS coefficients per (station,
+                            season, variable) bin; outputs JSON.
+cmd/edge-scan               Joins recorded book state to ensemble polls,
+                            applies all probability models (naive, MOS,
+                            climate-shrunk, market-mid), emits per-bracket
+                            edge with full provenance columns.
 
-internal/
-  clock           Paired (monotonic, wall) timestamps. Wall is the cross-source
-                  sync axis; monotonic is for in-process latency diagnostics.
-  config          YAML defaults + env overlay (ISOBAR_*) + validation.
-  env             Minimal .env loader (no external deps).
-  journal         Crash-safe rotating JSONL writer. Batched fsync for
-                  throughput; periodic flush bounds data loss to N ms.
-  obs             log/slog setup. JSON output to stderr, level via env.
-  kalshi          RSA-signed auth, REST client, authenticated WS subscriber
-                  (orderbook_delta + trade).
-  openmeteo       NOAA GFS + ECMWF IFS ensemble REST poller (free tier).
-  replay          Reads back JSONL journals (plain + gz) for offline
-                  analysis; shared input layer for cmd/analyze.
-  retry           Context-aware exponential backoff with jitter (shared).
+internal/calibration/cliparse   NWS CLI bulletin parser (90.1% coverage).
+internal/calibration/mos        OLS bias correction + ProbBelow/Above.
+internal/calibration/climate    Historical-frequency lookup with seasonal window
+                                + p_shrunk = w·climate + (1-w)·naive.
+internal/market                 Ticker parsing, fee model, station/location/TZ.
+internal/openmeteo              31-member GFS ensemble decoder (live + historical).
+internal/replay                 JSONL journal reader + orderbook reconstruction.
+internal/journal                Crash-safe rotating JSONL writer.
+internal/kalshi                 RSA-signed REST + authenticated WS subscriber
+                                with rolling re-discovery.
 ```
 
-**Hot-path principle.** The recorder does not decode WS frames. Bytes from the
-socket are wrapped in a thin envelope (timestamps + source tag) and written to
-disk. All decoding happens in the analyzer. This minimizes the producer hot
-path and future-proofs against schema changes.
+13 Go packages, 0 lint issues, all binaries build via `make build-all`.
 
-**Reused from `arbhunter`.** The Kalshi REST client (`auth.go`,
-`client.go`, `types.go`, `client_test.go`) is copied verbatim —
-battle-tested code, ~840 LOC, zero churn. The BTC lead-lag strategy
-from arbhunter is *not* reused: Coinbase integrated Kalshi in Jan
-2026 and that alpha is gone at REST-from-cloud latency.
+**Hot-path principle.** The recorder does not decode WS frames. Bytes
+from the socket are wrapped in a thin envelope (timestamps + source tag)
+and written to disk. All decoding happens offline in `cmd/analyze` and
+`cmd/edge-scan`.
+
+## Reports (current → archived)
+
+The Phase 0.5 evaluation has gone through three reports as methodology
+matured. The current one supersedes both predecessors:
+
+- **Current**: [`2026-05-05-floor-estimate-v2.md`](./reports/phase0.5/2026-05-05-floor-estimate-v2.md)
+  — Phase 0.5 v2 with stratified Brier, climate baseline, bootstrap CIs.
+  **Gate: not met.**
+- *Superseded*: [`2026-05-02-pipeline-validation.md`](./reports/phase0.5/2026-05-02-pipeline-validation.md)
+  — interim status doc after the original was retracted
+- *Retracted*: [`2026-05-02-floor-estimate_RETRACTED.md`](./reports/phase0.5/2026-05-02-floor-estimate_RETRACTED.md)
+  — original first-pass report with overstated headline; preserved with
+  retraction header for audit trail
+
+See [`reports/INDEX.md`](./reports/INDEX.md) for the chain.
+
+## Architectural decisions
+
+8 Architecture Decision Records (ADRs) under [`docs/decisions/`](./docs/decisions/),
+in dependency order:
+
+| ADR | Decision |
+|---|---|
+| 0001 | Pivot strategy after 8-agent research wave (kill naive thesis) |
+| 0002 | Kill `btc-hourly`, delete `internal/coinbase` |
+| 0003 | Dashboard = stdlib Go + htmx + SSE (deferred) |
+| 0004 | Two-signal scope: weather-calibrated + hurricane-landfall |
+| 0005 | Extract `internal/retry`; promote `DiscoverOpenTickers` |
+| 0006 | `cmd/peek` as ongoing Kalshi catalog probe |
+| 0007 | NWS CLI bulletins as calibration y-target |
+| 0008 | Deterministic GFS for first-pass MOS (canary now fired — see ADR-0009) |
+| 0009 | Trigger ensemble-spread NGR / ECMWF blend after MOS canary |
 
 ## Quickstart
 
 ```bash
 # 1. Go 1.26+ and (optionally) golangci-lint
-# 2. Get a Kalshi API key + RSA private key (PEM), drop in ./secrets/
-mkdir -p secrets
+# 2. Get a Kalshi API key + RSA private key (PEM)
+mkdir -p secrets && chmod 700 secrets
 cp /path/to/kalshi.pem ./secrets/kalshi.pem
+chmod 600 ./secrets/kalshi.pem
 
 # 3. Configure
 cp config/config.example.yaml config/config.yaml
 cp .env.example .env
-# edit .env with your KALSHI_API_KEY_ID
+# edit .env with KALSHI_API_KEY_ID
 
-# 4. Build & run
-make build
+# 4. Build everything
+make build-all
+
+# 5. Run the recorder (live capture)
 set -a && source .env && set +a
 ./bin/tape -config config/config.yaml
+
+# 6. Calibration pipeline (offline, on accumulated tape)
+./bin/calibrate-parse-cli --zip data/calibration/cli/KNYC.zip \
+                         --start 2024-04-29 --end 2026-05-04
+./bin/calibrate-fit --out data/calibration/mos-coefficients.json --holdout-days 90
+./bin/edge-scan --data ./data --out data/edge-scan-v2.csv \
+                --mos data/calibration/mos-coefficients.json \
+                --climate data/calibration/obs
 ```
 
-Recorded data lands under `./data/<source>/<YYYY-MM-DD>/<source>-<hour>.jsonl`.
+Recorded data lands under `./data/<source>/<YYYY-MM-DD>/<source>-<hour>.jsonl[.gz]`.
 
 ## Project conventions
 
@@ -94,32 +151,18 @@ Recorded data lands under `./data/<source>/<YYYY-MM-DD>/<source>-<hour>.jsonl`.
 - Secrets live in `./secrets/` (gitignored) or env vars with `ISOBAR_` prefix
 - Recorded data lives in `./data/` (gitignored)
 
-## Roadmap (12-week rebuild, post-research pivot)
+## Documentation map
 
-- **W1** *(now)*: prune Coinbase, save research, update strategy docs.
-- **W2–5** `weather-calibrated` signal: NGR/EMOS, ECMWF blend, conformal
-  intervals, EVT tail pricing, Lyapunov 8-day gate, T−3h Bayesian update.
-- **W6–8** `hurricane-landfall` signal: NHC ATCF parser, HAFS/HWRF,
-  NDBC-SST-nudged intensity, regime-switch HMM. Timed for June 1.
-- **W9** microstructure + risk: Avellaneda-Stoikov with bounded-payoff
-  σ² = P(1-P)/√t, OFI gate, no-trade zone, CUSUM, Kelly with
-  ρ = −1/(K−1) correction.
-- **W10** Phase 0.5 gate report (hard gate).
-- **W11** operator dashboard (stdlib Go + htmx + SSE + Lightweight Charts).
-- **W12** paper + live exec (`$50 → $200` canary first).
-
-Full detail — exit criteria per phase, risk controls, test strategy — is
-in [`docs/`](./docs/README.md):
-
-- [Roadmap](./docs/ROADMAP.md) — phase-by-phase with explicit gates
-- [Strategy](./docs/STRATEGY.md) — edge thesis and execution doctrine
+- [Strategy](./docs/STRATEGY.md) — edge thesis and execution doctrine (note: needs v3 update post-Phase 0.5 v2)
 - [Architecture](./docs/ARCHITECTURE.md) — package layout and invariants
-- [Testing](./docs/TESTING.md) — rules, coverage floors, CI expectations
+- [Roadmap](./docs/ROADMAP.md) — phase-by-phase with explicit gates
 - [Operations](./docs/OPERATIONS.md) — runbook and troubleshooting
 - [Risk](./docs/RISK.md) — the L0–L4 control hierarchy
+- [Testing](./docs/TESTING.md) — rules, coverage floors, CI expectations
 - [Glossary](./docs/GLOSSARY.md) — terms, defined once
-- [Research](./docs/research/) — 8 agent reports + [SYNTHESIS.md](./docs/research/SYNTHESIS.md) decision doc
-- [Decisions](./docs/decisions/) — Architecture Decision Records (ADRs)
+- [Research](./docs/research/) — 8 agent reports + [SYNTHESIS.md](./docs/research/SYNTHESIS.md)
+- [Decisions](./docs/decisions/) — 9 ADRs documenting major design choices
+- [Reports](./reports/) — Phase 0.5 evaluation reports (see INDEX)
 
-Running log of every change: [CHANGELOG.md](./CHANGELOG.md).
+Running log: [CHANGELOG.md](./CHANGELOG.md).
 PR + commit conventions: [CONTRIBUTING.md](./CONTRIBUTING.md).

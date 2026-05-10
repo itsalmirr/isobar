@@ -144,6 +144,48 @@ func TestPriceDollarsToCents(t *testing.T) {
 	}
 }
 
+func TestApplyFrameToBooks(t *testing.T) {
+	books := map[string]*Book{}
+	walls := map[string]int64{}
+
+	snapshotPayload := json.RawMessage(`{"market_ticker":"KXHIGHNY-26APR22-T64","yes_dollars_fp":[["0.4500","100"]],"no_dollars_fp":[["0.5200","75"]]}`)
+	deltaPayload := json.RawMessage(`{"market_ticker":"KXHIGHNY-26APR22-T64","price_dollars":"0.4500","delta_fp":"10","side":"yes"}`)
+
+	// Snapshot creates book and updates wall.
+	env1 := Envelope{Wall: 100}
+	f1 := KalshiFrame{Type: "orderbook_snapshot", Msg: snapshotPayload}
+	require.False(t, ApplyFrameToBooks(books, walls, env1, f1))
+	require.Len(t, books, 1)
+	require.Equal(t, int64(100), walls["KXHIGHNY-26APR22-T64"])
+	require.Equal(t, 100.0, books["KXHIGHNY-26APR22-T64"].Yes[45])
+
+	// Delta after snapshot updates book and wall.
+	env2 := Envelope{Wall: 200}
+	f2 := KalshiFrame{Type: "orderbook_delta", Msg: deltaPayload}
+	require.False(t, ApplyFrameToBooks(books, walls, env2, f2))
+	require.Equal(t, int64(200), walls["KXHIGHNY-26APR22-T64"])
+	require.Equal(t, 110.0, books["KXHIGHNY-26APR22-T64"].Yes[45])
+
+	// Delta before snapshot for unknown ticker is silently skipped.
+	otherDelta := json.RawMessage(`{"market_ticker":"OTHER","price_dollars":"0.5","delta_fp":"5","side":"yes"}`)
+	f3 := KalshiFrame{Type: "orderbook_delta", Msg: otherDelta}
+	require.False(t, ApplyFrameToBooks(books, walls, Envelope{Wall: 300}, f3))
+	require.Len(t, books, 1)
+
+	// Frame with no ticker is no-op.
+	f4 := KalshiFrame{Type: "subscribed", Msg: json.RawMessage(`{}`)}
+	require.False(t, ApplyFrameToBooks(books, walls, Envelope{Wall: 400}, f4))
+
+	// Malformed snapshot returns true.
+	f5 := KalshiFrame{Type: "orderbook_snapshot", Msg: json.RawMessage(`{"market_ticker":"BAD","yes_dollars_fp":"not-an-array"}`)}
+	require.True(t, ApplyFrameToBooks(books, walls, Envelope{Wall: 500}, f5))
+
+	// nil walls map is allowed (analyze case).
+	books2 := map[string]*Book{}
+	require.False(t, ApplyFrameToBooks(books2, nil, env1, f1))
+	require.Len(t, books2, 1)
+}
+
 func TestBookRoundTripSnapshotThenDeltas(t *testing.T) {
 	// Realistic sequence: snapshot establishes book, then a series
 	// of deltas move the top of book. Verifies mid + best bid/ask

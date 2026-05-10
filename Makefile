@@ -37,6 +37,10 @@ run-peek:
 run-analyze:
 	$(GO) run ./cmd/analyze
 
+.PHONY: run-edge-scan
+run-edge-scan:
+	$(GO) run ./cmd/edge-scan
+
 .PHONY: test
 test:
 	$(GO) test -race -count=1 -timeout=60s $(PKGS)
