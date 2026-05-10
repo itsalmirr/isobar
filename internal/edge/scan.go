@@ -131,8 +131,11 @@ func Scan(opts ScanOptions) (*Result, error) {
 		}
 		spec, err := ParseTicker(msg.MarketTicker)
 		if err != nil {
-			res.SkippedReason["non_weather_ticker"]++
-			return nil
+			if errors.Is(err, ErrNotWeatherTicker) {
+				res.SkippedReason["non_weather_ticker"]++
+				return nil
+			}
+			return fmt.Errorf("parse ticker %q: %w", msg.MarketTicker, err)
 		}
 		res.WeatherTrades++
 

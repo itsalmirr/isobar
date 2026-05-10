@@ -69,30 +69,65 @@ OBS_DIR="$CALIB_DIR/obs"
 mkdir -p "$CLI_DIR" "$OBS_DIR"
 
 # --- 1. Fetch CLI bulletins -----------------------------------------------
+# We tolerate exit 1 from the fetch script: short windows can fail its
+# bulletin-count threshold even when the zips are perfectly fine, and on a
+# windowed re-run we only need new zips for the dates we don't already have.
 if [ "$SKIP_FETCH" -eq 0 ]; then
-  echo "===> 1/3 fetching NWS CLI bulletins ($START..$BUFFER_END) ..."
+  echo "===> 1/4 fetching NWS CLI bulletins ($START..$BUFFER_END) ..."
   ./scripts/calibration-fetch-cli.sh \
-    --data "$CALIB_DIR" \
+    --data  "$CALIB_DIR" \
     --start "$START" \
-    --end   "$BUFFER_END"
+    --end   "$BUFFER_END" || echo "  (fetch script returned non-zero; continuing if zips exist)"
 else
-  echo "===> 1/3 skipping CLI fetch (--skip-fetch); using existing $CLI_DIR"
+  echo "===> 1/4 skipping CLI fetch (--skip-fetch); using existing $CLI_DIR"
 fi
 
-# --- 2. Parse bulletins into KSTATION.csv ---------------------------------
+# --- 2. Verify zips exist before parsing ---------------------------------
 echo
-echo "===> 2/3 parsing CLI bulletins to canonical TMAX/TMIN CSVs ..."
+echo "===> 2/4 verifying CLI zips ..."
+missing=()
+for st in NYC MIA LAX MDW; do
+  z="$CLI_DIR/K${st}.zip"
+  if [ ! -f "$z" ]; then
+    missing+=("$z")
+  else
+    bulletins=$(unzip -l "$z" 2>/dev/null | awk '/\.txt$/' | wc -l | tr -d ' ')
+    echo "  K${st}.zip: ${bulletins} bulletins"
+  fi
+done
+if [ ${#missing[@]} -gt 0 ]; then
+  echo "ERROR: missing CLI zips:" >&2
+  for m in "${missing[@]}"; do echo "  - $m" >&2; done
+  exit 1
+fi
+
+# --- 3. Parse each station's zip into KSTATION.csv -----------------------
+echo
+echo "===> 3/4 parsing CLI bulletins to canonical TMAX/TMIN CSVs ..."
 if [ ! -x ./bin/calibrate-parse-cli ]; then
   echo "  building cmd/calibrate-parse-cli ..."
   go build -o ./bin/calibrate-parse-cli ./cmd/calibrate-parse-cli
 fi
-./bin/calibrate-parse-cli \
-  --in  "$CLI_DIR" \
-  --out "$OBS_DIR"
+parse_failed=0
+for st in NYC MIA LAX MDW; do
+  if ! ./bin/calibrate-parse-cli \
+      -zip   "$CLI_DIR/K${st}.zip" \
+      -start "$START" \
+      -end   "$END" \
+      -out   "$OBS_DIR/K${st}.csv"; then
+    parse_failed=$((parse_failed + 1))
+  fi
+done
+if [ "$parse_failed" -gt 0 ]; then
+  echo "ERROR: $parse_failed station(s) failed to parse" >&2
+  exit 1
+fi
+echo "  truth files written:"
+ls -la "$OBS_DIR"/K{NYC,MIA,LAX,MDW}.csv 2>&1
 
 # --- 3. Run edge-scan with truth -----------------------------------------
 echo
-echo "===> 3/3 running edge-scan with realized-PnL backtest ..."
+echo "===> 4/4 running edge-scan with realized-PnL backtest ..."
 if [ ! -x ./bin/edge-scan ]; then
   echo "  building cmd/edge-scan ..."
   go build -o ./bin/edge-scan ./cmd/edge-scan
