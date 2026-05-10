@@ -74,8 +74,24 @@ func loadPolls(omRoot string, start, end time.Time) (*pollIndex, error) {
 	}
 	for _, ss := range idx.byStation {
 		// Polls were written in time order per source, but across rotated
-		// files we still resort to be safe.
-		sort.SliceStable(ss.times, func(i, j int) bool { return ss.times[i].Before(ss.times[j]) })
+		// files we resort to be safe. Sort (time, poll) pairs together so
+		// the two slices stay aligned.
+		n := len(ss.times)
+		idxs := make([]int, n)
+		for i := range idxs {
+			idxs[i] = i
+		}
+		sort.SliceStable(idxs, func(a, b int) bool {
+			return ss.times[idxs[a]].Before(ss.times[idxs[b]])
+		})
+		sortedTimes := make([]time.Time, n)
+		sortedPolls := make([]*Poll, n)
+		for k, src := range idxs {
+			sortedTimes[k] = ss.times[src]
+			sortedPolls[k] = ss.polls[src]
+		}
+		ss.times = sortedTimes
+		ss.polls = sortedPolls
 	}
 	return idx, nil
 }
