@@ -20,9 +20,6 @@ func (r Resolution) Contains(tempF float64) bool {
 	return tempF >= r.Lo && tempF < r.Hi
 }
 
-// Width returns Hi - Lo. Open-ended ranges return +Inf.
-func (r Resolution) Width() float64 { return r.Hi - r.Lo }
-
 // Resolve maps a Spec to its YES-condition temperature range.
 //
 // Bracket convention (FIXME — verify against a Kalshi market detail
@@ -59,10 +56,14 @@ func (s Spec) Resolve() Resolution {
 }
 
 // ResolveWithSiblings returns the Resolution for spec using the sibling
-// bracket Specs (same series + same valid_date) to disambiguate
-// T-bracket direction. If no siblings or all siblings are also T, falls
-// back to the high-side default and the caller should treat the result
-// with FIXME-level scepticism.
+// bracket Specs to disambiguate T-bracket direction. The caller may pass
+// any list of Specs; this function defensively filters to siblings in
+// the same series and on the same valid_date so that a caller mistakenly
+// passing tickers from a different market can't mis-resolve the bracket.
+//
+// If no qualifying siblings remain (or all are also T), falls back to
+// the high-side default and the caller should treat the result with
+// FIXME-level scepticism.
 //
 // Disambiguation rule: a T-bracket is "low-side" iff its key is ≤ the
 // lowest sibling B-bracket midpoint. Otherwise it is "high-side"
@@ -71,10 +72,14 @@ func ResolveWithSiblings(spec Spec, siblings []Spec) Resolution {
 	if spec.Kind != BracketThreshold {
 		return spec.Resolve()
 	}
-	// Find min and max B-bracket keys among siblings (excluding spec itself).
-	minB, maxB := math.Inf(+1), math.Inf(-1)
+	// Find min B-bracket key among siblings in the same series and
+	// valid_date, excluding spec itself by ticker identity.
+	minB := math.Inf(+1)
 	for _, sib := range siblings {
 		if sib.Kind != BracketBetween {
+			continue
+		}
+		if sib.Series != spec.Series || !sib.ValidDate.Equal(spec.ValidDate) {
 			continue
 		}
 		if sib.Ticker == spec.Ticker {
@@ -82,9 +87,6 @@ func ResolveWithSiblings(spec Spec, siblings []Spec) Resolution {
 		}
 		if sib.Key < minB {
 			minB = sib.Key
-		}
-		if sib.Key > maxB {
-			maxB = sib.Key
 		}
 	}
 	if math.IsInf(minB, +1) {

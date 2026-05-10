@@ -2,6 +2,7 @@ package edge
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -69,7 +70,7 @@ func loadPolls(omRoot string, start, end time.Time) (*pollIndex, error) {
 		ss.polls = append(ss.polls, poll)
 		return nil
 	})
-	if err != nil && err != io.EOF {
+	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, err
 	}
 	for _, ss := range idx.byStation {
@@ -148,7 +149,7 @@ func dailyFiles(root string, start, end time.Time) ([]string, error) {
 
 // tradeMsg is the Kalshi WS trade-message inner shape. Fields match
 // Kalshi's v2 WS docs. Some recorded frames may use string price_dollars
-// (legacy) — priceDollars() handles both.
+// (legacy) — yesPriceCents() handles both representations.
 type tradeMsg struct {
 	MarketTicker string          `json:"market_ticker"`
 	YesPrice     int             `json:"yes_price"`
@@ -206,40 +207,3 @@ func (m tradeMsg) yesPriceCents() (int, bool) {
 	return 0, false
 }
 
-// priceDollars returns the executed trade price as a fraction in [0,1],
-// or -1 if it can't be derived. Kept for backwards compatibility with
-// any callers; new code should use yesPriceCents() and derive the
-// no-side price as (100 - yesPriceCents) when needed.
-func (m tradeMsg) priceDollars() float64 {
-	if m.YesPrice > 0 || m.NoPrice > 0 {
-		var c int
-		switch m.Side {
-		case "yes":
-			c = m.YesPrice
-			if c == 0 {
-				c = 100 - m.NoPrice
-			}
-		case "no":
-			c = m.NoPrice
-			if c == 0 {
-				c = 100 - m.YesPrice
-			}
-		default:
-			return -1
-		}
-		if c <= 0 || c >= 100 {
-			return -1
-		}
-		return float64(c) / 100
-	}
-	if len(m.PriceDollars) > 0 {
-		var s string
-		if err := json.Unmarshal(m.PriceDollars, &s); err == nil {
-			var v float64
-			if _, err := fmt.Sscanf(s, "%f", &v); err == nil && v > 0 && v < 1 {
-				return v
-			}
-		}
-	}
-	return -1
-}

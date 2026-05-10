@@ -1,7 +1,6 @@
 package edge
 
 import (
-	"compress/gzip"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -222,6 +221,69 @@ func TestScan_BacktestRealizedPnL(t *testing.T) {
 	if row.OurSide != "no" || row.OurPnLCents != 23 {
 		t.Errorf("row hypothetical action wrong: side=%q pnl=%d", row.OurSide, row.OurPnLCents)
 	}
+	// Per-row math fields — these would silently regress if fee or
+	// p_fair plumbing changed in scan.go. With p_fair=0, yes_price=25:
+	//   fee = ceil(0.07·0.25·0.75·100) = ceil(1.3125) = 2¢
+	//   EdgeCents = |0 - 25| - 2 = 23¢ (YES-perspective)
+	if row.NMembers != 3 || row.NMembersInBkt != 0 {
+		t.Errorf("members: total=%d in_bracket=%d, want 3 and 0",
+			row.NMembers, row.NMembersInBkt)
+	}
+	if row.PFairNaive != 0 {
+		t.Errorf("PFairNaive = %v, want 0", row.PFairNaive)
+	}
+	if row.FeeCents != 2 {
+		t.Errorf("FeeCents = %d, want 2", row.FeeCents)
+	}
+	if row.EdgeCents != 23 {
+		t.Errorf("EdgeCents = %d, want 23 (|0-25|-2 in YES-perspective)", row.EdgeCents)
+	}
+}
+
+// TestScan_BadTradeSideSkipped: a trade frame with an unrecognised side
+// value (anything other than "yes"/"no") should be counted as
+// bad_trade_side and not silently routed into yes-side math.
+func TestScan_BadTradeSideSkipped(t *testing.T) {
+	dir := t.TempDir()
+	pollTime := time.Date(2026, 4, 29, 7, 30, 0, 0, time.UTC)
+	tradeTime := pollTime.Add(20 * time.Minute)
+
+	if err := writeJournal(t, filepath.Join(dir, "openmeteo", "2026-04-29"), "om.jsonl",
+		[]envelope{{
+			Wall: pollTime.UnixNano(), Source: "openmeteo", Kind: "rest:NY", Payload: synthPoll(t),
+		}}); err != nil {
+		t.Fatal(err)
+	}
+	tradeMsg, _ := json.Marshal(map[string]interface{}{
+		"market_ticker": "KXHIGHNY-26APR29-B62.5",
+		"yes_price":     25,
+		"no_price":      75,
+		"side":          "sell",
+		"ts_ms":         tradeTime.UnixMilli(),
+	})
+	frame, _ := json.Marshal(map[string]interface{}{
+		"type": "trade", "msg": json.RawMessage(tradeMsg),
+	})
+	if err := writeJournal(t, filepath.Join(dir, "kalshi", "2026-04-29"), "k.jsonl",
+		[]envelope{{Wall: tradeTime.UnixNano(), Source: "kalshi", Kind: "ws", Payload: frame}}); err != nil {
+		t.Fatal(err)
+	}
+	res, err := Scan(ScanOptions{
+		DataDir:    dir,
+		StartDate:  time.Date(2026, 4, 29, 0, 0, 0, 0, time.UTC),
+		EndDate:    time.Date(2026, 4, 30, 0, 0, 0, 0, time.UTC),
+		MaxPollAge: time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if res.SkippedReason["bad_trade_side"] != 1 {
+		t.Errorf("bad_trade_side = %d, want 1, full=%v",
+			res.SkippedReason["bad_trade_side"], res.SkippedReason)
+	}
+	if len(res.Rows) != 0 {
+		t.Errorf("expected zero rows for bad-side trade, got %d", len(res.Rows))
+	}
 }
 
 // TestScan_BacktestNoTruthSkipped: trade for a date outside the truth
@@ -389,7 +451,3 @@ func writeJournal(t *testing.T, dir, name string, envs []envelope) error {
 	}
 	return nil
 }
-
-// Compile-time assert gzip is reachable so the test file imports it
-// when we extend tests to cover .gz reads in a follow-up.
-var _ = gzip.BestSpeed
