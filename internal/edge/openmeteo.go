@@ -112,19 +112,61 @@ func ParsePoll(raw []byte) (*Poll, error) {
 
 // matchTemperatureMember returns the member ID for an Open-Meteo hourly
 // field name, or false if the field isn't a temperature_2m series we care
-// about. "temperature_2m" → "00" (control), "temperature_2m_memberNN" → "NN".
+// about.
 //
-// Other variables (precipitation, etc.) return false.
+// Single-model responses (e.g. ?models=gfs_seamless alone):
+//
+//	"temperature_2m"               → "00"   (control)
+//	"temperature_2m_memberNN"      → "NN"   (perturbations 01..N)
+//
+// Multi-model responses (e.g. ?models=gfs_seamless,ecmwf_ifs025) suffix
+// every series with the model tag, and we prefix the model into the
+// member ID so members from different models don't collide:
+//
+//	"temperature_2m_ncep_gefs_seamless"          → "ncep_gefs_seamless:00"
+//	"temperature_2m_memberNN_ncep_gefs_seamless" → "ncep_gefs_seamless:NN"
+//	"temperature_2m_ecmwf_ifs025_ensemble"        → "ecmwf_ifs025_ensemble:00"
+//	"temperature_2m_memberNN_ecmwf_ifs025_ensemble" → "ecmwf_ifs025_ensemble:NN"
+//
+// Aggregators ("temperature_2m_max", "_min", and their member/model
+// variants) and other variables (precipitation, etc.) return false.
 func matchTemperatureMember(field string) (string, bool) {
-	if field == "temperature_2m" {
+	const base = "temperature_2m"
+	if !strings.HasPrefix(field, base) {
+		return "", false
+	}
+	rest := field[len(base):]
+
+	// Reject aggregators before pattern-matching members.
+	if strings.HasPrefix(rest, "_max") || strings.HasPrefix(rest, "_min") {
+		return "", false
+	}
+
+	// Single-model control.
+	if rest == "" {
 		return "00", true
 	}
-	const prefix = "temperature_2m_member"
-	if strings.HasPrefix(field, prefix) {
-		suffix := field[len(prefix):]
-		if len(suffix) == 2 && isAllDigits(suffix) {
-			return suffix, true
+
+	// Member: "_memberNN" optionally followed by "_<model>".
+	if strings.HasPrefix(rest, "_member") {
+		mr := rest[len("_member"):]
+		if len(mr) < 2 || !isAllDigits(mr[:2]) {
+			return "", false
 		}
+		num := mr[:2]
+		tail := mr[2:]
+		if tail == "" {
+			return num, true
+		}
+		if !strings.HasPrefix(tail, "_") {
+			return "", false
+		}
+		return tail[1:] + ":" + num, true
+	}
+
+	// Multi-model control: "_<model>".
+	if strings.HasPrefix(rest, "_") {
+		return rest[1:] + ":00", true
 	}
 	return "", false
 }

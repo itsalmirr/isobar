@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/wh0o0pz/isobar/internal/calibration/mos"
 	"github.com/wh0o0pz/isobar/internal/edge"
 )
 
@@ -34,6 +35,9 @@ func main() {
 		"enables realized-PnL backtest. Trades with no truth row are skipped.")
 	edgeThresh := flag.Int("edge-threshold-cents", 5,
 		"min naive edge (post-fee, cents) required to enter a hypothetical trade")
+	mosPath := flag.String("mos", "",
+		"(optional) path to MOS coefficients JSON; when set p_fair uses the "+
+			"calibrated estimator instead of naive ensemble-fraction")
 	flag.Parse()
 
 	if *startStr == "" || *endStr == "" {
@@ -81,6 +85,16 @@ func main() {
 		fmt.Fprintf(os.Stderr, "loaded truth: %d (station,date) rows from %s\n", truth.Len(), *truthDir)
 		scanOpts.Truth = truth
 	}
+	if *mosPath != "" {
+		coeffs, err := mos.LoadCoefficients(*mosPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "edge-scan: load mos:", err)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "loaded MOS coefficients: %d bins from %s (fitted %s)\n",
+			len(coeffs.Bins), *mosPath, coeffs.FittedAt.Format(time.RFC3339))
+		scanOpts.MOS = &coeffs
+	}
 
 	res, err := edge.Scan(scanOpts)
 	if err != nil {
@@ -105,6 +119,10 @@ func main() {
 	fmt.Printf("weather trades:     %d\n", res.WeatherTrades)
 	fmt.Printf("paired trades:      %d  (%.1f%% of weather)\n",
 		res.PairedTrades, pct(res.PairedTrades, res.WeatherTrades))
+	if res.MOSEnabled {
+		fmt.Printf("MOS-calibrated:     %d  (%.1f%% of paired; rest fell back to naive)\n",
+			res.MOSApplied, pct(res.MOSApplied, res.PairedTrades))
+	}
 	if res.BacktestEnabled {
 		fmt.Printf("\n# realized-PnL backtest (entry threshold = %d¢ post-fee)\n", *edgeThresh)
 		fmt.Printf("trades entered:     %d  (%.1f%% of paired)\n",
@@ -128,7 +146,9 @@ func writeCSV(path string, rows []edge.EdgeRow) error {
 
 	if err := w.Write([]string{
 		"ts_ms", "ticker", "series", "valid_date", "bracket_kind", "bracket_key",
-		"side", "trade_price_cents", "p_fair_naive", "n_members", "n_members_in_bkt",
+		"side", "trade_price_cents",
+		"p_fair_naive", "p_fair_mos", "p_fair", "mos_applied",
+		"n_members", "n_members_in_bkt",
 		"poll_age_s", "fee_cents", "edge_cents",
 		"has_truth", "actual_temp_f", "yes_resolved", "our_side", "our_pnl_cents",
 	}); err != nil {
@@ -149,6 +169,9 @@ func writeCSV(path string, rows []edge.EdgeRow) error {
 			r.Side,
 			strconv.Itoa(r.TradePriceCents),
 			strconv.FormatFloat(r.PFairNaive, 'f', 4, 64),
+			strconv.FormatFloat(r.PFairMOS, 'f', 4, 64),
+			strconv.FormatFloat(r.PFair, 'f', 4, 64),
+			boolStr(r.MOSApplied),
 			strconv.Itoa(r.NMembers),
 			strconv.Itoa(r.NMembersInBkt),
 			strconv.Itoa(r.PollAgeS),
@@ -180,6 +203,10 @@ func writeSummary(path, startStr, endStr string, res *edge.Result) error {
 	fmt.Fprintf(f, "- weather trades:     %d\n", res.WeatherTrades)
 	fmt.Fprintf(f, "- paired trades:      %d  (%.1f%% of weather)\n",
 		res.PairedTrades, pct(res.PairedTrades, res.WeatherTrades))
+	if res.MOSEnabled {
+		fmt.Fprintf(f, "- MOS-calibrated:     %d  (%.1f%% of paired; rest fell back to naive)\n",
+			res.MOSApplied, pct(res.MOSApplied, res.PairedTrades))
+	}
 
 	// Realized PnL section — only present when truth was loaded.
 	if res.BacktestEnabled {

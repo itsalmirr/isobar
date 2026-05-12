@@ -131,6 +131,16 @@ func TestMatchTemperatureMember(t *testing.T) {
 		"precipitation":           {"", false},
 		"temperature_2m_member1":  {"", false},
 		"temperature_2m_memberAB": {"", false},
+
+		// Multi-model: ?models=A,B suffixes every series with the model tag.
+		"temperature_2m_ncep_gefs_seamless":            {"ncep_gefs_seamless:00", true},
+		"temperature_2m_member01_ncep_gefs_seamless":   {"ncep_gefs_seamless:01", true},
+		"temperature_2m_member30_ncep_gefs_seamless":   {"ncep_gefs_seamless:30", true},
+		"temperature_2m_ecmwf_ifs025_ensemble":         {"ecmwf_ifs025_ensemble:00", true},
+		"temperature_2m_member50_ecmwf_ifs025_ensemble": {"ecmwf_ifs025_ensemble:50", true},
+		// Aggregators stay rejected even with model suffix.
+		"temperature_2m_max_member01_ecmwf_ifs025_ensemble": {"", false},
+		"temperature_2m_max_ecmwf_ifs025_ensemble":          {"", false},
 	}
 	for in, want := range cases {
 		gotID, gotOK := matchTemperatureMember(in)

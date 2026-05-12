@@ -12,9 +12,11 @@
 package mos
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"sort"
 	"time"
 )
@@ -222,6 +224,29 @@ func season(t time.Time) string {
 // binKey is the canonical map-key form: "STATION|SEASON|VARIABLE".
 func binKey(station, season, variable string) string {
 	return station + "|" + season + "|" + variable
+}
+
+// LoadCoefficients reads a Coefficients JSON file produced by calibrate-fit
+// and refuses any file whose schema_version doesn't match
+// CoefficientsSchemaVersion. The schema check is the read-side enforcement
+// of the "bump on math change" rule documented on the constant.
+func LoadCoefficients(path string) (Coefficients, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return Coefficients{}, fmt.Errorf("mos: read %s: %w", path, err)
+	}
+	var c Coefficients
+	if err := json.Unmarshal(b, &c); err != nil {
+		return Coefficients{}, fmt.Errorf("mos: decode %s: %w", path, err)
+	}
+	if c.SchemaVersion != CoefficientsSchemaVersion {
+		return Coefficients{}, fmt.Errorf("mos: %s has schema_version=%q, want %q",
+			path, c.SchemaVersion, CoefficientsSchemaVersion)
+	}
+	if len(c.Bins) == 0 {
+		return Coefficients{}, fmt.Errorf("mos: %s has no fitted bins", path)
+	}
+	return c, nil
 }
 
 // SortedBinKeys returns the bin keys in deterministic order. Useful for
