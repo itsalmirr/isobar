@@ -130,27 +130,40 @@ func dailyFiles(root string, start, end time.Time) ([]string, error) {
 	return out, nil
 }
 
-// tradeMsg is the Kalshi WS trade-message inner shape. Fields match
-// Kalshi's v2 WS docs. Some recorded frames may use string price_dollars
-// (legacy) — priceDollars() handles both.
+// tradeMsg is the Kalshi WS trade-message inner shape. Recorded frames use
+// string yes_price_dollars/no_price_dollars and taker_side; older v2 docs
+// describe int yes_price/no_price with side. priceDollars()/side() handle
+// both.
 type tradeMsg struct {
-	MarketTicker string          `json:"market_ticker"`
-	YesPrice     int             `json:"yes_price"`
-	NoPrice      int             `json:"no_price"`
-	PriceDollars json.RawMessage `json:"price_dollars,omitempty"`
-	Side         string          `json:"side"`
-	Count        int             `json:"count"`
-	TsMs         int64           `json:"ts_ms"`
+	MarketTicker    string          `json:"market_ticker"`
+	YesPrice        int             `json:"yes_price"`
+	NoPrice         int             `json:"no_price"`
+	YesPriceDollars string          `json:"yes_price_dollars,omitempty"`
+	NoPriceDollars  string          `json:"no_price_dollars,omitempty"`
+	PriceDollars    json.RawMessage `json:"price_dollars,omitempty"`
+	Side            string          `json:"side"`
+	TakerSide       string          `json:"taker_side,omitempty"`
+	Count           int             `json:"count"`
+	TsMs            int64           `json:"ts_ms"`
 }
 
-// priceDollars returns the executed trade price as a fraction in [0,1],
-// or -1 if it can't be derived. Prefers the integer cents (yes_price /
-// no_price) which is Kalshi's canonical v2 representation; falls back to
-// the legacy "0.1600"-style string in price_dollars.
+// side returns the trade's taker side, preferring `taker_side` (recorded
+// Kalshi WS shape) and falling back to `side` (older docs/tests).
+func (m tradeMsg) side() string {
+	if m.TakerSide != "" {
+		return m.TakerSide
+	}
+	return m.Side
+}
+
+// priceDollars returns the executed YES-price as a fraction in (0,1), or
+// -1 if it can't be derived. Tries, in order: int yes_price/no_price (v2
+// docs shape), string yes_price_dollars/no_price_dollars (recorded WS),
+// legacy bare price_dollars string.
 func (m tradeMsg) priceDollars() float64 {
 	if m.YesPrice > 0 || m.NoPrice > 0 {
 		var c int
-		switch m.Side {
+		switch m.side() {
 		case "yes":
 			c = m.YesPrice
 			if c == 0 {
@@ -168,6 +181,18 @@ func (m tradeMsg) priceDollars() float64 {
 			return -1
 		}
 		return float64(c) / 100
+	}
+	if m.YesPriceDollars != "" {
+		var v float64
+		if _, err := fmt.Sscanf(m.YesPriceDollars, "%f", &v); err == nil && v > 0 && v < 1 {
+			return v
+		}
+	}
+	if m.NoPriceDollars != "" {
+		var v float64
+		if _, err := fmt.Sscanf(m.NoPriceDollars, "%f", &v); err == nil && v > 0 && v < 1 {
+			return 1 - v
+		}
 	}
 	if len(m.PriceDollars) > 0 {
 		var s string

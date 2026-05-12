@@ -199,7 +199,7 @@ func Scan(opts ScanOptions) (*Result, error) {
 			ValidDate:       spec.ValidDate,
 			BracketKind:     spec.Kind.String(),
 			BracketKey:      spec.Key,
-			Side:            msg.Side,
+			Side:            msg.side(),
 			TradePriceCents: int(priceDollars*100 + 0.5),
 			PFairNaive:      pFair,
 			NMembers:        nMembers,
