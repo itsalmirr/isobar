@@ -9,6 +9,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/wh0o0pz/isobar/internal/calibration/mos"
 	"github.com/wh0o0pz/isobar/internal/replay"
 )
 
@@ -35,6 +36,14 @@ type ScanOptions struct {
 	// required for our hypothetical strategy to take a trade. Default
 	// is 5 — matches Phase 0.5 fee-aware floor in STRATEGY.md.
 	EdgeThresholdCents int
+
+	// MOS, if non-nil, switches p_fair from the naive ensemble-member-count
+	// estimator to a calibrated MOS estimator: ensemble mean feeds the
+	// fitted (a + b·f, σ) per (station, season, variable) bin, and p_fair
+	// is integrated under that normal across the bracket Resolution.
+	// Trades that hit a missing bin fall back to naive p_fair so the
+	// backtest never silently disappears them.
+	MOS *mos.Coefficients
 }
 
 // EdgeRow is one trade-event record in the output CSV.
@@ -48,6 +57,9 @@ type EdgeRow struct {
 	Side            string
 	TradePriceCents int
 	PFairNaive      float64
+	PFairMOS        float64 // 0 if no MOS coeffs or bin missing
+	PFair           float64 // the p_fair actually used for edge math (MOS if available, else naive)
+	MOSApplied      bool
 	NMembers        int
 	NMembersInBkt   int
 	PollAgeS        int
@@ -76,6 +88,12 @@ type Result struct {
 	TradesEntered   int // rows where OurSide != ""
 	TradesWon       int // rows where OurPnLCents > 0
 	TotalPnLCents   int // sum of OurPnLCents
+
+	// MOSEnabled is true iff opts.MOS was non-nil. MOSApplied is the
+	// count of paired trades that successfully hit a fitted bin (i.e.
+	// p_fair came from MOS, not naive fallback).
+	MOSEnabled bool
+	MOSApplied int
 }
 
 // Scan walks the data tree, pairs each Kalshi trade event with the
@@ -106,6 +124,7 @@ func Scan(opts ScanOptions) (*Result, error) {
 	res := &Result{
 		SkippedReason:   map[string]int{},
 		BacktestEnabled: opts.Truth != nil,
+		MOSEnabled:      opts.MOS != nil,
 	}
 
 	kalshiFiles, err := dailyFiles(filepath.Join(opts.DataDir, "kalshi"), opts.StartDate, opts.EndDate)
@@ -171,20 +190,52 @@ func Scan(opts ScanOptions) (*Result, error) {
 		// flag those in SkippedReason so the summary highlights the issue).
 		resolution := spec.Resolve()
 
-		// p_fair = fraction of members whose daily extreme falls in the
-		// bracket. KXHIGH* uses TMAX, KXLOWT* uses TMIN.
+		// Naive p_fair = fraction of members whose daily extreme falls in
+		// the bracket. KXHIGH* uses TMAX, KXLOWT* uses TMIN. We also sum
+		// the per-member extreme to compute the ensemble mean that feeds
+		// the MOS calibrator below.
 		nIn := 0
+		var sumT float64
 		for _, md := range extremes {
 			t := md.TMaxF
 			if !spec.IsHigh() {
 				t = md.TMinF
 			}
+			sumT += t
 			if resolution.Contains(t) {
 				nIn++
 			}
 		}
 		nMembers := len(extremes)
-		pFair := float64(nIn) / float64(nMembers)
+		pFairNaive := float64(nIn) / float64(nMembers)
+
+		// MOS-calibrated p_fair, if coefficients were provided. We feed
+		// the ensemble mean into the fitted (μ=a+b·f, σ) and integrate
+		// the normal across the bracket [Lo, Hi). Bins that weren't fit
+		// (e.g. too few training pairs) fall back to naive — never silent.
+		pFair := pFairNaive
+		var pFairMOS float64
+		mosApplied := false
+		if opts.MOS != nil {
+			variable := "tmax"
+			if !spec.IsHigh() {
+				variable = "tmin"
+			}
+			mean := sumT / float64(nMembers)
+			mu, sigma, ok := opts.MOS.Predict(station, spec.ValidDate, variable, mean)
+			if ok {
+				pFairMOS = mos.ProbBelow(resolution.Hi, mu, sigma) -
+					mos.ProbBelow(resolution.Lo, mu, sigma)
+				if pFairMOS < 0 {
+					pFairMOS = 0
+				}
+				if pFairMOS > 1 {
+					pFairMOS = 1
+				}
+				pFair = pFairMOS
+				mosApplied = true
+			}
+		}
 
 		priceDollars := msg.priceDollars()
 		if priceDollars < 0 {
@@ -201,7 +252,10 @@ func Scan(opts ScanOptions) (*Result, error) {
 			BracketKey:      spec.Key,
 			Side:            msg.side(),
 			TradePriceCents: int(priceDollars*100 + 0.5),
-			PFairNaive:      pFair,
+			PFairNaive:      pFairNaive,
+			PFairMOS:        pFairMOS,
+			PFair:           pFair,
+			MOSApplied:      mosApplied,
 			NMembers:        nMembers,
 			NMembersInBkt:   nIn,
 			PollAgeS:        int(age.Seconds()),
@@ -264,6 +318,9 @@ func Scan(opts ScanOptions) (*Result, error) {
 
 		res.Rows = append(res.Rows, row)
 		res.PairedTrades++
+		if row.MOSApplied {
+			res.MOSApplied++
+		}
 		return nil
 	})
 	if err != nil && !errors.Is(err, io.EOF) {
