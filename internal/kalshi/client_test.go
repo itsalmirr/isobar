@@ -254,13 +254,14 @@ func TestDiscoverOpenTickersHandlesEmptyPageWithCursor(t *testing.T) {
 }
 
 func TestThrottleDoesNotSerializeCallers(t *testing.T) {
-	// If throttle held the mutex across its sleep, 4 concurrent callers
+	// If throttle held the mutex across its wait, 4 concurrent callers
 	// would each wait 1s back-to-back. The fix reserves slots under the
-	// lock and sleeps outside, so total wall time is ~3s for 4 callers
+	// lock and waits outside, so total wall time is ~3s for 4 callers
 	// (first goes immediately, then 1s * 3 for the queue). We keep the
 	// assertion loose so it's not flaky: wall time must be substantially
 	// less than the buggy serialization worst case of ~4s.
 	c := &Client{minDelay: 1000 * time.Millisecond, now: time.Now}
+	ctx := context.Background()
 
 	var wg sync.WaitGroup
 	start := time.Now()
@@ -268,7 +269,7 @@ func TestThrottleDoesNotSerializeCallers(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			c.throttle()
+			_ = c.throttle(ctx)
 		}()
 	}
 	wg.Wait()
@@ -277,7 +278,7 @@ func TestThrottleDoesNotSerializeCallers(t *testing.T) {
 	// Bug-case would be ~4s (each caller sleeps 1s in series). Fixed
 	// case is ~3s (one slot per second, reserved under the lock). Leave
 	// margin to keep the test reliable under CI load.
-	require.Less(t, elapsed, 3500*time.Millisecond, "throttle is serializing callers; lock is held during sleep")
+	require.Less(t, elapsed, 3500*time.Millisecond, "throttle is serializing callers; lock is held during wait")
 }
 
 func TestGetRaw(t *testing.T) {
@@ -451,10 +452,15 @@ func TestGetBalanceAndRaw(t *testing.T) {
 
 func TestResetRateLimit(t *testing.T) {
 	// ResetRateLimit is a no-network setter; exercise it only for coverage.
-	c := &Client{minDelay: 2 * time.Second, now: time.Now}
+	c := &Client{
+		minDelay:     2 * time.Second,
+		baseMinDelay: 1 * time.Second,
+		now:          time.Now,
+	}
 	c.ResetRateLimit()
+	require.Equal(t, 1*time.Second, c.minDelay)
 	// Zeroing minDelay does not cause subsequent throttle calls to panic.
-	c.throttle()
+	require.NoError(t, c.throttle(context.Background()))
 }
 
 // TestDeleteSucceeds ensures the DELETE helper's happy path is covered.
@@ -682,6 +688,33 @@ func TestDoRaw_DoesNotRetry403(t *testing.T) {
 	require.Error(t, err)
 	require.ErrorIs(t, err, ErrAuth)
 	require.Equal(t, int32(1), calls.Load(), "403 must not be retried")
+}
+
+// TestThrottle_HonorsCtxCancellation verifies the throttle wait can be
+// cancelled mid-flight by ctx. Before the fix this was a non-cancellable
+// time.Sleep that could pin a caller for up to 2s after the parent
+// context already wanted them gone.
+func TestThrottle_HonorsCtxCancellation(t *testing.T) {
+	c := &Client{
+		minDelay: 2 * time.Second,
+		now:      time.Now,
+		// Pretend a recent call already happened so throttle has to wait.
+		lastCall: time.Now(),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- c.throttle(ctx)
+	}()
+	// Sleep a hair so throttle has entered its wait, then cancel.
+	time.Sleep(10 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("throttle did not return within 50ms of cancel")
+	}
 }
 
 // TestDoRaw_MinDelayDecaysAfterSuccessCluster verifies the
