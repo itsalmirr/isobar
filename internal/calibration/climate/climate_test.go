@@ -195,6 +195,161 @@ func TestCircDist(t *testing.T) {
 	}
 }
 
+// TestDayOfYear_Feb29InLeapYear pins Feb 29 (leap years only) to DOY 60
+// and asserts it does NOT collide with the same year's March 1 (DOY 61).
+// Pre-fix both returned 60, silently aliasing leap-year Feb 29 obs into
+// the Mar 1 bucket; this test would fail under that behavior.
+func TestDayOfYear_Feb29InLeapYear(t *testing.T) {
+	feb29 := time.Date(2024, 2, 29, 0, 0, 0, 0, time.UTC)
+	mar1Leap := time.Date(2024, 3, 1, 0, 0, 0, 0, time.UTC)
+
+	if got := dayOfYear(feb29); got != 60 {
+		t.Errorf("dayOfYear(2024-02-29) = %d, want 60", got)
+	}
+	if got := dayOfYear(mar1Leap); got != 61 {
+		t.Errorf("dayOfYear(2024-03-01) = %d, want 61", got)
+	}
+	if dayOfYear(feb29) == dayOfYear(mar1Leap) {
+		t.Errorf("Feb 29 and Mar 1 (leap year) must be distinguishable, both got %d", dayOfYear(feb29))
+	}
+}
+
+// TestDayOfYear_Mar1InLeapYear pins Mar 1 in a leap year to DOY 61.
+// Goes with TestDayOfYear_Mar1InNonLeapYear to demonstrate the year-aware
+// (ISO-style) shift around the leap day.
+func TestDayOfYear_Mar1InLeapYear(t *testing.T) {
+	mar1Leap := time.Date(2024, 3, 1, 0, 0, 0, 0, time.UTC)
+	if got := dayOfYear(mar1Leap); got != 61 {
+		t.Errorf("dayOfYear(2024-03-01) = %d, want 61", got)
+	}
+}
+
+// TestDayOfYear_Mar1InNonLeapYear pins Mar 1 in a non-leap year to DOY 60.
+// This is the ISO day-of-year for any year without a Feb 29; the storage
+// path uses a leap-year-canonical mapping (Mar 1 → 61) but queries against
+// non-leap years return 60, and the ±SeasonWindowDays window covers the
+// 1-slot offset.
+func TestDayOfYear_Mar1InNonLeapYear(t *testing.T) {
+	mar1NonLeap := time.Date(2025, 3, 1, 0, 0, 0, 0, time.UTC)
+	if got := dayOfYear(mar1NonLeap); got != 60 {
+		t.Errorf("dayOfYear(2025-03-01) = %d, want 60", got)
+	}
+	// Spot-check the century edge cases: 2000 is leap (div by 400),
+	// 1900 is not (div by 100, not by 400).
+	if got := dayOfYear(time.Date(2000, 3, 1, 0, 0, 0, 0, time.UTC)); got != 61 {
+		t.Errorf("dayOfYear(2000-03-01) = %d, want 61 (year 2000 is leap)", got)
+	}
+	if got := dayOfYear(time.Date(1900, 3, 1, 0, 0, 0, 0, time.UTC)); got != 60 {
+		t.Errorf("dayOfYear(1900-03-01) = %d, want 60 (year 1900 is NOT leap)", got)
+	}
+}
+
+// TestClimate_Feb29ObsNotAliasedToMar1 proves the silent-collision bug
+// is fixed end-to-end: a Feb 29 observation and a Mar 1 observation are
+// stored in distinct day-of-year slots, not merged into one.
+//
+// The ±SeasonWindowDays window means the BracketProb output for Feb 29
+// and Mar 1 targets is similar (each window absorbs both obs), so the
+// test inspects the post-compile per-day storage table directly — that
+// is the surface where the aliasing previously occurred. Pre-fix, both
+// obs landed in slot 60; post-fix, Feb 29 is in slot 60 and Mar 1 is
+// in slot 61.
+func TestClimate_Feb29ObsNotAliasedToMar1(t *testing.T) {
+	dir := t.TempDir()
+	rows := [][]string{
+		{"2024-02-29", "99", "70"}, // distinguishable tmax for Feb 29
+		{"2024-03-01", "50", "30"}, // distinguishable tmax for Mar 1
+	}
+	writeObsCSV(t, filepath.Join(dir, "KNYC.csv"), rows)
+	l := New()
+	if err := l.Load(dir, []string{"KNYC"}); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	// Sanity-check the raw obs table — both obs should be retained,
+	// keyed by their month-day strings.
+	tmaxObs := l.obs["KNYC"]["tmax"]
+	if len(tmaxObs) != 2 {
+		t.Fatalf("tmax obs count = %d, want 2; obs=%+v", len(tmaxObs), tmaxObs)
+	}
+	mdSet := map[string]float64{}
+	for _, p := range tmaxObs {
+		mdSet[p.monthDay] = p.value
+	}
+	if mdSet["02-29"] != 99 {
+		t.Errorf("Feb 29 obs missing or wrong value: got %v, want 99", mdSet["02-29"])
+	}
+	if mdSet["03-01"] != 50 {
+		t.Errorf("Mar 1 obs missing or wrong value: got %v, want 50", mdSet["03-01"])
+	}
+
+	// The keying used by compile must place these two obs in different
+	// DOY buckets. This is the bug-discriminating assertion: pre-fix,
+	// dayOfYearMD returned 60 for both; post-fix, Feb 29 → 60 and
+	// Mar 1 → 61.
+	feb29DOY := dayOfYearMD("02-29")
+	mar1DOY := dayOfYearMD("03-01")
+	if feb29DOY == mar1DOY {
+		t.Fatalf("Feb 29 and Mar 1 share DOY %d — aliasing not fixed", feb29DOY)
+	}
+	if feb29DOY != 60 {
+		t.Errorf("dayOfYearMD(02-29) = %d, want 60", feb29DOY)
+	}
+	if mar1DOY != 61 {
+		t.Errorf("dayOfYearMD(03-01) = %d, want 61", mar1DOY)
+	}
+
+	// End-to-end via the BracketProb surface: a leap-year Feb 29 query
+	// (DOY 60) and a leap-year Mar 1 query (DOY 61) both see both obs
+	// via the ±30-day window, so each window is [50, 99]. The point of
+	// the test is that both queries succeed (no NaN, both obs counted),
+	// confirming the per-day table populates correctly for both slots.
+	feb29Target, _ := time.Parse("2006-01-02", "2024-02-29")
+	pFeb29 := l.BracketProb("KNYC", "tmax", feb29Target, 70, true)
+	if math.IsNaN(pFeb29) {
+		t.Errorf("Feb 29 BracketProb = NaN, slot 60 unpopulated")
+	}
+	if pFeb29 != 0.5 {
+		t.Errorf("Feb 29 BracketProb(above 70) = %v, want 0.5 (1 of 2 obs ≥ 70)", pFeb29)
+	}
+
+	mar1Target, _ := time.Parse("2006-01-02", "2024-03-01")
+	pMar1 := l.BracketProb("KNYC", "tmax", mar1Target, 70, true)
+	if math.IsNaN(pMar1) {
+		t.Errorf("Mar 1 BracketProb = NaN, slot 61 unpopulated")
+	}
+	if pMar1 != 0.5 {
+		t.Errorf("Mar 1 BracketProb(above 70) = %v, want 0.5 (1 of 2 obs ≥ 70)", pMar1)
+	}
+}
+
+// TestCircDist_LeapYearWrapAround pins circular distance behavior at the
+// 366-day cycle boundary so any future refactor that drops back to a
+// 365-day cycle (which would re-create the Feb 29 collision risk) fails
+// loudly.
+func TestCircDist_LeapYearWrapAround(t *testing.T) {
+	// Day 366 (Dec 31 in a leap year) and day 1 (Jan 1) are adjacent.
+	if got := circDist(366, 1); got != 1 {
+		t.Errorf("circDist(366, 1) = %d, want 1 (adjacent across year boundary)", got)
+	}
+	// Day 366 to day 2 should be 2 days, not duplicating day 1.
+	if got := circDist(366, 2); got != 2 {
+		t.Errorf("circDist(366, 2) = %d, want 2", got)
+	}
+	// Reflexive at the boundary.
+	if got := circDist(366, 366); got != 0 {
+		t.Errorf("circDist(366, 366) = %d, want 0", got)
+	}
+	// Diametric opposite: day 1 to day 184 is the max distance (183).
+	if got := circDist(1, 184); got != 183 {
+		t.Errorf("circDist(1, 184) = %d, want 183", got)
+	}
+	// Feb 29 (60) and Mar 1 leap (61) are 1 day apart, not 0.
+	if got := circDist(60, 61); got != 1 {
+		t.Errorf("circDist(60, 61) = %d, want 1 (Feb 29 vs Mar 1 distinct)", got)
+	}
+}
+
 func formatInt(n int) string {
 	if n < 0 {
 		return "-" + formatInt(-n)
