@@ -101,3 +101,11 @@ Canary: if dashboard development exceeds 2 weeks (we planned 4, each
   reasoning.
 - `docs/ARCHITECTURE.md` §"Future (Phase 1+) shape" — directory layout.
 - Scheduled for W11 per the 12-week plan.
+
+---
+
+## Note (2026-05-13) — `ISOBAR_LIVE_ALLOW` deferred
+
+The Decision section above names `ISOBAR_LIVE_ALLOW=1` as the env-var gate for `/control/bot/*` endpoints. Phase 0 audit (2026-05-13) found the variable is unread anywhere in the Go codebase; the dashboard, `cmd/bot`, and `internal/exec` packages this ADR depends on are themselves not yet implemented.
+
+The specific env-var name in this ADR is therefore non-binding and the live-trade gating mechanism is deferred to the ADR that lands `cmd/bot` (anticipated slot 0013+). See `audit/live-allow-trace.md` for the trace and decision.
