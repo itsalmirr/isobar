@@ -788,6 +788,43 @@ func newTestJournalWithHook(t *testing.T, opts Options) (*Journal, string) {
 	return j, dir
 }
 
+// TestEnvelope_NewWritesHaveV1 is the write-side tripwire for the
+// envelope schema-version field. It opens a journal, writes a single
+// frame, closes (which drains + fsyncs), reads the raw on-disk bytes
+// back, and asserts the serialized line carries
+// `"v":"isobar.journal/v1"`. This is a regression detector: if a
+// future change accidentally drops the schema stamp from the writer,
+// this test fails before the unstamped bytes can land in a production
+// tape. The constant value is pinned because a bump requires a
+// reader-side migration policy decision (held for Phase 2).
+func TestEnvelope_NewWritesHaveV1(t *testing.T) {
+	j, dir := newTestJournal(t, Options{
+		MaxFileBytes: 1 << 20,
+		MaxFileAge:   time.Hour,
+		QueueSize:    16,
+	})
+	j.Write(Frame{
+		Stamp:   clock.Now(),
+		Source:  "test",
+		Kind:    "ws",
+		Payload: json.RawMessage(`{"hello":"world"}`),
+	})
+	require.NoError(t, j.Close())
+
+	files := walkExt(t, dir, ".jsonl")
+	require.Len(t, files, 1)
+	raw, err := os.ReadFile(files[0])
+	require.NoError(t, err)
+
+	// Substring assertion on the raw bytes — the on-disk format is
+	// part of the public tape contract and a struct-level decode
+	// would hide a field-drop regression.
+	require.Contains(t, string(raw), `"v":"`+EnvelopeSchemaVersion+`"`,
+		"envelope must carry the schema-version field; got: %s", string(raw))
+	require.Equal(t, "isobar.journal/v1", EnvelopeSchemaVersion,
+		"EnvelopeSchemaVersion constant must remain isobar.journal/v1 — bump requires reader migration policy decision")
+}
+
 func walkExt(t *testing.T, dir, suffix string) []string {
 	t.Helper()
 	var out []string
