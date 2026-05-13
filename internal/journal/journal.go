@@ -43,6 +43,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -150,6 +151,13 @@ type Journal struct {
 	droppedAtLastTick   atomic.Uint64
 	alarmActive         atomic.Bool
 	alarmFirstSeenNanos atomic.Int64
+
+	// alarmHookPanics counts how many times a user-supplied OnDropAlarm
+	// callback has panicked. ADR-0011 §Consequences pins this as a
+	// guarded failure mode: a buggy hook must not be able to kill the
+	// writer goroutine and silently turn off all journaling. Read via
+	// AlarmHookPanicTotal().
+	alarmHookPanics atomic.Uint64
 
 	// Resolved option values (post-default-fill). Kept on the struct so
 	// the run goroutine and Write don't re-read opts on every call.
@@ -277,6 +285,13 @@ func (j *Journal) Write(f Frame) {
 // ADR-0011 §5 preserves this name for the operator health-check.sh
 // script and existing test assertions.
 func (j *Journal) Dropped() uint64 { return j.dropped.Load() }
+
+// AlarmHookPanicTotal returns the monotonic count of OnDropAlarm
+// invocations that panicked. Reads are atomic and safe from any
+// goroutine. ADR-0011 §Consequences guards the writer goroutine
+// against a buggy hook; this accessor lets tests, future Prometheus
+// scrape, and operators observe how often the guard tripped.
+func (j *Journal) AlarmHookPanicTotal() uint64 { return j.alarmHookPanics.Load() }
 
 // Close stops the writer goroutine, draining the queue and fsyncing the
 // current file. Safe to call from any goroutine; idempotent.
@@ -505,9 +520,7 @@ func (j *Journal) checkDropAlarm() {
 		if since >= j.alarmSustain && !j.alarmActive.Load() {
 			// Edge-trigger: arm and fire exactly once for this crossing.
 			j.alarmActive.Store(true)
-			if j.onDropAlarm != nil {
-				j.onDropAlarm(j.opts.Source, cur, since)
-			}
+			j.safeInvokeAlarm(j.opts.Source, cur, since)
 		}
 		return
 	}
@@ -516,6 +529,45 @@ func (j *Journal) checkDropAlarm() {
 	// re-arm the edge-trigger so a future sustained breach fires again.
 	j.alarmFirstSeenNanos.Store(0)
 	j.alarmActive.Store(false)
+}
+
+// safeInvokeAlarm runs the OnDropAlarm hook under a deferred recover
+// so a panicking callback cannot kill the writer goroutine.
+//
+// ADR-0011 §Consequences specifically lists this as a guarded failure
+// mode: the writer is the single owner of the on-disk file descriptor,
+// and the OnDropAlarm seam is the prescribed integration point for
+// Phase 6 Prometheus metrics. A buggy operator-supplied hook (nil
+// deref, divide-by-zero, panic inside slog handler, etc.) must not be
+// able to silently turn off all journaling — that would re-introduce
+// the original silent-drop defect through a different layer.
+//
+// On panic: log the panic + stack at error level, bump
+// alarmHookPanics, then return so the run() select loop continues.
+// The next alarm tick will retry; if the hook keeps panicking the
+// counter keeps ticking and an operator can observe via
+// AlarmHookPanicTotal() (or, in Phase 6, the Prometheus gauge).
+func (j *Journal) safeInvokeAlarm(src string, drops uint64, since time.Duration) {
+	if j.onDropAlarm == nil {
+		// Belt-and-braces: Open() always installs a non-nil hook
+		// (custom or default-slog-warn fallback). Guarding here so a
+		// future refactor that resets j.onDropAlarm cannot reintroduce
+		// a nil-deref crash in the writer goroutine.
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			j.alarmHookPanics.Add(1)
+			j.logger.Error("journal: OnDropAlarm panicked — writer survives, hook skipped this tick",
+				"src", src,
+				"drops", drops,
+				"since", since,
+				"recover", fmt.Sprintf("%v", r),
+				"stack", string(debug.Stack()),
+			)
+		}
+	}()
+	j.onDropAlarm(src, drops, since)
 }
 
 // newPath builds dir/source/YYYY-MM-DD/source-HHMMSS.NNNNNNNNN.jsonl,
