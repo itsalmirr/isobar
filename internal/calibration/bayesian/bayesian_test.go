@@ -288,8 +288,8 @@ func TestLoadKernel_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	if err := os.WriteFile(path, raw, 0o600); err != nil {
-		t.Fatalf("write: %v", err)
+	if werr := os.WriteFile(path, raw, 0o600); werr != nil {
+		t.Fatalf("write: %v", werr)
 	}
 
 	got, err := LoadKernel(path)
