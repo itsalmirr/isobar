@@ -11,6 +11,101 @@ weather maps — the project's edge would come from pricing weather better
 than the market does. The current evidence (see Phase 0.5 v2 below) says
 we don't.
 
+## Pipeline
+
+```
+   Open-Meteo ensemble  +  Kalshi WS trades + book
+            │                       │
+            └──────────┬────────────┘
+                       ▼
+              cmd/tape (recorder)        single-file owner per source,
+                       │                 raw frames stamped + journaled
+                       ▼
+            data/{kalshi,openmeteo}/<date>/*.jsonl[.gz]
+                       │
+                       ▼
+              cmd/edge-scan             walks tape, pairs trades to polls,
+                       │                 emits 4 probability columns
+                       ▼
+          edges-*.csv + summary-*.md     MOS + climate + naive + market
+                       │
+                       ▼
+              realized-PnL backtest     "no imaginary bets" — skip trades
+                                         outside NWS CLI truth window
+```
+
+Next-alpha foundation (not yet integrated):
+`internal/calibration/bayesian` ships the T−3h precision-weighted
+posterior update (ADR-0010). `cmd/calibrate-bayesian` defines the
+kernel-fitting CLI; the fit body lands once the held-out evaluation
+harness (ADR-0011, proposed) clears its gate.
+
+## Results — Phase 0.5 v2
+
+n=79 tradeable [35,65)¢ rows; bootstrap 95% CIs on Brier deltas
+(positive Δ = lower Brier = better):
+
+| Calibrator | Brier vs naive (Δ) | vs market mid (Δ) | Verdict |
+|---|---:|---:|---|
+| MOS | +0.060 [+0.008, +0.113] | −0.100 [−0.188, −0.013] | calibration is real; loses to market |
+| Climate-shrunk-naive | +0.070 [+0.047, +0.094] | −0.090 [−0.173, −0.009] | ties MOS; same loss to market |
+| MOS vs climate-shrunk | −0.011 [−0.056, +0.035] | — | statistically **tied** |
+| **Canary verdict** | — | — | **[ADR-0009 fired](./docs/decisions/0009-mos-canary-fired-escalate-calibration.md)** |
+
+Source numbers and methodology:
+[`reports/phase0.5/2026-05-05-floor-estimate-v2.md`](./reports/phase0.5/2026-05-05-floor-estimate-v2.md).
+The honest one-paragraph reading: any calibration of the ensemble beats
+the naive estimator significantly, but MOS doesn't earn its complexity
+over a 5-line shrinkage estimator, and both calibrators lose to Kalshi
+market mid in the tradeable zone. The market is genuinely better-informed
+than our static daily forecast, mostly because it absorbs intraday
+observation that our prior doesn't see.
+
+## What I built and why
+
+Five engineering bets driving the current state of the code:
+
+1. **MOS calibration with the right σ.** Per-bin OLS on
+   `(station, season, variable)` with holdout-σ when the holdout has
+   ≥30 pairs and a labelled `training-fallback` otherwise. Coefficients
+   are stamped with `FitModelSet`; the scanner refuses to apply
+   GFS-only-trained MOS to a GFS+ECMWF poll. Schema-versioned
+   (`isobar.mos/v1`) so future loaders can refuse to silently
+   re-interpret. ([`internal/calibration/mos`](./internal/calibration/mos/),
+   [docs/CALIBRATION.md](./docs/CALIBRATION.md))
+2. **Climate baseline as a critique.** A 5-line shrinkage estimator
+   `p = 0.2·climate + 0.8·naive` ships as a separate probability column
+   so the calibration story can be tested against the simplest possible
+   alternative. It ties MOS in the tradeable midrange — the load-bearing
+   evidence behind ADR-0009. Implementation uses a per-day-of-year
+   pre-sorted slice for O(log N) binary-search lookup over a ±30-day
+   seasonal window. ([`internal/calibration/climate`](./internal/calibration/climate/))
+3. **Multi-model ensemble decoder (GFS + ECMWF).** Open-Meteo's
+   `models=` parameter lets one poll carry two ensembles; the parser in
+   `internal/edge.ParsePoll` tags each member with its source
+   (`gfs:NN` / `ecmwf:NN`) and the scanner derives the observed model
+   set to gate MOS application. Parse + guard are shipped; the
+   recorder stays GFS-only by default until a multi-model fit is
+   available. ([`internal/edge/openmeteo.go`](./internal/edge/openmeteo.go))
+4. **Realized-PnL backtest with truth-file coverage.** `edge-scan
+   --truth <dir>` loads NWS CLI ground-truth CSVs and scores every
+   paired trade. Trades with no truth row are skipped under the
+   *no imaginary bets* rule — the aggregate `no_truth_available`
+   counter is the operator's first audit hook. `scripts/run-backtest.sh`
+   is the end-to-end wrapper. ([`docs/BACKTEST.md`](./docs/BACKTEST.md))
+5. **Decision-gate methodology.** Every iteration ships a written
+   report under `reports/` with stratified Brier scores and bootstrap
+   95% CIs, *before* any capital commitment. ADR-0009 fired on the
+   first such report; the project is currently a forecasting-research
+   artifact with a documented failed-trading-gate, not a deployed bot.
+   This pattern is the most important thing in the repo.
+6. **(Next-alpha foundation) T−3h Bayesian update.**
+   `internal/calibration/bayesian` ships the precision-weighted Gaussian
+   update math + a schema-versioned kernel loader; `cmd/calibrate-bayesian`
+   scaffolds the fit CLI. Integration into Scan is gated on ADR-0011's
+   held-out evaluation harness — math first, integration once it
+   demonstrably clears the gate. ([ADR-0010](./docs/decisions/0010-t-minus-3h-bayesian-update.md))
+
 ## Status — Phase 0.5 first verdict: gate NOT met by current MOS calibration
 
 The latest decision-gate report
