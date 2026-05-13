@@ -763,6 +763,90 @@ func TestDefaultAlarmHook_FiresStructuredWarn(t *testing.T) {
 	require.True(t, found, "expected at least one drop-alarm fired record at WARN level")
 }
 
+// TestOnDropAlarm_PanicDoesNotKillWriter installs a hook that always
+// panics, induces sustained drops, and asserts:
+//  1. AlarmHookPanicTotal() rises (the panic was caught and counted);
+//  2. Close() completes cleanly (the writer goroutine survived);
+//  3. Writes after the panic are still serviced — i.e. the writer
+//     keeps draining the queue rather than wedging.
+//
+// ADR-0011 §Consequences enumerates "buggy hook silently kills all
+// journaling" as the failure mode this guard exists to prevent. The
+// test is the regression detector for that guarantee.
+func TestOnDropAlarm_PanicDoesNotKillWriter(t *testing.T) {
+	withShortAlarmInterval(t, 5*time.Millisecond)
+
+	var hookCalls atomic.Uint64
+	panickyHook := func(src string, drops uint64, since time.Duration) {
+		hookCalls.Add(1)
+		panic("test: hook intentionally panics")
+	}
+
+	dir := t.TempDir()
+	j, err := Open(Options{
+		Dir:            dir,
+		Source:         "test",
+		MaxFileBytes:   1 << 20,
+		MaxFileAge:     time.Hour,
+		QueueSize:      2,
+		FlushEvery:     time.Hour, // park flush so queue fills
+		AlarmThreshold: 1,
+		AlarmSustain:   20 * time.Millisecond,
+		OnDropAlarm:    panickyHook,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	require.NoError(t, err)
+
+	// Force sustained drops so the alarm fires (and the hook panics).
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		for k := 0; k < 1000; k++ {
+			j.Write(Frame{Source: "test", Kind: "x", Payload: json.RawMessage(`"x"`)})
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// Wait for the panic counter to bump. If the writer had died, no
+	// further alarm ticks would fire and this Eventually times out.
+	require.Eventually(t, func() bool {
+		return j.AlarmHookPanicTotal() >= 1
+	}, 500*time.Millisecond, 5*time.Millisecond,
+		"alarm hook should have been invoked (and panicked) at least once; hookCalls=%d panics=%d drops=%d",
+		hookCalls.Load(), j.AlarmHookPanicTotal(), j.Dropped())
+
+	// Subsequent writes must still drain — proves the writer goroutine
+	// survived the panic. Use a queue that's currently quiet, with a
+	// small payload, and a short FlushEvery so the data lands on disk
+	// before Close() returns.
+	postDrops := j.Dropped()
+	// Brief calm so the alarm ticks see a sub-threshold rate and clear.
+	time.Sleep(30 * time.Millisecond)
+	j.Write(Frame{Source: "test", Kind: "post-panic", Payload: json.RawMessage(`{"survived":true}`)})
+
+	// Close cleanly — fails (hangs or panics) if the writer died.
+	require.NoError(t, j.Close(), "Close must complete after hook panicked; writer must survive")
+
+	// Confirm something actually landed on disk after the panic by
+	// reading the file back. We don't require the exact one frame we
+	// posted (the queue may have had backlog), but the file must
+	// exist and the post-panic frame's "survived":true must be in it.
+	files := walkExt(t, dir, ".jsonl")
+	require.NotEmpty(t, files, "expected at least one journal file")
+	var found bool
+	for _, p := range files {
+		data, err := os.ReadFile(p)
+		require.NoError(t, err)
+		if strings.Contains(string(data), `"survived":true`) {
+			found = true
+			break
+		}
+	}
+	require.True(t, found, "post-panic Write did not reach disk — writer goroutine appears dead")
+	require.GreaterOrEqual(t, j.AlarmHookPanicTotal(), uint64(1),
+		"AlarmHookPanicTotal must reflect at least one recovered panic")
+	require.GreaterOrEqual(t, j.Dropped(), postDrops,
+		"drop counter must remain monotonic across the panic")
+}
+
 // newTestJournalWithHook is a variant of newTestJournal that respects
 // a caller-supplied OnDropAlarm (and the alarm thresholds it carries).
 // The shared helper above silently overwrote OnDropAlarm because it
