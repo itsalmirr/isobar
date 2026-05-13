@@ -19,8 +19,16 @@ type Station struct {
 	// City is the human-readable name (for log messages, reports).
 	City string
 
-	// Lat, Lon are the point used for Open-Meteo polling. For Chicago
-	// this is KMDW (Midway) per ADR-0007, NOT KORD (O'Hare).
+	// Lat, Lon are the canonical observing-site coordinates (WGS84
+	// decimal degrees), used for Open-Meteo polling and for boot-time
+	// validation of operator-supplied config (see
+	// internal/config/config.go: ValidateStationCoords). For Chicago
+	// this is KMDW (Midway) per ADR-0007, NOT KORD (O'Hare). Values
+	// are sourced from api.weather.gov/stations/<CODE>; cross-checked
+	// against aviationweather.gov station info. Tolerance for config
+	// drift is ±0.001°; tighter than that risks rejecting valid
+	// rounding, looser drops past the 1°F bracket-flip threshold for
+	// stations near coast/elevation gradients.
 	Lat, Lon float64
 
 	// UTCOffsetHours is the local-civil-time offset during US daylight
@@ -57,19 +65,19 @@ var allStations = []Station{
 	},
 	{
 		Code: "KMIA", Location: "MIA", City: "Miami",
-		Lat: 25.7617, Lon: -80.1918, UTCOffsetHours: -4,
+		Lat: 25.7959, Lon: -80.2870, UTCOffsetHours: -4,
 		HighSeries: "KXHIGHMIA", LowSeries: "KXLOWTMIA",
 		CLIPil: "CLIMIA",
 	},
 	{
 		Code: "KLAX", Location: "LAX", City: "Los Angeles",
-		Lat: 33.9416, Lon: -118.4085, UTCOffsetHours: -7,
+		Lat: 33.9425, Lon: -118.4081, UTCOffsetHours: -7,
 		HighSeries: "KXHIGHLAX", LowSeries: "KXLOWTLAX",
 		CLIPil: "CLILAX",
 	},
 	{
 		Code: "KMDW", Location: "CHI", City: "Chicago",
-		Lat: 41.7861, Lon: -87.7522, UTCOffsetHours: -5,
+		Lat: 41.7842, Lon: -87.7553, UTCOffsetHours: -5,
 		HighSeries: "KXHIGHCHI", LowSeries: "KXLOWTCHI",
 		CLIPil: "CLIMDW",
 	},
@@ -82,6 +90,13 @@ func AllStations() []Station {
 	copy(out, allStations)
 	return out
 }
+
+// AllStationsCanonical is a named alias for AllStations() used by
+// boot-time config validation (internal/config: ValidateStationCoords).
+// Calling it through this name documents that the caller depends on
+// the Lat/Lon fields being the canonical NWS values, not arbitrary
+// fixtures. Returns a fresh copy on every call.
+func AllStationsCanonical() []Station { return AllStations() }
 
 // AllStationCodes returns the four-letter station codes (KNYC, KMIA,
 // KLAX, KMDW) in canonical order. Convenience for callers that only
