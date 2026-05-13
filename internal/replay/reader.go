@@ -29,13 +29,28 @@ import (
 // Envelope is the on-disk shape of one recorded frame. Payload is the
 // raw producer bytes (Kalshi WS frame, Open-Meteo JSON response, …) —
 // this package does not decode it.
+//
+// Version is the journal envelope schema version, stamped at write time
+// (see internal/journal.EnvelopeSchemaVersion). Frames written before
+// the "v" field landed (the ~700 MB of legacy tape on prod) decode with
+// an empty Version off-disk; the reader rewrites that to
+// EnvelopeSchemaLegacyV0 so downstream callers always see a populated
+// label and can switch on schema generation without a nil check.
 type Envelope struct {
 	Wall    int64           `json:"t"` // unix-nanoseconds, UTC
 	Mono    int64           `json:"m"` // process-monotonic nanoseconds
 	Source  string          `json:"src"`
 	Kind    string          `json:"k"`
+	Version string          `json:"v,omitempty"`
 	Payload json.RawMessage `json:"p,omitempty"`
 }
+
+// EnvelopeSchemaLegacyV0 is the placeholder version string the reader
+// stamps on frames whose on-disk envelope predates the "v" field. It
+// is NOT a value any writer ever emits — it is a synthetic label for
+// "absence of v on read" so downstream consumers always see a
+// populated Version and can switch on schema generation.
+const EnvelopeSchemaLegacyV0 = "isobar.journal/v0-legacy"
 
 // ListJournals returns every .jsonl or .jsonl.gz file directly under
 // dir, sorted lexicographically (which for our filename convention is
@@ -133,6 +148,13 @@ func forEachFrameInFile(path string, fn func(env Envelope, bytes int, firstInFil
 		// multi-million-frame tapes spend most of their wall time here.
 		if err := sonic.Unmarshal(line, &env); err != nil {
 			continue // tolerate malformed frames
+		}
+		// Tape predating the schema-version field decodes with Version
+		// == "". Stamp a synthetic v0-legacy label so consumers see a
+		// populated schema string and can switch on it. The writer
+		// never emits this value — it only appears via back-compat.
+		if env.Version == "" {
+			env.Version = EnvelopeSchemaLegacyV0
 		}
 		if err := fn(env, len(line), firstInFile); err != nil {
 			return err
