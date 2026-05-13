@@ -37,8 +37,10 @@ we don't.
 Next-alpha foundation (not yet integrated):
 `internal/calibration/bayesian` ships the T−3h precision-weighted
 posterior update (ADR-0010). `cmd/calibrate-bayesian` defines the
-kernel-fitting CLI; the fit body lands once the held-out evaluation
-harness (ADR-0011, proposed) clears its gate.
+kernel-fitting CLI; the fit body lands once a held-out evaluation
+harness (ADR-0010 follow-up, not yet an accepted ADR — the original
+0011 slot was reassigned to journal backpressure during the audit)
+clears its gate.
 
 ## Results — Phase 0.5 v2
 
@@ -102,9 +104,9 @@ Five engineering bets driving the current state of the code:
 6. **(Next-alpha foundation) T−3h Bayesian update.**
    `internal/calibration/bayesian` ships the precision-weighted Gaussian
    update math + a schema-versioned kernel loader; `cmd/calibrate-bayesian`
-   scaffolds the fit CLI. Integration into Scan is gated on ADR-0011's
-   held-out evaluation harness — math first, integration once it
-   demonstrably clears the gate. ([ADR-0010](./docs/decisions/0010-t-minus-3h-bayesian-update.md))
+   scaffolds the fit CLI. Integration into Scan is gated on a held-out
+   evaluation harness named as an ADR-0010 follow-up — math first,
+   integration once it demonstrably clears the gate. ([ADR-0010](./docs/decisions/0010-t-minus-3h-bayesian-update.md))
 
 ## Status — Phase 0.5 first verdict: gate NOT met by current MOS calibration
 
@@ -210,8 +212,9 @@ internal/kalshi                 RSA-signed REST + authenticated WS subscriber
   ships the math (`Update`, `LoadKernel`) and schema (`isobar.bayesian/v1`).
   `cmd/calibrate-bayesian` defines the fit-pipeline CLI; the fit body
   is deferred to a follow-up commit. Integration into Scan is gated on
-  the held-out evaluation harness proposed in ADR-0011. See ADR-0010
-  for the math and design rationale.
+  a held-out evaluation harness named as an ADR-0010 follow-up (the
+  original 0011 slot was reassigned to journal backpressure during the
+  audit). See ADR-0010 for the math and design rationale.
 
 **Hot-path principle.** The recorder does not decode WS frames. Bytes
 from the socket are wrapped in a thin envelope (timestamps + source tag)
@@ -236,7 +239,7 @@ See [`reports/INDEX.md`](./reports/INDEX.md) for the chain.
 
 ## Architectural decisions
 
-10 Architecture Decision Records (ADRs) under [`docs/decisions/`](./docs/decisions/),
+13 Architecture Decision Records (ADRs) under [`docs/decisions/`](./docs/decisions/),
 in dependency order:
 
 | ADR | Decision |
@@ -251,6 +254,13 @@ in dependency order:
 | 0008 | Deterministic GFS for first-pass MOS (canary now fired — see ADR-0009) |
 | 0009 | Trigger ensemble-spread NGR / ECMWF blend after MOS canary |
 | 0010 | T−3h Bayesian update of MOS prior via intraday observations (proposed) |
+| 0011 | Journal backpressure: drop with counter, sampled debug log, alarm hook |
+| 0012 | Time-source discipline: Clock interface, now-func fields, custom lint analyzer |
+| 0013 | Retire PR#9 paper-trader/scoring lineage from `main`; defer until cmd/bot unblock |
+
+Phase 2 structural decisions are proposed in
+[`audit/02-architecture.md`](./audit/02-architecture.md) (reserved ADR
+slots 0014-0020, pending per-decision sign-off).
 
 ## Quickstart
 
@@ -293,9 +303,13 @@ Recorded data lands under `./data/<source>/<YYYY-MM-DD>/<source>-<hour>.jsonl[.g
 - Go 1.26+, `internal/` only (no `pkg/` until cross-binary need)
 - stdlib-first: `log/slog`, `errgroup`, `context`. Outside deps: `coder/websocket`, `yaml.v3`, `testify` (test-only)
 - `make all` runs lint + vet + race-tested unit tests + build
+- `make lint` runs both `golangci-lint` and the custom `clockcheck`
+  analyzer (`tools/clockcheck/`) per ADR-0012 — direct `time.Now` /
+  `Since` / `Until` outside the allowlist fails the build
 - `make install-hooks` enables the pre-commit tripwire (refuses commits with gitignored-but-tracked files)
 - Secrets live in `./secrets/` (gitignored) or env vars with `ISOBAR_` prefix
-- Recorded data lives in `./data/` (gitignored)
+- Recorded data lives in `./data/` (gitignored); journal-drop alarms
+  (ADR-0011) land in `./data/alarms/<YYYY-MM-DD>.jsonl`
 
 ## Documentation map
 

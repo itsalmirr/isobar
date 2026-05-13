@@ -5,11 +5,18 @@
 > happen, how we would know, what is in place today. Rewritten
 > 2026-05-13 to reflect the Phase 0 audit
 > ([audit/00-map.md](../audit/00-map.md)) and ADRs 0007–0010.
+> Status column refreshed post-Bucket-A close (same date) —
+> [audit/01-line-audit.md](../audit/01-line-audit.md) appendix is the
+> authoritative list of what shipped; [ADR-0011](./decisions/0011-journal-backpressure.md),
+> [ADR-0012](./decisions/0012-time-source-discipline.md), and
+> [ADR-0013](./decisions/0013-retire-pr9-paper-trader-lineage.md)
+> are the new canonical references.
 >
 > Phase 0 has no live execution. Most controls below are
 > design-ahead for Phase 1+; the column "Status" labels which ones
 > are shipped (`LIVE`), in the current P1 triage round
 > (`IN PROGRESS`), waiting on a decision (`PENDING DECISION`),
+> resolved into a deferred-capability ADR (`ACCEPTED`),
 > deferred to observability work (`PHASE 6`), or operator-only with
 > no code-level mitigation (`MONITORED`).
 >
@@ -105,76 +112,126 @@ constraint the Phase 1 exec branch will inherit.
 | Owner | solo-operator |
 | Status | **MONITORED** (no code-level alarm; refit cadence is operator-driven) |
 
+### MOS in-sample σ over-confidence (training-residual stdev too tight)
+
+| Field | Value |
+|---|---|
+| Severity | **P1** |
+| Detection | The pre-Bucket-A `Fit` derived σ from training residuals, which under-estimates predictive spread by construction. Tradeable-midrange Brier inflates accordingly. The new `SigmaSource` field on Coefficients records `holdout`, `training-fallback`, or `pooled` so any consumer can audit the provenance. |
+| Mitigation | Bucket A8 reworked `Fit` to compute σ from the OOS holdout when `NHoldout ≥ MinHoldoutForSigma` (default 30); falls back to a training-residual fallback below that threshold with `SigmaSource: training-fallback` so the consumer can downgrade confidence. A `FitModelSet` guard prevents applying a GFS-only fit to a multi-model poll. Clock injection per [ADR-0012](./decisions/0012-time-source-discipline.md) makes `Fit` deterministic — identical pairs → identical Coefficients JSON byte-for-byte (regression test `TestFit_DeterministicAcrossCalls`). |
+| Owner | solo-operator |
+| Status | **LIVE** (A8; holdout-σ + clock injection) |
+
+### T-bracket low-side resolution (KXLOWT* resolved as one-sided high)
+
+| Field | Value |
+|---|---|
+| Severity | **P1** |
+| Detection | Pre-Bucket-A the resolution logic treated every threshold bracket as one-sided "≥ Lo", which is correct for `KXHIGH*` but inverts `KXLOWT*`. Symptom would be reversed `outcome` columns in `data/calibration/*` for KXLOWT brackets. The new `ResolveWithSiblings` uses first-pass sibling collection to detect low-side T-brackets by their sibling shape. |
+| Mitigation | Bucket A10 shipped `ResolveWithSiblings` in [internal/edge/resolution.go](../internal/edge/resolution.go); `scan.go` does a first-pass sibling collection so `KXLOWT*` resolves correctly via sibling-based direction inference. Exercised by `TestResolveWithSiblings_{LowSide,HighSide}Detected`. |
+| Owner | solo-operator |
+| Status | **LIVE** (A10) |
+
+### Orderbook snapshot-error state machine (delta-before-snapshot)
+
+| Field | Value |
+|---|---|
+| Severity | **P1** |
+| Detection | Pre-Bucket-A the `internal/replay` orderbook could apply delta frames against an empty book, leaving it in a silently-divergent state. Bucket A3 introduced an `uninitialized` state + typed `ErrBookUninitialized` + counters `RejectedDeltasTotal()` and `SnapshotErrorsTotal()` so the divergence is observable. |
+| Mitigation | Bucket A3 shipped the state machine: delta-before-snapshot rejects with `ErrBookUninitialized` and increments `RejectedDeltasTotal()`; snapshot-apply errors increment `SnapshotErrorsTotal()`; logs are suppressed past the first to avoid flooding. Covered by orderbook tests asserting exactly-once counter semantics under repeated rejections. |
+| Owner | solo-operator |
+| Status | **LIVE** (A3; typed error + counters + log-suppress) |
+
+### `bin/` tracked-vs-gitignore drift
+
+| Field | Value |
+|---|---|
+| Severity | **P2** |
+| Detection | Phase 0 inferred `bin/` was tracked in git; closer audit confirmed it is not. Risk now is a future regression — someone commits a built binary by accident. Detection is the CI tripwire and the pre-commit hook. |
+| Mitigation | Lane D shipped a CI step in `.github/workflows/ci.yml` plus a `.githooks/pre-commit` hook that fails if any path under `bin/` is in the tracked tree. Local pre-commit catches at commit time; CI is the merge-time backstop. |
+| Owner | solo-operator |
+| Status | **LIVE** (Lane D; CI + pre-commit hook) |
+
+### PR#9 paper-trader lineage retired (deferred capability)
+
+| Field | Value |
+|---|---|
+| Severity | **P2** |
+| Detection | When `cmd/bot` work begins, the paper-trader / fillability / score / settle / backfill-score binaries plus `internal/papertrade` need cherry-pick + migration from `refs/pull/{7,8,9}/head`. Without that, the live-money path has no precursor scaffolding and any migration question (e.g. `market.ParseTicker` → `edge.ParseTicker` semantics) gets relitigated under deadline. |
+| Mitigation | [ADR-0013](./decisions/0013-retire-pr9-paper-trader-lineage.md) documents the 11 commit SHAs, PR refs (#7/#8/#9), recovery paths in priority order (GitHub PR refs → reflog SHAs → audit backup branches `audit/2026-05-13` + `audit/2026-05-13-post-bucket-a`), and the full API-migration surface (`market.*` → `edge.*` rename map) so the eventual `cmd/bot` PR is mechanical, not exploratory. |
+| Owner | solo-operator |
+| Status | **ACCEPTED** (deferred capability per ADR-0013; revisits when `cmd/bot` unblocks) |
+
 ### Forecast-source outage (Open-Meteo down — what happens to live trade?)
 
 | Field | Value |
 |---|---|
 | Severity | **P1** |
-| Detection | The poller emits a warn log on a failed fetch and skips to the next 30 m tick. The audit map ([§6](../audit/00-map.md)) flagged the missing retry; the symptom of a multi-hour outage is a multi-hour gap in `data/openmeteo/<date>/*.jsonl`. |
-| Mitigation | Two layers: (1) record-side — implement a bounded exponential-backoff retry in the Open-Meteo poller so a transient failure is retried (≤ 5 attempts, capped at 30 s between tries, ctx-aware so SIGTERM still works). (2) Trade-side — the L3 signal-sanity gate's `staleness_max` (default 30 s for WS-derived state, larger for ensemble polls) refuses to emit a signal on stale ensemble data. Both layers are design-ahead; the record-side fix is part of the P1 triage round. |
+| Detection | The poller emits structured per-attempt slogs (Bucket A6); `FetchFailuresTotal()` exposes the cumulative count of locations that exhausted retries. Symptom of an outage beyond the retry budget is a gap in `data/openmeteo/<date>/*.jsonl` plus a non-zero `FetchFailuresTotal` reading. |
+| Mitigation | Two layers: (1) record-side — bounded exponential backoff with jitter (1 s → 2 s → 4 s, `max_attempts: 4`, ctx-aware so SIGTERM still works); covered by 7 new tests in `internal/openmeteo/client_retry_test.go` (5xx storm + 429 + ctx-cancel cases). (2) Trade-side — the L3 signal-sanity gate's `staleness_max` (default 30 s for WS-derived state, larger for ensemble polls) refuses to emit a signal on stale ensemble data; remains design-ahead. |
 | Owner | solo-operator |
-| Status | **IN PROGRESS** (record-side retry); **DESIGN-AHEAD** (L3 staleness gate, Phase 1+) |
+| Status | **LIVE** (record-side retry, A6 in [audit/01-line-audit.md](../audit/01-line-audit.md) appendix); **DESIGN-AHEAD** (L3 staleness gate, Phase 1+) |
 
 ### Kalshi WS disconnect storm
 
 | Field | Value |
 |---|---|
 | Severity | **P1** |
-| Detection | `cmd/tape` slog stderr lines `ws subscriber reconnecting` clustered within a short window. Per-reconnect counter logged in `audit/00-map.md` §5. |
+| Detection | `cmd/tape` slog stderr lines `ws subscriber reconnecting` clustered within a short window. Per-reconnect counter logged in `audit/00-map.md` §5. Frame-starvation (silent TCP-half-open) is now detected by the app-level liveness watchdog. |
 | Mitigation | `internal/retry` provides context-aware exponential backoff with jitter
-(`initial_backoff: 500ms`, `max_backoff: 30s`, `max_attempts: 0` = forever) per [config/config.yaml:42-46](../config/config.yaml). Subscriber re-establishes via `kalshi.SetTickers/Reload`. There is no circuit breaker on a sustained 5xx run; for Phase 0 (recorder-only) the right behaviour is to keep trying. Phase 1 exec will need a "stop new orders if WS has been disconnected for > N seconds" interlock; that lives in the L2 reconciliation design. |
+(`initial_backoff: 500ms`, `max_backoff: 30s`, `max_attempts: 0` = forever) per [config/config.yaml:42-46](../config/config.yaml). Subscriber re-establishes via `kalshi.SetTickers/Reload`. Bucket A5 added an app-level liveness layer in [internal/kalshi/ws.go](../internal/kalshi/ws.go): periodic ping with read-deadline + watchdog that forces a reconnect on starvation (covered by two new tests — frame-starvation reconnect + ping failure). There is still no circuit breaker on a sustained 5xx run; for Phase 0 (recorder-only) the right behaviour is to keep trying. Phase 1 exec will need a "stop new orders if WS has been disconnected for > N seconds" interlock; that lives in the L2 reconciliation design. |
 | Owner | solo-operator |
-| Status | **LIVE** (recorder side); **DESIGN-AHEAD** (exec-side interlock) |
+| Status | **LIVE-IMPROVED** (recorder side, A5); **DESIGN-AHEAD** (exec-side interlock) |
 
 ### Silent journal drop (frame loss on burst)
 
 | Field | Value |
 |---|---|
 | Severity | **P1** |
-| Detection | `internal/journal.Write` is non-blocking ([journal.go:124](../internal/journal/journal.go)); on a full 16 384-item queue, the frame is dropped and a per-source counter increments. A 60 s warn log reports the drop count. Audit map [P1 #4](../audit/00-map.md). |
-| Mitigation | Three pieces, all under the next ADR (the journal-backpressure ADR-0011 per the user instruction): (1) raise the drop event to a tagged structured log so a host-side monitor can alarm on it, (2) emit the drop counter to a sidecar JSON file that `tape-health.sh` can sample, (3) decide whether to switch the recorder to blocking-with-timeout when the queue is consistently saturated. The ADR will pick the trade-off (data fidelity vs producer-blocking) for the recorder vs trader separately. |
+| Detection | `internal/journal.Write` is non-blocking ([journal.go](../internal/journal/journal.go)); on a full 16 384-item queue, the frame is dropped and a per-source counter increments. A 60 s warn log reports the cumulative count; a sampled debug log + edge-triggered `OnDropAlarm` callback now fire on sustained-rate breaches per [ADR-0011](./decisions/0011-journal-backpressure.md). |
+| Mitigation | Bucket A1+A2 shipped the ADR-0011 design end-to-end: per-source counter, sampled debug log, panic-safe alarm callback, plus `cmd/tape` wires the hook to a `data/alarms/<date>.jsonl` sink. Tripwire test `TestProdJournalHasAlarmHookWired` in [cmd/tape/main_test.go](../cmd/tape/main_test.go) fails the build if `journal.Open` is ever called without `OnDropAlarm`. The Phase 6 Prometheus sink plugs into the same seam. |
 | Owner | solo-operator |
-| Status | **IN PROGRESS** |
+| Status | **LIVE** (A1+A2; tripwire active) |
 
 ### Station-coordinate drift (CHI → ORD vs KMDW)
 
 | Field | Value |
 |---|---|
 | Severity | **P1** |
-| Detection | [config/config.yaml:64](../config/config.yaml) currently encodes `lat: 41.9742, lon: -87.9073` (ORD), while [config/config.example.yaml:70](../config/config.example.yaml) encodes `lat: 41.7861, lon: -87.7522` (KMDW). [ADR-0007 §"Neutral"](./decisions/0007-calibration-ground-truth-cli.md) confirms Kalshi resolves `KXHIGHCHI`/`KXLOWTCHI` on Midway. Symptom of unresolved drift is a persistent residual on CHI brackets relative to other stations in the per-station Brier breakdown of `reports/phase0.5/`. |
-| Mitigation | (1) Pin the canonical station list — name, lat, lon, ICAO — in `internal/market/stations.go` (single source of truth, per [docs/ARCHITECTURE.md](./ARCHITECTURE.md) §"market"). (2) At `cmd/tape` boot, validate every configured location's `(lat, lon)` against the registry within an epsilon (~0.05°); refuse to start on mismatch. (3) Fix the active `config/config.yaml` to KMDW coords. The active config has not been switched yet; the example file is correct. |
+| Detection | Canonical station registry now lives in [internal/market/stations.go](../internal/market/stations.go); boot-time `validateStationCoords` in [internal/config/config.go](../internal/config/config.go) refuses to start on mismatch. [ADR-0007 §"Neutral"](./decisions/0007-calibration-ground-truth-cli.md) confirms Kalshi resolves `KXHIGHCHI`/`KXLOWTCHI` on Midway; CHI is patched to canonical KMDW and the cutover is marked in a boot frame on the journal. Symptom of unresolved drift would be a persistent residual on CHI brackets relative to other stations in the per-station Brier breakdown of `reports/phase0.5/`. |
+| Mitigation | Bucket A1+A2 shipped: (1) canonical station list — name, lat, lon, ICAO — pinned in `internal/market/stations.go` (single source of truth, per [docs/ARCHITECTURE.md](./ARCHITECTURE.md) §"market"). (2) `cmd/tape` boot validates every configured `(lat, lon)` against the registry within an epsilon (~0.05°); refuses to start on mismatch. (3) Active `config/config.yaml` patched to KMDW; cutover marked via boot frame. Cross-package consolidation of three remaining drifting station maps (`internal/edge/{scan,poll_index,ticker}`) is proposed in [audit/02-architecture.md](../audit/02-architecture.md) §1.1, pending per-decision sign-off. |
 | Owner | solo-operator |
-| Status | **IN PROGRESS** (registry sentinel + boot-time check is the P1 triage item; config swap is pending) |
+| Status | **LIVE** (A1+A2; registry sentinel + boot-time check + config swap) |
 
 ### Secret leakage (`.env` perms, PEM on disk)
 
 | Field | Value |
 |---|---|
 | Severity | **P1** |
-| Detection | `stat -f%Mp%Lp /Users/wh0o0pz/dev/isobar/.env` returns the file mode. `git log --all -p -- .env` returns empty (audit §8: never committed). |
-| Mitigation | (1) `.env` mode is now `0o600` per the P1 triage round (audit P1 #6). (2) PEM-on-disk path is operator-set; the recommended convention is `./secrets/kalshi.pem` with `0o600`; `.gitignore` covers `secrets/`, `*.pem`, `*.key`, `.env*`. (3) Pending: a boot-time refusal-to-start check that `.env` (when present) and the PEM file (always) are no more permissive than `0o600`. Without that check, a future `chmod` regression is silent. |
+| Detection | `stat -f%Mp%Lp /Users/wh0o0pz/dev/isobar/.env` returns the file mode. `git log --all -p -- .env` returns empty (audit §8: never committed). [internal/env.CheckMode](../internal/env/env.go) runs at startup and returns an error if the file is group- or world-readable; the recorder refuses to boot in that state. |
+| Mitigation | Bucket A5 shipped the boot-time refusal-to-start check (`CheckMode`); `.env` mode is `0o600`; the check is documented in [docs/OPERATIONS.md](./OPERATIONS.md). PEM-on-disk path is operator-set; recommended convention is `./secrets/kalshi.pem` with `0o600`; `.gitignore` covers `secrets/`, `*.pem`, `*.key`, `.env*`. The same `CheckMode` predicate applies to the PEM file when loaded. A future `chmod` regression now surfaces as a refused boot, not silent. |
 | Owner | solo-operator |
-| Status | **PARTIAL** (`.env` mode is fixed; startup-time refusal check is pending) |
+| Status | **LIVE** (A5; chmod + startup refusal check) |
 
 ### Deploy-path drift (memory vs loop-prompt — pin to canonical systemctl)
 
 | Field | Value |
 |---|---|
 | Severity | **P1** |
-| Detection | `audit/00-map.md` §10: operator memory `project_isobar_prod_deploy.md` says `/root/isobar/...` on Vultr with `isobar-tape.service`; `scripts/loop-prompt.txt:3-5` references `/opt/isobar/...` and a separate `isobar` user. One is wrong; rolling forward on the wrong assumption breaks the next restart. |
-| Mitigation | (1) Commit canonical `deploy/isobar-tape.service` + `deploy/install.sh` to the repo so the deployment is reproducible from `main` without operator-memory dependence. (2) Strip `/opt/isobar/...` from `scripts/loop-prompt.txt` or update it to match the systemd unit file. (3) Pin the install layout in [docs/OPERATIONS.md](./OPERATIONS.md) (note: that doc was last touched 2026-04-22 and predates the prod deploy; updating it is on the same P1 triage round). |
+| Detection | `audit/00-map.md` §10: operator memory `project_isobar_prod_deploy.md` says `/root/isobar/...` on Vultr with `isobar-tape.service`; `scripts/loop-prompt.txt:3-5` references `/opt/isobar/...` and a separate `isobar` user. One is wrong; rolling forward on the wrong assumption breaks the next restart. SSH-from-Claude is classifier-rejected, so the operator must paste the `systemctl cat` output for the audit to commit ground truth. |
+| Mitigation | (1) Commit canonical `deploy/isobar-tape.service` + `deploy/install.sh` to the repo so the deployment is reproducible from `main` without operator-memory dependence. (2) Strip `/opt/isobar/...` from `scripts/loop-prompt.txt` or update it to match the systemd unit file. (3) Pin the install layout in [docs/OPERATIONS.md](./OPERATIONS.md). One force-push to `main` was authorized on 2026-05-13 (recorded in [ADR-0013](./decisions/0013-retire-pr9-paper-trader-lineage.md)); future force-pushes require explicit per-message authorization. |
 | Owner | solo-operator |
-| Status | **IN PROGRESS** |
+| Status | **PENDING — awaiting `systemctl cat` paste from operator** |
 
-### `ISOBAR_LIVE_ALLOW`: doc'd kill-switch that does nothing
+### `ISOBAR_LIVE_ALLOW`: live-trade gate (resolved — stripped from mutable docs)
 
 | Field | Value |
 |---|---|
 | Severity | **P1** |
-| Detection | Audit §7 + §14 P3 #8: the string `ISOBAR_LIVE_ALLOW` appears in `docs/research/04-dashboard-architecture.md` and `docs/decisions/0003-dashboard-stack.md` as the gate that "must be set to `1` for live trading to occur", but `grep -r ISOBAR_LIVE_ALLOW internal/ cmd/` returns nothing. The check does not exist. |
-| Mitigation | Two options, picked when Phase 1 exec scope review starts: (a) implement the check in `internal/config` so that any execution code refuses to send orders when `ISOBAR_LIVE_ALLOW != "1"`, defaulting to off; or (b) strip the reference from the docs and rely on the `./halt` file convention alone. Today the situation is the worst of both — operator may believe a gate is in place when it is not. |
+| Detection | The string `ISOBAR_LIVE_ALLOW` no longer appears in mutable docs ([audit/live-allow-trace.md](../audit/live-allow-trace.md) records the trace and decision). ADR-0003 retains the original Decision text (immutable per project policy) with a forward-note appendix recording the deferral. |
+| Mitigation | Stripped from mutable docs and `.env.example`; the live-trade gating mechanism will be re-introduced in a dedicated ADR when `cmd/bot` + `internal/exec` land (anticipated slot per the post-audit ADR sequence). Until then the `./halt` file convention (L0) is the only operator-facing gate, which is sufficient because no live-order path exists. |
 | Owner | solo-operator |
-| Status | **PENDING DECISION** |
+| Status | **RESOLVED** (Lane D stripped from mutable docs; future ADR will re-introduce when `cmd/bot` lands) |
 
 ### NY compliance regression
 
@@ -263,9 +320,12 @@ to compare server time vs local wall clock; drift > 250 ms warns,
   Phase 2's fill-sim-matches-reality comparison counts.
 - **Static config caps without tests.** Not caps; aspirations. Every
   cap ships with a property test.
-- **`ISOBAR_LIVE_ALLOW` as currently documented.** It is documented
-  but unimplemented (`audit/00-map.md` §7); see the P1 entry above.
-  Currently not a control we can rely on.
+- **`ISOBAR_LIVE_ALLOW` as previously documented.** Stripped from
+  mutable docs per [audit/live-allow-trace.md](../audit/live-allow-trace.md);
+  ADR-0003 retains the historical Decision text with a forward note.
+  The variable name is non-binding and the gate is deferred to the
+  ADR that lands `cmd/bot` + `internal/exec`. Not a control we
+  currently rely on.
 
 ## Risk-change procedure
 
@@ -314,6 +374,18 @@ Risk parameters are never tweaked "just for this session".
   appearance in an error path is itself a bug to fix.
 
 ---
+
+## Held for Phase 2 (Bucket B)
+
+Phase 1's line audit surfaced 35 P1 findings. Bucket A closed 17 of
+them (the rows flipped to `LIVE` / `LIVE-IMPROVED` / `RESOLVED`
+above). The remaining ~18 are held for Phase 2; the authoritative
+routing table is [audit/02-architecture.md §4.4](../audit/02-architecture.md)
+which maps each Bucket B P1 onto a proposed ADR slot (ADR-0014
+through ADR-0020). Those are reserved slots described as **proposal
+only, pending per-decision sign-off** in audit/02-architecture.md;
+none are accepted yet, and nothing in this document treats them as
+authoritative.
 
 ## Known unknowns
 
@@ -380,6 +452,17 @@ audit) does not mistake silence for absence.
   — canary fired
 - [ADR-0010](./decisions/0010-t-minus-3h-bayesian-update.md) — T−3h
   Bayesian update foundation
-- ADR-0011 (in flight per user instruction) — journal
-  backpressure / silent frame drop mitigation
-- ADR-0012 (planned next slot) — calibration validation harness
+- [ADR-0011](./decisions/0011-journal-backpressure.md) — journal
+  backpressure: drop-with-counter + sampled debug log + alarm hook
+- [ADR-0012](./decisions/0012-time-source-discipline.md) —
+  time-source discipline: Clock interface + clockcheck analyzer
+- [ADR-0013](./decisions/0013-retire-pr9-paper-trader-lineage.md) —
+  retire the PR#9 paper-trader/scoring lineage at the Bucket A
+  force-push; recovery paths catalogued
+- [audit/01-line-audit.md](../audit/01-line-audit.md) appendix — Bucket A
+  status (what shipped) + Bucket B held for Phase 2
+- [audit/02-architecture.md](../audit/02-architecture.md) — Phase 2
+  proposed structural decisions (ADR-0014–0020, **proposal only,
+  pending per-decision sign-off**) + §4.4 Bucket B routing table
+- [audit/live-allow-trace.md](../audit/live-allow-trace.md) —
+  `ISOBAR_LIVE_ALLOW` deferral decision

@@ -4,7 +4,14 @@
 > trading, and the failure modes we refuse to have. Written
 > 2026-05-13 to reflect the post-canary state (ADR-0009 fired) and
 > the response (ADR-0010 + the planned validation harness in the next
-> ADR slot after 0011).
+> ADR slot after 0011). Refreshed same day post-Bucket-A close: see
+> [ADR-0011](./decisions/0011-journal-backpressure.md),
+> [ADR-0012](./decisions/0012-time-source-discipline.md), and
+> [ADR-0013](./decisions/0013-retire-pr9-paper-trader-lineage.md) for
+> the canonical references. The Phase 2 structural decisions
+> (ADR-0014–0020) are **proposed in
+> [audit/02-architecture.md](../audit/02-architecture.md), pending
+> per-decision sign-off** — none are authoritative yet.
 
 ## In one paragraph
 
@@ -144,6 +151,19 @@ Until that tool runs and clears its primary gate, the T−3h Bayesian
 update is not wired into the live scan path. The package compiles
 and its tests pass; integration is gated.
 
+**Bucket A boundary event — PR#9 paper-trader lineage retired.**
+The Bucket A close force-pushed `main` to drop 11 commits of
+`cmd/paper-trader` + `cmd/fillability` + `cmd/score` + `cmd/settle` +
+`cmd/backfill-score` + `internal/papertrade` work merged via PRs
+#7–#9 ahead of the audit (out of scope for Phase 1's "no new
+capability" framing; binaries no longer compiled against the
+post-Bucket-A `internal/edge` API). Nothing is lost:
+[ADR-0013](./decisions/0013-retire-pr9-paper-trader-lineage.md)
+catalogues commit SHAs, PR refs, and audit backup branches
+(`audit/2026-05-13` + `audit/2026-05-13-post-bucket-a`) for
+cherry-pick + migration when the `cmd/bot` ADR unblocks the
+live-money path.
+
 ### Decision gate (before any real-money order)
 
 The bot does not place a real-money order until **all four** of
@@ -259,10 +279,13 @@ Cross-linked with [docs/RISK.md](./RISK.md). Quick list:
    reuse it; Kalshi de-dupes.
 3. **Silent fill loss.** Fills observed on WS are persisted to disk
    *before* in-memory position state updates. The recorder's
-   journal-write path is non-blocking and drops on a full queue
-   today (P1 in [`audit/00-map.md` §14](../audit/00-map.md);
-   tracked as ADR-0011 journal-backpressure); the exec path will
-   not adopt that pattern.
+   journal-write path is non-blocking and drops on a full queue;
+   [ADR-0011](./decisions/0011-journal-backpressure.md) is now
+   accepted and Bucket A1+A2 shipped the per-source counter +
+   sampled debug log + alarm hook + boot-time tripwire test
+   (`cmd/tape/main_test.go::TestProdJournalHasAlarmHookWired`).
+   The exec path will not adopt the non-blocking pattern — it
+   will choose blocking-with-deadline once `cmd/bot` lands.
 4. **Clock drift.** Signed requests fail if local clock drifts > 1
    min from Kalshi server time. Drift > 250 ms warns; > 1 s halts
    trading (RISK.md L4).
@@ -271,12 +294,16 @@ Cross-linked with [docs/RISK.md](./RISK.md). Quick list:
    bump should produce a decode warning, not a silent misprice.
 6. **Kill switch.** `./halt` file present ⇒ no orders leave the
    process (RISK.md L0).
-7. **`ISOBAR_LIVE_ALLOW`.** Documented as a live-trade gate in
-   [docs/decisions/0003-dashboard-stack.md](./decisions/0003-dashboard-stack.md)
-   and the research notes but **not read by any Go file today**
-   (audit P3 #8). Logged as a risk; treated as PENDING DECISION in
-   RISK.md until either implemented or stripped from the docs
-   before Phase 1 exec ships.
+7. **`ISOBAR_LIVE_ALLOW`.** Previously documented as a live-trade
+   gate in ADR-0003; the audit found the variable was unread by any
+   Go file. The reference is now stripped from mutable docs per
+   [audit/live-allow-trace.md](../audit/live-allow-trace.md); ADR-0003
+   retains the historical Decision text (immutable per project
+   policy) with a forward-note appendix. The live-trade gating
+   mechanism is deferred to the dedicated ADR that lands `cmd/bot`
+   + `internal/exec`; today the only operator-facing gate is the
+   `./halt` file convention (L0), which is sufficient because no
+   live-order code exists.
 
 ## What we will not do
 
@@ -313,11 +340,23 @@ cost** sections. Current canon for the post-Phase-0 calibration arc:
   Bayesian (Track B)
 - [ADR-0010](./decisions/0010-t-minus-3h-bayesian-update.md) —
   T−3h Bayesian update math and gates
-- ADR-0011 (in flight per the user instruction) — journal
-  backpressure / silent frame drop mitigation
-- ADR-0012 (planned, next slot) — calibration validation harness;
-  the primary gate the bot must clear before any real-money
-  trade
+- [ADR-0011](./decisions/0011-journal-backpressure.md) — journal
+  backpressure (accepted; landed via Bucket A1+A2)
+- [ADR-0012](./decisions/0012-time-source-discipline.md) —
+  time-source discipline: Clock interface + clockcheck analyzer
+  (accepted; landed via Bucket A4+A8)
+- [ADR-0013](./decisions/0013-retire-pr9-paper-trader-lineage.md) —
+  retire the PR#9 paper-trader / scoring lineage at the Bucket A
+  force-push; recovery paths catalogued
+- ADR-0014 through ADR-0020 — Phase 2 structural decisions
+  **proposed in [audit/02-architecture.md](../audit/02-architecture.md),
+  pending per-decision sign-off** (error-handling discipline,
+  schema-migration policy, station-registry consolidation,
+  `internal/edge` directional-split deferral, role boundaries,
+  CLI test discipline, `internal/`-only rule). None are accepted yet.
+- Calibration validation harness (still planned; ADR slot pending
+  per the post-Phase-2 sequence) — the primary gate the bot must
+  clear before any real-money trade.
 
 Decisions are never silent. A strategy is a hypothesis;
 hypotheses deserve timestamped evidence.

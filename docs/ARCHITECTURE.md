@@ -19,6 +19,16 @@
 - **Hot-path discipline.** The recorder never decodes. Bytes from the
   socket are stamped + journaled, and decoding happens in the analyzer
   where latency doesn't matter and schema changes are cheap to fix.
+- **Time-source discipline (ADR-0012).** Every wall-time read in
+  `internal/*` flows through `clock.Clock` (preferred for new code) or
+  a `now func() time.Time` field on a struct (existing pattern in
+  `internal/kalshi`, `internal/openmeteo`). Direct `time.Now`,
+  `time.Since`, `time.Until` calls outside the allowlist
+  (`internal/clock`, `cmd/*/main.go`, `*_test.go`,
+  `//nolint:clockcheck`) are rejected by the `clockcheck` custom
+  analyzer in `tools/clockcheck/`, wired into `make lint`. See
+  `internal/clock/clock.go` for the `Clock` / `Wall` / `FakeClock`
+  seam and ADR-0012 for the full doctrine.
 
 ## Directory layout (current)
 
@@ -54,10 +64,11 @@ internal/
                               fee model, ticker parser, bracket
                               resolution with sibling-aware T-direction
                               inference, truth-file index, and the Scan
-                              entrypoint for cmd/edge-scan. Replaces the
-                              prior internal/openmeteo/ensemble.go,
-                              internal/market/fee.go, and the standalone
-                              cmd/edge-scan/scanner.go (post-refactor).
+                              entrypoint for cmd/edge-scan. The ensemble
+                              decoder and fee model used to live in
+                              internal/openmeteo and internal/market;
+                              both were consolidated here so the scanner
+                              owns the offline-only surface end-to-end.
   env/                        Stdlib-only .env loader.
   journal/                    Append-only rotating JSONL writer with
                               size + age rotation, batched fsync, gzip
@@ -111,8 +122,18 @@ reports/
 
 docs/
   research/                   8 research reports + SYNTHESIS.md.
-  decisions/                  10 ADRs (0001-0010); ADR-0010 proposes
-                              the T−3h Bayesian update.
+  decisions/                  13 ADRs (0001-0013). ADR-0010 proposes the
+                              T−3h Bayesian update; ADR-0011/0012/0013
+                              are the Bucket A hardening decisions
+                              (journal backpressure, time-source
+                              discipline, PR#9 retirement).
+
+tools/
+  clockcheck/                 Custom x/tools/go/analysis analyzer that
+                              flags direct time.Now/time.Since/time.Until
+                              calls outside the ADR-0012 allowlist.
+                              Wired into `make lint` via
+                              `tools/clockcheck/cmd/clockcheck`.
 ```
 
 *Historical note:* `internal/coinbase` (public Coinbase WS subscriber)
@@ -148,10 +169,17 @@ produces a clean drain.
 
 - `Stamp.Wall` is `UnixNano` (UTC).
 - `Stamp.Mono` is nanoseconds since process start.
-- Both fields are sampled from the *same* `time.Now()` call; they refer to
-  the same physical event.
+- Both fields are sampled from the *same* `Clock.Now()` observation; they
+  refer to the same physical event.
 - Wall is the **only** cross-process comparable field. Use monotonic only
   for in-process interval measurement.
+- Per ADR-0012, the package now exports a `Clock` interface with two
+  implementations: `Wall()` returns the production singleton backed by
+  `time.Now`; `Fake(initial)` returns a `*FakeClock` for deterministic
+  tests (`Advance`, `Set`, concurrent-safe). `InitForTest(c)` reanchors
+  the package-level `Stamp.Mono` origin for tests that exercise `Now()`
+  directly. The clockcheck analyzer (`tools/clockcheck/`) enforces this
+  discipline at lint time — see the guiding constraint above.
 
 ### `internal/journal`
 
@@ -166,7 +194,22 @@ produces a clean drain.
 - Rotation is size-based (`MaxFileBytes`) or age-based (`MaxFileAge`),
   whichever fires first. Rotated files are optionally gzipped.
 - On-disk shape: newline-delimited JSON, one envelope per line, with keys
-  `t` (wall), `m` (mono), `src`, `k` (kind), `p` (raw payload).
+  `t` (wall), `m` (mono), `src`, `k` (kind), `p` (raw payload), and
+  `v` (schema version, `isobar.journal/v1`; readers rewrite missing
+  `v` to `v0-legacy` for back-compat).
+- Per ADR-0011, the queue-full drop path is **operator-visible**.
+  `Options.OnDropAlarm` is *required* — `Open` returns
+  `ErrAlarmHookRequired` if nil — and is invoked at most once per
+  crossing edge (drops sustained at ≥ `AlarmThreshold` per second for
+  ≥ `AlarmSustain`). The hook is panic-safe: a panicking operator
+  callback is logged + counted (`AlarmHookPanicTotal`) but never kills
+  the writer goroutine. `cmd/tape` installs its own sink in
+  `cmd/tape/alarms.go` that appends one JSONL line per crossing to
+  `data/alarms/<YYYY-MM-DD>.jsonl` (lazily opened, civil-date-rotated,
+  fsynced + closed in the errgroup-shutdown defer chain) alongside a
+  structured `slog.Error` and a process-wide `JournalDropsTotal`
+  counter — the tripwire that fails the build if `cmd/tape` ever
+  drops the hook is `TestProdJournalHasAlarmHookWired`.
 
 ### `internal/config`
 
@@ -452,7 +495,9 @@ column reference.
 
 Foundation for the T−3h precision-weighted Gaussian posterior update
 proposed in ADR-0010. **Not yet wired into the scan path** — integration
-is gated on ADR-0011's held-out evaluation harness.
+is gated on a held-out evaluation harness that ADR-0010 names as a
+follow-up, not yet ratified as its own ADR (the original 0011 slot
+was reassigned to journal backpressure during the audit).
 
 - `Update(prior, obs, kernel) → Posterior` is the pure math primitive:
   `1/σ²_post = 1/σ²_prior + 1/σ²_obs`,
@@ -474,8 +519,8 @@ is gated on ADR-0011's held-out evaluation harness.
   rather than meaningful predictive uncertainty.
 - The kernel fitter lives in `cmd/calibrate-bayesian` and is a scaffold
   today (flags wired, fit body pending). Integration into edge-scan
-  follows once ADR-0011's evaluation harness shows the update clears
-  its gate.
+  follows once the held-out evaluation harness (ADR-0010 follow-up)
+  shows the update clears its gate.
 
 ### `internal/obs`
 
@@ -543,6 +588,22 @@ If the gate continues to fail after the methodology improvements above,
 the project pivots from "trading bot" to "forecasting research artifact"
 per the v2 report's recommendation. None of the future packages would
 be built in that scenario.
+
+**ADR-0013 (PR#9 retirement).** An earlier branch carried a
+paper-trader / fillability / score / settle / backfill-score lineage
+toward this future shape; it was retired from `main` to keep the
+hardening audit focused. Recovery paths (re-extract from git history,
+or rebuild against the post-audit base) are spelled out in ADR-0013.
+None of the retired code is present in current `main`.
+
+**Phase 2 architecture decisions** are proposed in
+[audit/02-architecture.md](../audit/02-architecture.md) (pending
+per-decision sign-off; reserved ADR slots 0014-0020): error-handling
+discipline, schema-migration policy, station-registry consolidation
+into `internal/market`, deferral of the `internal/edge` directional
+split until ADR-0010 Bayesian wiring, three-role record/calibrate/trade
+architecture, CLI binary test discipline, and the `internal/`-only
+package-layout commitment. None of these are accepted ADRs today.
 
 ## Why it's laid out this way
 
