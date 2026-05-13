@@ -132,6 +132,17 @@ func Scan(opts ScanOptions) (*Result, error) {
 		return nil, fmt.Errorf("discover kalshi files: %w", err)
 	}
 
+	// First pass: discover every unique parsed Spec in the scan window so
+	// we can group them by (series, valid_date) and resolve T-brackets
+	// with sibling-aware direction inference. Without this pre-pass, a
+	// "low-side" T market (e.g. KXLOWTNYC-T56 in a market whose B-brackets
+	// start at B58.5) silently resolves as high-side and p_fair is
+	// computed against the wrong threshold.
+	siblings, err := collectSiblings(kalshiFiles)
+	if err != nil {
+		return nil, fmt.Errorf("collect siblings: %w", err)
+	}
+
 	err = replay.ForEachFrame(kalshiFiles, func(env replay.Envelope, _ int, _ bool) error {
 		res.TotalFrames++
 		var kf replay.KalshiFrame
@@ -183,12 +194,14 @@ func Scan(opts ScanOptions) (*Result, error) {
 			return fmt.Errorf("daily extremes: %w", err)
 		}
 
-		// Resolution; T-bracket direction needs sibling context — a future
-		// pass over per-(series,date) ticker sets could populate this. For
-		// the v0 lower bound, default high-side is fine for the high-end T
-		// markets and gives a known-wrong p_fair for the low-end ones (we
-		// flag those in SkippedReason so the summary highlights the issue).
-		resolution := spec.Resolve()
+		// Resolution. T-brackets default to high-side (≥ K). The first-pass
+		// scan over Kalshi files (above) groups every observed Spec by
+		// (series, valid_date) so ResolveWithSiblings can flip a T-bracket
+		// to low-side when its key sits below the lowest sibling B-bracket
+		// midpoint. Bracket convention itself is still tagged FIXME in
+		// resolution.go.
+		sibKey := siblingKey(spec.Series, spec.ValidDate)
+		resolution := ResolveWithSiblings(spec, siblings[sibKey])
 
 		// Naive p_fair = fraction of members whose daily extreme falls in
 		// the bracket. KXHIGH* uses TMAX, KXLOWT* uses TMIN. We also sum
@@ -329,6 +342,58 @@ func Scan(opts ScanOptions) (*Result, error) {
 	// Stable sort by ts for deterministic CSV output.
 	sort.Slice(res.Rows, func(i, j int) bool { return res.Rows[i].TsMs < res.Rows[j].TsMs })
 	return res, nil
+}
+
+// siblingKey is the canonical bucket for "specs in the same market family
+// on the same civil day", used to look up siblings when resolving
+// T-bracket direction. Variable is implicit in series prefix (KXHIGH* vs
+// KXLOWT*), so series+valid_date is sufficient.
+func siblingKey(series string, validDate time.Time) string {
+	return series + "|" + validDate.Format("2006-01-02")
+}
+
+// collectSiblings does a first pass over every Kalshi trade frame in the
+// scan window, parses each unique market_ticker into a Spec, and groups
+// the Specs by siblingKey. The returned map's slices each contain every
+// Spec observed for that (series, valid_date) bucket — which is exactly
+// the input ResolveWithSiblings expects.
+//
+// Errors only on file-level IO problems; malformed trade frames and
+// non-weather tickers are silently skipped (the main scan loop counts
+// those separately).
+func collectSiblings(kalshiFiles []string) (map[string][]Spec, error) {
+	seenTicker := map[string]bool{} // dedupe by raw ticker
+	out := map[string][]Spec{}
+	err := replay.ForEachFrame(kalshiFiles, func(env replay.Envelope, _ int, _ bool) error {
+		var kf replay.KalshiFrame
+		if err := json.Unmarshal(env.Payload, &kf); err != nil {
+			return nil
+		}
+		if kf.Type != "trade" {
+			return nil
+		}
+		var msg tradeMsg
+		if err := json.Unmarshal(kf.Msg, &msg); err != nil {
+			return nil
+		}
+		if seenTicker[msg.MarketTicker] {
+			return nil
+		}
+		seenTicker[msg.MarketTicker] = true
+		spec, err := ParseTicker(msg.MarketTicker)
+		if err != nil {
+			// Non-weather or malformed ticker — skip silently here; the
+			// main scan loop will count these per-trade.
+			return nil
+		}
+		k := siblingKey(spec.Series, spec.ValidDate)
+		out[k] = append(out[k], spec)
+		return nil
+	})
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	return out, nil
 }
 
 // stationLocation returns the IANA timezone for each Kalshi-resolved
