@@ -974,3 +974,63 @@ If product wants to keep it: move to `experiments/peek/`.
 Per the cadence rule: **stopping here.** Phase 2 (architecture reconsider) waits for confirmation.
 
 Phase 2 will look at: domain/transport/storage seams, interface contracts at consumer boundaries, package-by-tech vs package-by-domain layout, value-object invariants, where a clearance-grade reviewer would point and say "footgun", concurrency/retry/timeout/backpressure consistency, reusability across services.
+
+---
+
+# Appendix — Bucket A status (post-merge, 2026-05-13)
+
+After Phase 1 the product lead split the 35 P1s into **Bucket A** (fix now — shape-stable under Phase 2 restructure) and **Bucket B** (hold for Phase 2 — structural decision pending). Bucket A is now closed. 11 PRs landed, plus 1 post-merge nolint annotation.
+
+## Closed in Bucket A
+
+| # | Title | Source finding | Branch (merged) |
+|---|---|---|---|
+| A1+A2 + S4(write) | Journal alarm hook wired in cmd/tape + panic-safe `OnDropAlarm` + envelope `"v"` field | journal §P1 #1, #3, prior-review S4 | `fix/journal-alarm-hook-and-envelope-v` |
+| A3 | Orderbook snapshot-error state machine (uninitialized → typed errors → counter) | replay §P1 #1, #2 | `fix/orderbook-snapshot-error-state-machine` |
+| A4 + A8 | `internal/clock` Clock interface + Fake/Wall + `clockcheck` analyzer + ADR-0012 + MOS determinism | utility §P1 (clock), calibration §P1 #2 (mos) | `feat/clock-injection-adr-0012` |
+| A5 | Kalshi WS app-level liveness watchdog (ping + read-deadline + reconnect on starvation) | kalshi §P1 #4 | `fix/kalshi-client-and-ws-hardening` |
+| A6a | Kalshi explicit `*http.Transport` with per-stage timeouts + TLS 1.2 min | kalshi §P1 #1 | (same branch) |
+| A6b | `Retry-After` parsing + 5xx-retry + typed `ErrAuth` on 401/403 | kalshi §P1 #6 + prior-review F1.3, F1.4 | (same branch) |
+| A6c | `minDelay` success-counter decay | prior-review F1.5 | (same branch) |
+| A6d | Ctx-aware `throttle` (was non-cancellable `time.Sleep`) | prior-review F1.7 | (same branch) |
+| A7 | Feb 29 climate aliasing — leap-year-aware `dayOfYear` | calibration §P1 #3 | `fix/climate-feb29-aliasing` |
+| A9 | Delete dead `internal/market/ticker.go` (−284 LOC) | utility §P1 (market) | `chore/delete-dead-ticker-and-resolve-resolution-fixmes` |
+| A10 | Resolve `internal/edge/resolution.go:28-65` FIXMEs (one resolved, one documented with counter+log) | edge §P1 #5, #6 | (same branch) |
+| A11 | `Poll.ModelSet` precompute cache (gate criteria PASSED — −99.99% ns/op, −100% allocs) | prior-review F2.2 | `perf/poll-modelset-cache` |
+
+Plus post-merge fix [b99423e](../internal/kalshi/client.go) — `time.Until` in `withCallDeadline` annotated `//nolint:clockcheck` per ADR-0012's escape-hatch policy (ctx.Deadline is intrinsically wall-bound).
+
+**All gates green on merged main**: `go build` / `go vet` / `gofmt` / `go test -race -count=1` (every package) / `make lint` (golangci-lint **0 issues** + custom clockcheck analyzer **0 violations**).
+
+## Held for Phase 2 (Bucket B)
+
+| Item | Why held | Source |
+|---|---|---|
+| 3 station-mapping tables drifting (edge/scan, edge/poll_index, edge/ticker) | Phase 2 consolidates into `internal/market` as single source of truth | edge cross-cutting |
+| Kalshi REST 429-retry on POST | Latent — no POST callers outside `cmd/bot` (deferred until audit closes). Gating issue for live trading. | kalshi §P1 #3 |
+| Schema-migration policy (mos, bayesian, **journal v0-legacy**, isobar-tape.boot) | Phase 2 decides write/read migration discipline. Today journal accepts un-versioned legacy frames as `v0-legacy` indefinitely. | calibration cross-cutting + prior-review §S4 |
+| Silent skip-and-count error policy across edge/replay/journal/cliparse | Structural — Phase 2 proposes typed-error / escalation / counter taxonomy as a policy ADR | edge §P3, replay §P1, cliparse §P2 |
+| 5 production binaries with zero tests (edge-scan, calibrate-fit, calibrate-parse-cli, analyze, peek) | Phase 2 first decides which survive consolidation; testing dead binaries (peek, calibrate-bayesian scaffold) is wasted work | cmd §cross-cutting |
+| `internal/edge` split (decode / probability / scan) before Bayesian integration | Phase 2 design observation §S1 | prior-review |
+| Record/calibrate/trade three-role split (vs current two roles) | Phase 2 design observation §S2 | prior-review |
+| Extract `WeatherSignal` from `Scan` for future Signal interface seam | Phase 2 design observation §S3 | prior-review |
+| Time-source-discipline doctrine across packages | Partially closed by ADR-0012 + clockcheck (write-side enforcement); Phase 2 may extend to cover envelope timestamps + monotonic-vs-wall guidance | prior-review §S5 |
+| 7 ADR-gap candidates from prior-review §3 (journal schema versioning, recorder-no-decode invariant, edge consolidation, sonic choice, JSONL format, poll cadence, internal-only rule, fee model) | Phase 2 writes these — engineering-doctrine ADRs | prior-review §3 |
+
+## Deferred (gating issues — not Bucket B)
+
+- **`cmd/bot` and any live-order path**: deferred until audit closes per pure-hardening rule.
+- **Deploy ground truth** (`systemctl cat isobar-tape.service` from prod host): blocked on user paste — SSH classifier-rejected. User will paste verbatim out-of-band.
+
+## Three regression tripwires now live (shipped with their A-items)
+
+1. **Alarm-hook-wired**: `cmd/tape/main_test.go::TestProdJournalHasAlarmHookWired` fails the build if `journal.Open` is ever called without `OnDropAlarm`. (A1)
+2. **No-naked-`time.Now()`**: `tools/clockcheck` analyzer, wired into `make lint`. Fails the build on any new `time.Now(` outside `internal/clock`, `cmd/*/main.go`, `*_test.go`, or `//nolint:clockcheck` exempted. (A4)
+3. **Tracked-vs-gitignore**: shipped earlier in Lane D (`.github/workflows/ci.yml` step + `.githooks/pre-commit` hook). (defensive; from Phase 0 P1 triage)
+
+## Ground state count
+
+Phase 1 surfaced 35 P1 findings. Bucket A closed 17 of them (the 11 PRs above cover multiple cited line items). Bucket B holds the other 18, all routed to Phase 2.
+
+Net code change in Bucket A (vs pre-bucket main `dee0df4`): roughly +3500 LOC of production code + tests + docs + tooling, −400 LOC of dead code. ADRs: 0011 (already accepted) + 0012 (new, accepted).
+
