@@ -43,7 +43,7 @@ capital has been committed.
 
 ## What's shipped
 
-Six binaries plus three calibration / verification packages:
+Seven binaries plus calibration / verification / scanner packages:
 
 ```
 cmd/tape                    Recorder (Kalshi WS + Open-Meteo REST → JSONL).
@@ -54,25 +54,69 @@ cmd/analyze                 Phase-0.5 sanity report over recorded journals.
 cmd/calibrate-parse-cli     NWS CLI bulletin zip → daily TMAX/TMIN CSV.
 cmd/calibrate-fit           OLS-fit MOS coefficients per (station,
                             season, variable) bin; outputs JSON.
+cmd/calibrate-bayesian      T−3h Bayesian-kernel fitter (ADR-0010
+                            foundation; flags wired, fit body pending).
 cmd/edge-scan               Joins recorded book state to ensemble polls,
                             applies all probability models (naive, MOS,
                             climate-shrunk, market-mid), emits per-bracket
-                            edge with full provenance columns.
+                            edge with full provenance columns. Also runs
+                            the realized-PnL backtest when --truth is set.
 
 internal/calibration/cliparse   NWS CLI bulletin parser (90.1% coverage).
-internal/calibration/mos        OLS bias correction + ProbBelow/Above.
+internal/calibration/mos        OLS bias correction + ProbBelow/Above,
+                                holdout-σ honesty, FitModelSet guard.
 internal/calibration/climate    Historical-frequency lookup with seasonal window
                                 + p_shrunk = w·climate + (1-w)·naive.
-internal/edge                   Offline scan engine, fee model, recorded poll decoder.
-internal/market                 Ticker parsing and station/location/TZ registry.
-internal/openmeteo              Open-Meteo REST poller for live recording.
+internal/calibration/bayesian   T−3h precision-weighted Gaussian posterior
+                                update (foundation only; not yet wired into Scan).
+internal/edge                   Offline scan engine: ensemble decoder, fee model,
+                                ticker parser, bracket resolution (with
+                                sibling-aware T-direction), truth index, Scan.
+internal/market                 Station/series/TZ registry. No fee model
+                                here anymore — it moved to internal/edge.
+internal/openmeteo              Live Open-Meteo REST poller. Multi-model via
+                                Options.Model = "gfs_seamless,ecmwf_ifs025".
 internal/replay                 JSONL journal reader + orderbook reconstruction.
 internal/journal                Crash-safe rotating JSONL writer.
 internal/kalshi                 RSA-signed REST + authenticated WS subscriber
                                 with rolling re-discovery.
 ```
 
-13 Go packages, 0 lint issues, all binaries build via `make build-all`.
+15 internal Go packages, 0 lint issues, all binaries build via `make build-all`.
+
+**What landed in this iteration (Lane A + Lane C).**
+
+- **Multi-model ensemble decoder (GFS + ECMWF).** The poll parser in
+  `internal/edge.ParsePoll` recognises Open-Meteo's multi-model field
+  names and tags each member with its source model
+  (`gfs:NN` / `ecmwf:NN`). The scanner's `pollModelSet` derives the
+  observed model set and compares it against `Coefficients.FitModelSet`,
+  refusing to apply GFS-only-trained MOS to a GFS+ECMWF poll. Parse +
+  guard are shipped; the recorder is still GFS-only by default — flip
+  by setting `openmeteo.model` in `config.yaml`.
+- **Realized-PnL backtest mode.** `cmd/edge-scan --truth <dir>` loads
+  `KSTATION.csv` truth files and scores every paired trade against
+  realized TMAX/TMIN. Trades without truth coverage are skipped (the
+  *no imaginary bets* rule). `scripts/run-backtest.sh` is the end-to-end
+  wrapper (fetch CLI bulletins → parse → run scan with `--truth`). See
+  `docs/BACKTEST.md` for the column reference.
+- **MOS calibration with the right σ.** `internal/calibration/mos`
+  now sources σ from holdout residuals when the holdout has
+  ≥`MinHoldoutForSigma` (30) pairs, falling back to training-σ
+  *with* a `SigmaSource` field labelling the fallback. Coefficients
+  are stamped with `FitModelSet` so the scanner can refuse mismatched
+  model sets at scan-time (`SkippedReason = "model_set_mismatch:..."`).
+- **Climate-shrunk-naive baseline.** Five-line shrinkage estimator
+  `p = 0.2·climate + 0.8·naive` shipped as a separate probability
+  column (`--climate <obs-dir>` on `edge-scan`) to test whether MOS
+  earns its complexity. The v2 floor report says it doesn't — see
+  ADR-0009.
+- **T−3h Bayesian update — foundation.** `internal/calibration/bayesian`
+  ships the math (`Update`, `LoadKernel`) and schema (`isobar.bayesian/v1`).
+  `cmd/calibrate-bayesian` defines the fit-pipeline CLI; the fit body
+  is deferred to a follow-up commit. Integration into Scan is gated on
+  the held-out evaluation harness proposed in ADR-0011. See ADR-0010
+  for the math and design rationale.
 
 **Hot-path principle.** The recorder does not decode WS frames. Bytes
 from the socket are wrapped in a thin envelope (timestamps + source tag)
@@ -97,7 +141,7 @@ See [`reports/INDEX.md`](./reports/INDEX.md) for the chain.
 
 ## Architectural decisions
 
-8 Architecture Decision Records (ADRs) under [`docs/decisions/`](./docs/decisions/),
+10 Architecture Decision Records (ADRs) under [`docs/decisions/`](./docs/decisions/),
 in dependency order:
 
 | ADR | Decision |
@@ -111,6 +155,7 @@ in dependency order:
 | 0007 | NWS CLI bulletins as calibration y-target |
 | 0008 | Deterministic GFS for first-pass MOS (canary now fired — see ADR-0009) |
 | 0009 | Trigger ensemble-spread NGR / ECMWF blend after MOS canary |
+| 0010 | T−3h Bayesian update of MOS prior via intraday observations (proposed) |
 
 ## Quickstart
 
@@ -137,9 +182,13 @@ set -a && source .env && set +a
 ./bin/calibrate-parse-cli --zip data/calibration/cli/KNYC.zip \
                          --start 2024-04-29 --end 2026-05-04
 ./bin/calibrate-fit --out data/calibration/mos-coefficients.json --holdout-days 90
-./bin/edge-scan --data ./data --out data/calibration/edge-scan \
+./bin/edge-scan --data ./data --start 2026-04-29 --end 2026-05-06 \
                 --mos data/calibration/mos-coefficients.json \
                 --climate data/calibration/obs
+
+# 7. Realized-PnL backtest (after CLI bulletins have been parsed
+#    into data/calibration/obs/KSTATION.csv)
+./scripts/run-backtest.sh --tape ./data --start 2026-04-29 --end 2026-05-06
 ```
 
 Recorded data lands under `./data/<source>/<YYYY-MM-DD>/<source>-<hour>.jsonl[.gz]`.
@@ -156,13 +205,15 @@ Recorded data lands under `./data/<source>/<YYYY-MM-DD>/<source>-<hour>.jsonl[.g
 
 - [Strategy](./docs/STRATEGY.md) — edge thesis and execution doctrine (note: needs v3 update post-Phase 0.5 v2)
 - [Architecture](./docs/ARCHITECTURE.md) — package layout and invariants
+- [Calibration](./docs/CALIBRATION.md) — MOS math, climate baseline, shrinkage, σ-source honesty
+- [Backtest](./docs/BACKTEST.md) — realized-PnL backtest pipeline + CSV column reference
 - [Roadmap](./docs/ROADMAP.md) — phase-by-phase with explicit gates
 - [Operations](./docs/OPERATIONS.md) — runbook and troubleshooting
 - [Risk](./docs/RISK.md) — the L0–L4 control hierarchy
 - [Testing](./docs/TESTING.md) — rules, coverage floors, CI expectations
 - [Glossary](./docs/GLOSSARY.md) — terms, defined once
 - [Research](./docs/research/) — 8 agent reports + [SYNTHESIS.md](./docs/research/SYNTHESIS.md)
-- [Decisions](./docs/decisions/) — 9 ADRs documenting major design choices
+- [Decisions](./docs/decisions/) — 10 ADRs documenting major design choices
 - [Reports](./reports/) — Phase 0.5 evaluation reports (see INDEX)
 
 Running log: [CHANGELOG.md](./CHANGELOG.md).
