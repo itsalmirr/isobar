@@ -109,3 +109,8 @@ tidy:
 .PHONY: clean
 clean:
 	rm -rf $(BIN_DIR) coverage.out coverage.html *.pprof
+
+.PHONY: install-hooks
+install-hooks:
+	git config core.hooksPath .githooks
+	@echo "pre-commit hooks installed (.githooks/)"
