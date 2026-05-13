@@ -293,6 +293,7 @@ Recorded data lands under `./data/<source>/<YYYY-MM-DD>/<source>-<hour>.jsonl[.g
 - Go 1.26+, `internal/` only (no `pkg/` until cross-binary need)
 - stdlib-first: `log/slog`, `errgroup`, `context`. Outside deps: `coder/websocket`, `yaml.v3`, `testify` (test-only)
 - `make all` runs lint + vet + race-tested unit tests + build
+- `make install-hooks` enables the pre-commit tripwire (refuses commits with gitignored-but-tracked files)
 - Secrets live in `./secrets/` (gitignored) or env vars with `ISOBAR_` prefix
 - Recorded data lives in `./data/` (gitignored)
 
