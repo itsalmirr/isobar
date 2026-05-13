@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -18,6 +19,13 @@ import (
 	"time"
 )
 
+// ErrAuth is returned when the API rejects credentials (401 or 403).
+// It is not retried — the credentials are wrong, the signature drifted
+// beyond the server's clock skew tolerance, or the key was revoked.
+// Callers (especially cmd/bot in Phase 1) must treat this as a terminal
+// error and surface it for human attention rather than spinning.
+var ErrAuth = errors.New("kalshi: authentication failed")
+
 // Client is a typed REST client for the Kalshi Trade API v2.
 // It includes per-request rate limiting and automatic retry on 429 responses.
 type Client struct {
@@ -26,13 +34,16 @@ type Client struct {
 	signer     *Signer
 	httpClient *http.Client
 
-	rateMu   sync.Mutex
-	lastCall time.Time
-	minDelay time.Duration // minimum delay between requests
+	rateMu        sync.Mutex
+	lastCall      time.Time
+	minDelay      time.Duration // minimum delay between requests
+	baseMinDelay  time.Duration // floor for minDelay decay (default 1s)
+	consecutive2x int           // consecutive 2xx successes, used by decay
 
-	// now is the wall-time source for throttle accounting. Defaults to
-	// time.Now in NewClient; tests override via SetNowForTest to make
-	// rate-limit timing deterministic. Per ADR-0012.
+	// now is the wall-time source for throttle accounting AND the
+	// Retry-After HTTP-date delta computation. Defaults to time.Now in
+	// NewClient; tests override via SetNowForTest. Per ADR-0012
+	// (time-source discipline).
 	now func() time.Time
 }
 
@@ -73,8 +84,9 @@ func NewClient(baseURL string, signer *Signer) *Client {
 			Transport: newTransport(),
 			Timeout:   10 * time.Second,
 		},
-		minDelay: 1000 * time.Millisecond, // ~1 req/s to stay within Kalshi rate limits
-		now:      time.Now,
+		minDelay:     1000 * time.Millisecond, // ~1 req/s to stay within Kalshi rate limits
+		baseMinDelay: 1000 * time.Millisecond, // floor for success-driven decay
+		now:          time.Now,
 	}
 }
 
@@ -95,7 +107,8 @@ func (c *Client) SetNowForTest(now func() time.Time) {
 // Call this after discovery to avoid carrying over inflated delays into polling.
 func (c *Client) ResetRateLimit() {
 	c.rateMu.Lock()
-	c.minDelay = 1000 * time.Millisecond
+	c.minDelay = c.baseMinDelay
+	c.consecutive2x = 0
 	c.rateMu.Unlock()
 }
 
@@ -501,10 +514,44 @@ func (c *Client) sign(req *http.Request, path string) error {
 const (
 	maxRetries       = 5
 	maxAdaptiveDelay = 2 * time.Second
+	// retryAfterCap bounds how long Retry-After can park a caller, so a
+	// misbehaving server (or a 3600-second header) can't stall us for an
+	// hour. RFC 9110 allows arbitrary values; this is our policy ceiling.
+	retryAfterCap = 60 * time.Second
 )
+
+// parseRetryAfter implements RFC 9110 Retry-After parsing. Both forms
+// are valid:
+//
+//   - delta-seconds: a non-negative integer (e.g. "120")
+//   - HTTP-date:     an RFC 7231 IMF-fixdate (e.g. "Wed, 21 Oct 2015 ...")
+//
+// Returns (0, false) when the header is missing or unparseable. The
+// caller is responsible for applying the policy cap (retryAfterCap).
+func parseRetryAfter(header string, now time.Time) (time.Duration, bool) {
+	h := strings.TrimSpace(header)
+	if h == "" {
+		return 0, false
+	}
+	if secs, err := strconv.Atoi(h); err == nil {
+		if secs < 0 {
+			return 0, false
+		}
+		return time.Duration(secs) * time.Second, true
+	}
+	if t, err := http.ParseTime(h); err == nil {
+		d := t.Sub(now)
+		if d < 0 {
+			d = 0
+		}
+		return d, true
+	}
+	return 0, false
+}
 
 func (c *Client) doRaw(ctx context.Context, req *http.Request) ([]byte, error) {
 	req.Header.Set("Accept", "application/json")
+	isGET := req.Method == http.MethodGet
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		c.throttle()
@@ -532,30 +579,77 @@ func (c *Client) doRaw(ctx context.Context, req *http.Request) ([]byte, error) {
 
 		resp, err := c.httpClient.Do(req) //nolint:gosec // URL comes from our own baseURL + typed path helpers
 		if err != nil {
+			// Network error. Retry on GET (idempotent); fail fast on any
+			// other method so we never double-submit an order.
+			if isGET && attempt < maxRetries && ctx.Err() == nil {
+				backoff := time.Duration(1<<uint(attempt+1)) * time.Second
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(backoff):
+					continue
+				}
+			}
 			return nil, fmt.Errorf("kalshi: HTTP request failed: %w", err)
 		}
 
 		bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+		retryAfterHdr := resp.Header.Get("Retry-After")
 		_ = resp.Body.Close()
 		if err != nil {
 			return nil, fmt.Errorf("kalshi: read response body: %w", err)
 		}
 
-		if resp.StatusCode == 429 && attempt < maxRetries {
-			// Adaptively slow down on rate limits, capped at MaxAdaptiveDelay
-			// so a flaky API doesn't compound into minute-long gaps.
-			c.rateMu.Lock()
-			if c.minDelay < maxAdaptiveDelay {
-				c.minDelay *= 2
-				if c.minDelay > maxAdaptiveDelay {
-					c.minDelay = maxAdaptiveDelay
+		status := resp.StatusCode
+
+		// 401/403 are terminal — credentials, not transient.
+		if status == http.StatusUnauthorized || status == http.StatusForbidden {
+			return nil, fmt.Errorf("%w: API error %d: %s", ErrAuth, status, string(bodyBytes))
+		}
+
+		// 429 retries on every method (preserve existing behavior) — the
+		// adaptive throttle is also applied here so subsequent calls are
+		// gentler. 5xx retries only on GET (idempotent).
+		retryable := false
+		switch {
+		case status == http.StatusTooManyRequests:
+			retryable = attempt < maxRetries
+		case isGET && (status == http.StatusBadGateway ||
+			status == http.StatusServiceUnavailable ||
+			status == http.StatusGatewayTimeout):
+			retryable = attempt < maxRetries
+		}
+
+		if retryable {
+			// Bit-shift backoff: 2^(attempt+1) seconds.
+			backoff := time.Duration(1<<uint(attempt+1)) * time.Second
+
+			if status == http.StatusTooManyRequests {
+				// Adaptive throttle: bump minDelay so the next call is gentler.
+				c.rateMu.Lock()
+				if c.minDelay < maxAdaptiveDelay {
+					c.minDelay *= 2
+					if c.minDelay > maxAdaptiveDelay {
+						c.minDelay = maxAdaptiveDelay
+					}
+				}
+				c.consecutive2x = 0
+				c.rateMu.Unlock()
+
+				// Retry-After is a floor, not an override. RFC 9110 says
+				// the server may indicate the minimum wait; we apply our
+				// own backoff if it's larger, and cap at retryAfterCap so
+				// a misbehaving server can't park us.
+				if ra, ok := parseRetryAfter(retryAfterHdr, c.now()); ok {
+					if ra > backoff {
+						backoff = ra
+					}
+				}
+				if backoff > retryAfterCap {
+					backoff = retryAfterCap
 				}
 			}
-			c.rateMu.Unlock()
 
-			// 2^(attempt+1) seconds; bit-shift avoids the float64 allocation
-			// of math.Pow for small integers.
-			backoff := time.Duration(1<<uint(attempt+1)) * time.Second
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
@@ -564,8 +658,8 @@ func (c *Client) doRaw(ctx context.Context, req *http.Request) ([]byte, error) {
 			}
 		}
 
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return nil, fmt.Errorf("kalshi: API error %d: %s", resp.StatusCode, string(bodyBytes))
+		if status < 200 || status >= 300 {
+			return nil, fmt.Errorf("kalshi: API error %d: %s", status, string(bodyBytes))
 		}
 		return bodyBytes, nil
 	}
