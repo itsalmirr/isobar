@@ -108,7 +108,7 @@ func stationFromTruthFilename(name string) (string, bool) {
 }
 
 func loadTruthFile(idx *TruthIndex, station, path string) error {
-	f, err := os.Open(path)
+	f, err := os.Open(path) //nolint:gosec // path is discovered from operator-supplied truth directory
 	if err != nil {
 		return err
 	}

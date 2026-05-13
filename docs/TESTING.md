@@ -68,13 +68,14 @@
 | `internal/config`      | 95%                  | Every `Validate` branch.           |
 | `internal/journal`     | 90%                  | Rotation, drop, roundtrip, shutdown. *Currently ~86%.* |
 | `internal/kalshi`      | 85%                  | All REST verbs + signer + ws subscribe msg + DiscoverOpenTickers + throttle + SetTickers/Reload. |
-| `internal/market`      | 90%                  | Ticker parser + fee model + station registry round-trip. |
-| `internal/openmeteo`   | 80%                  | URL build, error propagation, ensemble decoder. |
+| `internal/edge`        | 85%                  | Ticker parser + fee model + poll pairing + scan/backtest math. |
+| `internal/market`      | 90%                  | Station registry round-trip + market ticker parser. |
+| `internal/openmeteo`   | 80%                  | URL build, error propagation, live poller behavior. |
 | `internal/replay`      | 90%                  | Journal read + Kalshi frame decode + orderbook apply + ApplyFrameToBooks helper. |
 | `internal/retry`       | 95%                  | Jitter, Next, Do happy-path + ctx + max-attempts. |
 | `internal/calibration/cliparse` | 85%         | NWS bulletin parser + dedupe + gap report. |
 | `internal/calibration/mos`      | 90%         | OLS fit + Predict + ProbBelow + degenerate sigma. |
-| `internal/calibration/climate`  | 85%         | Frequency lookup + season window + ShrinkP + missing-column failure. |
+| `internal/calibration/climate`  | 85%         | Frequency lookup + range probability + season window + ShrinkP + missing-column failure. |
 
 Coverage is a floor, not a ceiling, and not a substitute for
 thinking — a 100%-covered function can still be wrong. But a package under

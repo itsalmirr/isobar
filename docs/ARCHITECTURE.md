@@ -43,6 +43,8 @@ internal/
   config/                     YAML + env overlay + validation. Field
                               `kalshi.rediscover_interval` controls the
                               recorder's rolling re-discovery cadence.
+  edge/                       Offline scan engine, recorded poll decoder,
+                              Kalshi fee model, and edge/backtest math.
   env/                        Stdlib-only .env loader.
   journal/                    Append-only rotating JSONL writer with
                               size + age rotation, batched fsync, gzip
@@ -50,11 +52,10 @@ internal/
   kalshi/                     RSA-signed REST client + signer +
                               authenticated WS subscriber with
                               SetTickers/Reload for graceful re-subscribe.
-  market/                     Ticker parsing, fee model (Kalshi parabolic),
-                              station/location/timezone metadata.
+  market/                     Ticker parsing and station/location/timezone
+                              metadata.
   obs/                        slog JSON bootstrap.
-  openmeteo/                  31-member GFS ensemble REST poller (live)
-                              + ensemble decoder for recorded polls.
+  openmeteo/                  Open-Meteo REST poller for live recording.
   replay/                     JSONL journal reader (plain + gz) +
                               orderbook reconstruction. Shared input
                               layer for cmd/analyze, cmd/edge-scan.
@@ -247,6 +248,8 @@ produces a clean drain.
 - `BracketProb` returns historical empirical frequency of the bracket
   condition restricted to a ±30-day calendar window around the target
   date.
+- `RangeProb` returns historical empirical frequency inside a half-open
+  Kalshi resolution range `[lo, hi)`, including open-ended thresholds.
 - `ShrinkP(naive, climate, w)` = `w·climate + (1-w)·naive`. NaN climate
   falls back to naive.
 - Used as a baseline against MOS per Pass 3 critique: if MOS doesn't

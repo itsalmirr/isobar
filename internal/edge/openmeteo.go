@@ -212,8 +212,8 @@ func (p *Poll) DailyExtremesF(civilDate time.Time, loc *time.Location) (
 	out := map[string]MemberDaily{}
 	for id, series := range p.Members {
 		var (
-			minC, maxC float64 = math.Inf(+1), math.Inf(-1)
-			n                  = 0
+			minC, maxC = math.Inf(+1), math.Inf(-1)
+			n          = 0
 		)
 		for i, t := range p.HourlyTimes {
 			if t.Before(startUTC) || !t.Before(endUTC) {
