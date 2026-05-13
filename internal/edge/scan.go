@@ -5,9 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"path/filepath"
 	"sort"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/wh0o0pz/isobar/internal/calibration/climate"
@@ -55,27 +58,37 @@ type ScanOptions struct {
 
 // EdgeRow is one trade-event record in the output CSV.
 type EdgeRow struct {
-	TsMs             int64
-	Ticker           string
-	Series           string
-	ValidDate        time.Time
-	BracketKind      string
-	BracketKey       float64
-	Side             string
-	TradePriceCents  int
-	PFairNaive       float64
-	PFairMOS         float64 // 0 if no MOS coeffs or bin missing
-	PFair            float64 // the p_fair actually used for edge math (MOS if available, else naive)
-	MOSApplied       bool
+	TsMs            int64
+	Ticker          string
+	Series          string
+	ValidDate       time.Time
+	BracketKind     string
+	BracketKey      float64
+	Side            string
+	TradePriceCents int
+	PFairNaive      float64
+	PFairMOS        float64 // 0 if no MOS coeffs, bin missing, or model-set mismatch
+	PFair           float64 // the p_fair actually used for edge math (MOS if applied, naive otherwise)
+	MOSApplied      bool
+
+	// SkippedReason is a per-row tag explaining why MOS was NOT applied
+	// to this trade. Possible values:
+	//   ""                              MOS was applied (MOSApplied=true)
+	//   "no_coeffs"                     ScanOptions.MOS was nil
+	//   "no_bin"                        no fitted bin for (station, season, variable)
+	//   "model_set_mismatch:<obs>vs<fit>"  poll's models ≠ coefficients.FitModelSet
+	SkippedReason string
+
 	ClimateP         float64 // NaN if no climate lookup or no matching observations
 	PFairClimate     float64 // climate-shrunk-naive p_fair; NaN if ClimateP is NaN
 	ClimateApplied   bool
 	EdgeClimateCents int
-	NMembers         int
-	NMembersInBkt    int
-	PollAgeS         int
-	FeeCents         int
-	EdgeCents        int
+
+	NMembers      int
+	NMembersInBkt int
+	PollAgeS      int
+	FeeCents      int
+	EdgeCents     int
 
 	// Backtest fields — populated only when ScanOptions.Truth is set.
 	HasTruth    bool   // true iff truth was looked up successfully
@@ -93,6 +106,13 @@ type Result struct {
 	PairedTrades  int
 	Rows          []EdgeRow
 	SkippedReason map[string]int
+
+	// MembersSkipped counts ensemble members dropped across all paired
+	// trades for failing the MinHourlySamplesPerMember coverage check.
+	// A non-zero value here means at least one member was sparse on at
+	// least one poll, but the row was still produced from the surviving
+	// member subset (previous behaviour was to drop the whole trade).
+	MembersSkipped int
 
 	// Backtest aggregates — only populated when ScanOptions.Truth is set.
 	BacktestEnabled bool
@@ -149,7 +169,34 @@ func Scan(opts ScanOptions) (*Result, error) {
 		return nil, fmt.Errorf("discover kalshi files: %w", err)
 	}
 
-	walkErr := replay.ForEachFrame(kalshiFiles, func(env replay.Envelope, _ int, _ bool) error {
+	// First pass: discover every unique parsed Spec in the scan window so
+	// we can group them by (series, valid_date) and resolve T-brackets
+	// with sibling-aware direction inference. Without this pre-pass, a
+	// "low-side" T market (e.g. KXLOWTNYC-T56 in a market whose B-brackets
+	// start at B58.5) silently resolves as high-side and p_fair is
+	// computed against the wrong threshold.
+	siblings, err := collectSiblings(kalshiFiles)
+	if err != nil {
+		return nil, fmt.Errorf("collect siblings: %w", err)
+	}
+
+	// Once-per-distinct-pair throttle for "observed vs fit" model-set
+	// mismatch warnings, so a single misconfigured run doesn't flood the
+	// logs with one line per trade.
+	var mmLogOnce sync.Map // key = "obs|fit" string → struct{}
+	var fitModelSet []string
+	if opts.MOS != nil {
+		fitModelSet = mos.CanonicalModelSet(opts.MOS.FitModelSet)
+		if len(fitModelSet) == 0 {
+			// Defensive: an in-memory Coefficients{} built without
+			// LoadCoefficients may have no FitModelSet. Log a single
+			// warning and proceed; the per-trade guard below will skip
+			// every MOS apply via the model_set_mismatch branch.
+			log.Printf("edge: MOSCoefficients.FitModelSet is empty; MOS will not be applied to any row")
+		}
+	}
+
+	err = replay.ForEachFrame(kalshiFiles, func(env replay.Envelope, _ int, _ bool) error {
 		res.TotalFrames++
 		var kf replay.KalshiFrame
 		if decodeErr := json.Unmarshal(env.Payload, &kf); decodeErr != nil {
@@ -192,7 +239,7 @@ func Scan(opts ScanOptions) (*Result, error) {
 			res.SkippedReason["unknown_station_tz"]++
 			return nil //nolint:nilerr // unknown stations are counted and skipped
 		}
-		extremes, extremesErr := poll.DailyExtremesF(spec.ValidDate, tz)
+		extremes, skipped, extremesErr := poll.DailyExtremesFWithSkip(spec.ValidDate, tz)
 		if extremesErr != nil {
 			if errors.Is(extremesErr, ErrInsufficientCoverage) {
 				res.SkippedReason["insufficient_poll_coverage"]++
@@ -200,13 +247,20 @@ func Scan(opts ScanOptions) (*Result, error) {
 			}
 			return fmt.Errorf("daily extremes: %w", extremesErr)
 		}
+		// Diagnostic: how many ensemble members were dropped for partial
+		// coverage on this trade-poll pairing. Aggregate counter only —
+		// not a per-row field, since the row's NMembers already reflects
+		// the surviving subset.
+		res.MembersSkipped += skipped
 
-		// Resolution; T-bracket direction needs sibling context — a future
-		// pass over per-(series,date) ticker sets could populate this. For
-		// the v0 lower bound, default high-side is fine for the high-end T
-		// markets and gives a known-wrong p_fair for the low-end ones (we
-		// flag those in SkippedReason so the summary highlights the issue).
-		resolution := spec.Resolve()
+		// Resolution. T-brackets default to high-side (≥ K). The first-pass
+		// scan over Kalshi files (above) groups every observed Spec by
+		// (series, valid_date) so ResolveWithSiblings can flip a T-bracket
+		// to low-side when its key sits below the lowest sibling B-bracket
+		// midpoint. Bracket convention itself is still tagged FIXME in
+		// resolution.go.
+		sibKey := siblingKey(spec.Series, spec.ValidDate)
+		resolution := ResolveWithSiblings(spec, siblings[sibKey])
 
 		// Naive p_fair = fraction of members whose daily extreme falls in
 		// the bracket. KXHIGH* uses TMAX, KXLOWT* uses TMIN. We also sum
@@ -227,31 +281,65 @@ func Scan(opts ScanOptions) (*Result, error) {
 		nMembers := len(extremes)
 		pFairNaive := float64(nIn) / float64(nMembers)
 
-		// MOS-calibrated p_fair, if coefficients were provided. We feed
-		// the ensemble mean into the fitted (μ=a+b·f, σ) and integrate
-		// the normal across the bracket [Lo, Hi). Bins that weren't fit
-		// (e.g. too few training pairs) fall back to naive — never silent.
-		pFair := pFairNaive
-		var pFairMOS float64
-		mosApplied := false
+		// variable is reused by both the MOS Predict() and the
+		// Climate.RangeProb() paths below.
 		variable := "tmax"
 		if !spec.IsHigh() {
 			variable = "tmin"
 		}
-		if opts.MOS != nil {
-			mean := sumT / float64(nMembers)
-			mu, sigma, ok := opts.MOS.Predict(station, spec.ValidDate, variable, mean)
-			if ok {
-				pFairMOS = mos.ProbBelow(resolution.Hi, mu, sigma) -
-					mos.ProbBelow(resolution.Lo, mu, sigma)
-				if pFairMOS < 0 {
-					pFairMOS = 0
+
+		// MOS-calibrated p_fair, if coefficients were provided. We feed
+		// the ensemble mean into the fitted (μ=a+b·f, σ) and integrate
+		// the normal across the bracket [Lo, Hi). Skip paths:
+		//   - no coefficients loaded                  → "no_coeffs"
+		//   - model-set mismatch (observed vs fit)    → "model_set_mismatch:<obs>vs<fit>"
+		//   - no fitted bin for (station, season, variable) → "no_bin"
+		// All fall back to naive p_fair so the backtest never silently
+		// disappears them.
+		pFair := pFairNaive
+		var (
+			pFairMOS      float64
+			mosApplied    bool
+			mosSkipReason string
+		)
+		switch {
+		case opts.MOS == nil:
+			mosSkipReason = "no_coeffs"
+		case len(fitModelSet) == 0:
+			// Coefficients with empty FitModelSet — treat as a fatal
+			// mismatch for every poll. Logged once at the top of Scan.
+			obsModelSet := pollModelSet(extremes)
+			mosSkipReason = fmt.Sprintf("model_set_mismatch:%svs",
+				strings.Join(obsModelSet, "+"))
+			res.SkippedReason[mosSkipReason]++
+		default:
+			obsModelSet := pollModelSet(extremes)
+			if !mos.ModelSetEqual(obsModelSet, fitModelSet) {
+				key := strings.Join(obsModelSet, "+") + "|" + strings.Join(fitModelSet, "+")
+				if _, loaded := mmLogOnce.LoadOrStore(key, struct{}{}); !loaded {
+					log.Printf("edge: MOS model-set mismatch — observed=%v fit=%v; falling back to naive p_fair",
+						obsModelSet, fitModelSet)
 				}
-				if pFairMOS > 1 {
-					pFairMOS = 1
+				mosSkipReason = fmt.Sprintf("model_set_mismatch:%svs%s",
+					strings.Join(obsModelSet, "+"), strings.Join(fitModelSet, "+"))
+				res.SkippedReason[mosSkipReason]++
+			} else {
+				mean := sumT / float64(nMembers)
+				mu, sigma, ok := opts.MOS.Predict(station, spec.ValidDate, variable, mean)
+				if ok {
+					pFairMOS = mos.ProbBelow(resolution.Hi, mu, sigma) -
+						mos.ProbBelow(resolution.Lo, mu, sigma)
+					if pFairMOS < 0 {
+						pFairMOS = 0
+					}
+					if pFairMOS > 1 {
+						pFairMOS = 1
+					}
+					pFair = pFairMOS
+					mosApplied = true
+				} else {
+					mosSkipReason = "no_bin"
 				}
-				pFair = pFairMOS
-				mosApplied = true
 			}
 		}
 
@@ -261,6 +349,8 @@ func Scan(opts ScanOptions) (*Result, error) {
 			return nil
 		}
 
+		// Climate-shrunk-naive baseline. Reported alongside p_fair as a
+		// diagnostic column; not used as the trading model.
 		climateP := math.NaN()
 		pFairClimate := math.NaN()
 		edgeClimateCents := 0
@@ -287,6 +377,7 @@ func Scan(opts ScanOptions) (*Result, error) {
 			PFairMOS:         pFairMOS,
 			PFair:            pFair,
 			MOSApplied:       mosApplied,
+			SkippedReason:    mosSkipReason,
 			ClimateP:         climateP,
 			PFairClimate:     pFairClimate,
 			ClimateApplied:   climateApplied,
@@ -361,12 +452,106 @@ func Scan(opts ScanOptions) (*Result, error) {
 		}
 		return nil
 	})
-	if walkErr != nil && !errors.Is(walkErr, io.EOF) {
-		return nil, walkErr
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
 	}
 	// Stable sort by ts for deterministic CSV output.
 	sort.Slice(res.Rows, func(i, j int) bool { return res.Rows[i].TsMs < res.Rows[j].TsMs })
 	return res, nil
+}
+
+// pollModelSet returns the canonical sorted model set observed in the
+// poll, derived from member-ID prefixes. Bare numeric IDs ("00".."30")
+// are GFS (single-model default). Prefixed IDs like
+// "ncep_gefs_seamless:NN" / "ecmwf_ifs025_ensemble:NN" canonicalize to
+// the short tags mos.ModelGFS / mos.ModelECMWF respectively so they can
+// be compared against [mos.Coefficients.FitModelSet] via
+// [mos.ModelSetEqual].
+func pollModelSet(extremes map[string]MemberDaily) []string {
+	if len(extremes) == 0 {
+		return nil
+	}
+	tags := make([]string, 0, 2)
+	for id := range extremes {
+		tags = append(tags, memberModelTag(id))
+	}
+	return mos.CanonicalModelSet(tags)
+}
+
+// memberModelTag maps a parser-emitted member ID to the canonical short
+// model name (mos.ModelGFS / mos.ModelECMWF / "<full-prefix>" for
+// unknown). Bare numeric IDs are GFS; prefixed IDs split on ":" and the
+// prefix is matched against known model-name patterns.
+func memberModelTag(memberID string) string {
+	colon := strings.Index(memberID, ":")
+	if colon < 0 {
+		// Bare "00".."30" → GFS (single-model default).
+		return mos.ModelGFS
+	}
+	prefix := memberID[:colon]
+	switch {
+	case strings.HasPrefix(prefix, "ecmwf"):
+		return mos.ModelECMWF
+	case strings.HasPrefix(prefix, "ncep_gefs"), strings.HasPrefix(prefix, "gfs"):
+		return mos.ModelGFS
+	default:
+		// Unknown model prefix — surface verbatim. The mismatch guard
+		// will reject the poll against any coefficients.FitModelSet
+		// that doesn't list this exact tag.
+		return prefix
+	}
+}
+
+// siblingKey is the canonical bucket for "specs in the same market family
+// on the same civil day", used to look up siblings when resolving
+// T-bracket direction. Variable is implicit in series prefix (KXHIGH* vs
+// KXLOWT*), so series+valid_date is sufficient.
+func siblingKey(series string, validDate time.Time) string {
+	return series + "|" + validDate.Format("2006-01-02")
+}
+
+// collectSiblings does a first pass over every Kalshi trade frame in the
+// scan window, parses each unique market_ticker into a Spec, and groups
+// the Specs by siblingKey. The returned map's slices each contain every
+// Spec observed for that (series, valid_date) bucket — which is exactly
+// the input ResolveWithSiblings expects.
+//
+// Errors only on file-level IO problems; malformed trade frames and
+// non-weather tickers are silently skipped (the main scan loop counts
+// those separately).
+func collectSiblings(kalshiFiles []string) (map[string][]Spec, error) {
+	seenTicker := map[string]bool{} // dedupe by raw ticker
+	out := map[string][]Spec{}
+	err := replay.ForEachFrame(kalshiFiles, func(env replay.Envelope, _ int, _ bool) error {
+		var kf replay.KalshiFrame
+		if decodeErr := json.Unmarshal(env.Payload, &kf); decodeErr != nil {
+			return nil //nolint:nilerr // malformed frames are silently skipped here; counted by the main scan loop
+		}
+		if kf.Type != "trade" {
+			return nil
+		}
+		var msg tradeMsg
+		if decodeErr := json.Unmarshal(kf.Msg, &msg); decodeErr != nil {
+			return nil //nolint:nilerr // malformed trade messages are silently skipped; counted by the main scan loop
+		}
+		if seenTicker[msg.MarketTicker] {
+			return nil
+		}
+		seenTicker[msg.MarketTicker] = true
+		spec, parseErr := ParseTicker(msg.MarketTicker)
+		if parseErr != nil {
+			// Non-weather or malformed ticker — skip silently here; the
+			// main scan loop will count these per-trade.
+			return nil //nolint:nilerr // non-weather tickers are expected; counted by the main scan loop
+		}
+		k := siblingKey(spec.Series, spec.ValidDate)
+		out[k] = append(out[k], spec)
+		return nil
+	})
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	return out, nil
 }
 
 // stationLocation returns the IANA timezone for each Kalshi-resolved

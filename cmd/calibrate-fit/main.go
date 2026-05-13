@@ -56,6 +56,11 @@ func main() {
 		logger.Error("fit", "err", err)
 		os.Exit(1)
 	}
+	// Current calibration sources GFS deterministic forecasts only (see
+	// readForecastCSV: it reads gfs_tmax_f / gfs_tmin_f columns). Stamp
+	// the model set so the scanner can refuse to apply these coefficients
+	// to a multi-model poll without us having to remember.
+	coeffs.FitModelSet = []string{mos.ModelGFS}
 
 	if err := writeJSON(*outPath, coeffs); err != nil {
 		logger.Error("write", "err", err)
