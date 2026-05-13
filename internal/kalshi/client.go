@@ -3,11 +3,13 @@ package kalshi
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -34,6 +36,27 @@ type Client struct {
 	now func() time.Time
 }
 
+// newTransport builds the explicit *http.Transport used by NewClient.
+// Every timeout is documented in internal/kalshi/CLIENT.md with the
+// rationale for the chosen value. Pulled out so tests with httptest can
+// share the configured transport without re-stating the magic numbers.
+func newTransport() *http.Transport {
+	return &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   5 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ResponseHeaderTimeout: 5 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
+		MaxIdleConnsPerHost:   4,
+		ForceAttemptHTTP2:     true,
+		TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		},
+	}
+}
+
 // NewClient creates a Kalshi API client with built-in rate limiting.
 func NewClient(baseURL string, signer *Signer) *Client {
 	// Extract path prefix from baseURL for request signing.
@@ -47,7 +70,8 @@ func NewClient(baseURL string, signer *Signer) *Client {
 		pathPrefix: pathPrefix,
 		signer:     signer,
 		httpClient: &http.Client{
-			Timeout: 10 * time.Second,
+			Transport: newTransport(),
+			Timeout:   10 * time.Second,
 		},
 		minDelay: 1000 * time.Millisecond, // ~1 req/s to stay within Kalshi rate limits
 		now:      time.Now,
@@ -348,7 +372,28 @@ func (c *Client) GetRaw(ctx context.Context, path string, params map[string]stri
 
 // --- HTTP helpers ---
 
+// perRequestTimeout is the outer per-call deadline applied to every HTTP
+// call. It matches httpClient.Timeout so a caller that passes a parent
+// context without its own deadline still gets bounded latency. Callers
+// with tighter deadlines win because we only wrap if the inherited ctx
+// has no deadline or one further out than perRequestTimeout.
+const perRequestTimeout = 10 * time.Second
+
+// withCallDeadline returns ctx unchanged if it already has a deadline
+// tighter than perRequestTimeout; otherwise it wraps with WithTimeout.
+// This ensures no naked client.Do can hang past perRequestTimeout even
+// if the caller forgot a deadline.
+func withCallDeadline(ctx context.Context) (context.Context, context.CancelFunc) {
+	if d, ok := ctx.Deadline(); ok && time.Until(d) <= perRequestTimeout {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, perRequestTimeout)
+}
+
 func (c *Client) getRaw(ctx context.Context, path string, params map[string]string) (string, error) {
+	ctx, cancel := withCallDeadline(ctx)
+	defer cancel()
+
 	fullPath := path
 	if len(params) > 0 {
 		q := url.Values{}
@@ -367,7 +412,7 @@ func (c *Client) getRaw(ctx context.Context, path string, params map[string]stri
 		return "", signErr
 	}
 
-	bodyBytes, err := c.doRaw(req)
+	bodyBytes, err := c.doRaw(ctx, req)
 	if err != nil {
 		return "", err
 	}
@@ -375,6 +420,9 @@ func (c *Client) getRaw(ctx context.Context, path string, params map[string]stri
 }
 
 func (c *Client) get(ctx context.Context, path string, params map[string]string, out interface{}) error {
+	ctx, cancel := withCallDeadline(ctx)
+	defer cancel()
+
 	fullPath := path
 	if len(params) > 0 {
 		q := url.Values{}
@@ -394,10 +442,13 @@ func (c *Client) get(ctx context.Context, path string, params map[string]string,
 		return err
 	}
 
-	return c.do(req, out)
+	return c.do(ctx, req, out)
 }
 
 func (c *Client) post(ctx context.Context, path string, body interface{}, out interface{}) error {
+	ctx, cancel := withCallDeadline(ctx)
+	defer cancel()
+
 	data, err := json.Marshal(body)
 	if err != nil {
 		return fmt.Errorf("kalshi: marshal request body: %w", err)
@@ -413,10 +464,13 @@ func (c *Client) post(ctx context.Context, path string, body interface{}, out in
 		return err
 	}
 
-	return c.do(req, out)
+	return c.do(ctx, req, out)
 }
 
 func (c *Client) delete(ctx context.Context, path string, out interface{}) error {
+	ctx, cancel := withCallDeadline(ctx)
+	defer cancel()
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.baseURL+path, nil)
 	if err != nil {
 		return fmt.Errorf("kalshi: build DELETE request: %w", err)
@@ -426,7 +480,7 @@ func (c *Client) delete(ctx context.Context, path string, out interface{}) error
 		return err
 	}
 
-	return c.do(req, out)
+	return c.do(ctx, req, out)
 }
 
 func (c *Client) sign(req *http.Request, path string) error {
@@ -449,7 +503,7 @@ const (
 	maxAdaptiveDelay = 2 * time.Second
 )
 
-func (c *Client) doRaw(req *http.Request) ([]byte, error) {
+func (c *Client) doRaw(ctx context.Context, req *http.Request) ([]byte, error) {
 	req.Header.Set("Accept", "application/json")
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
@@ -503,8 +557,8 @@ func (c *Client) doRaw(req *http.Request) ([]byte, error) {
 			// of math.Pow for small integers.
 			backoff := time.Duration(1<<uint(attempt+1)) * time.Second
 			select {
-			case <-req.Context().Done():
-				return nil, req.Context().Err()
+			case <-ctx.Done():
+				return nil, ctx.Err()
 			case <-time.After(backoff):
 				continue
 			}
@@ -518,8 +572,8 @@ func (c *Client) doRaw(req *http.Request) ([]byte, error) {
 	return nil, fmt.Errorf("kalshi: exhausted retries")
 }
 
-func (c *Client) do(req *http.Request, out interface{}) error {
-	bodyBytes, err := c.doRaw(req)
+func (c *Client) do(ctx context.Context, req *http.Request, out interface{}) error {
+	bodyBytes, err := c.doRaw(ctx, req)
 	if err != nil {
 		return err
 	}
