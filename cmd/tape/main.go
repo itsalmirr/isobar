@@ -105,7 +105,7 @@ func run(ctx context.Context, logger *slog.Logger, cfg config.Config, configSHA 
 	g, ctx := errgroup.WithContext(ctx)
 
 	if cfg.Kalshi.Enabled {
-		g.Go(func() error { return startKalshi(ctx, logger, cfg, configSHA) })
+		g.Go(func() error { return startKalshi(ctx, logger, cfg, configSHA, g) })
 	}
 	if cfg.OpenMeteo.Enabled {
 		g.Go(func() error { return startOpenMeteo(ctx, logger, cfg, configSHA) })
@@ -159,7 +159,7 @@ func writeBootFrame(jrn *journal.Journal, configSHA string) {
 	})
 }
 
-func startKalshi(ctx context.Context, logger *slog.Logger, cfg config.Config, configSHA string) error {
+func startKalshi(ctx context.Context, logger *slog.Logger, cfg config.Config, configSHA string, g *errgroup.Group) error {
 	pemBytes, source, err := loadKalshiPEM(cfg.Kalshi)
 	if err != nil {
 		return err
@@ -202,7 +202,9 @@ func startKalshi(ctx context.Context, logger *slog.Logger, cfg config.Config, co
 	})
 
 	if cfg.Kalshi.RediscoverInterval > 0 {
-		go runRediscovery(ctx, logger, rest, sub, cfg.Kalshi.Series, cfg.Kalshi.RediscoverInterval)
+		g.Go(func() error {
+			return runRediscovery(ctx, logger, rest, sub, cfg.Kalshi.Series, cfg.Kalshi.RediscoverInterval)
+		})
 	}
 
 	return sub.Run(ctx)
@@ -212,15 +214,34 @@ func startKalshi(ctx context.Context, logger *slog.Logger, cfg config.Config, co
 // subscriber if the open-ticker set changed. This prevents the recorder
 // from going dead after configured series' brackets settle (the next-day
 // markets exist in Kalshi's catalog but were not in the initial
-// subscription). Returns when ctx is cancelled.
-func runRediscovery(ctx context.Context, logger *slog.Logger, rest *kalshi.Client, sub *kalshi.Subscriber, series []string, interval time.Duration) {
+// subscription).
+//
+// Lifecycle: returns nil on ctx cancellation (graceful shutdown). A
+// panic inside the loop is recovered and converted into an error so
+// the parent errgroup kills the whole process rather than leaving an
+// orphaned goroutine with the tape running blind.
+func runRediscovery(ctx context.Context, logger *slog.Logger, rest *kalshi.Client, sub *kalshi.Subscriber, series []string, interval time.Duration) (retErr error) {
+	defer func() {
+		if r := recover(); r != nil {
+			// Use the default logger as a fallback: if the supplied
+			// logger is what panicked (e.g. nil deref), calling it
+			// again here would re-panic past the recover boundary.
+			lg := logger
+			if lg == nil {
+				lg = slog.Default()
+			}
+			lg.Error("kalshi: rediscovery panicked — failing the errgroup", "recover", r)
+			retErr = fmt.Errorf("kalshi: rediscovery panic: %v", r)
+		}
+	}()
+
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	logger.Info("kalshi: rediscovery started", "interval", interval)
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 		case <-t.C:
 			fresh, err := rest.DiscoverOpenTickers(ctx, series, logger)
 			if err != nil {
