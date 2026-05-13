@@ -272,6 +272,85 @@ func TestScan_BacktestNoTruthSkipped(t *testing.T) {
 	}
 }
 
+// TestScan_LowSideTBracketResolution_KXLOWT: a KXLOWTNYC-T56 trade in a
+// market whose B-bracket siblings live above T56 must resolve as a
+// LOW-side threshold (TMIN < 56), not the default high-side. Verifies that
+// Scan groups specs by (series, valid_date) and feeds the siblings into
+// ResolveWithSiblings before computing p_fair.
+//
+// Setup: synthetic poll has TMIN ~40°F across all three members. With the
+// (broken) default high-side resolution [56, +Inf), p_fair would be 0/3 = 0
+// (no TMIN ≥ 56). With sibling-aware low-side resolution (-Inf, 56),
+// p_fair is 3/3 = 1.0 (every TMIN < 56). The test asserts the latter.
+func TestScan_LowSideTBracketResolution_KXLOWT(t *testing.T) {
+	dir := t.TempDir()
+	pollPayload := synthPoll(t)
+	pollTime := time.Date(2026, 4, 29, 7, 30, 0, 0, time.UTC)
+	tradeTime := pollTime.Add(20 * time.Minute)
+
+	if err := writeJournal(t, filepath.Join(dir, "openmeteo", "2026-04-29"), "om.jsonl",
+		[]envelope{{Wall: pollTime.UnixNano(), Source: "openmeteo", Kind: "rest:NY", Payload: pollPayload}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Three trade frames: one T56 (low-side) and two B-bracket siblings B58.5,
+	// B60.5 — both above T56 so ResolveWithSiblings should flip T56 to low.
+	// We use side=yes, yes_price=50 (mid-market) and the price isn't
+	// load-bearing for the assertion; only resolution + p_fair are.
+	for _, ticker := range []string{
+		"KXLOWTNYC-26APR29-T56",
+		"KXLOWTNYC-26APR29-B58.5",
+		"KXLOWTNYC-26APR29-B60.5",
+	} {
+		raw, _ := json.Marshal(map[string]interface{}{
+			"market_ticker": ticker,
+			"yes_price":     50,
+			"no_price":      50,
+			"side":          "yes",
+			"ts_ms":         tradeTime.UnixMilli(),
+		})
+		frame, _ := json.Marshal(map[string]interface{}{
+			"type": "trade", "msg": json.RawMessage(raw),
+		})
+		if err := writeJournal(t, filepath.Join(dir, "kalshi", "2026-04-29"),
+			"k-"+ticker+".jsonl",
+			[]envelope{{Wall: tradeTime.UnixNano(), Source: "kalshi", Kind: "ws", Payload: frame}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	res, err := Scan(ScanOptions{
+		DataDir:    dir,
+		StartDate:  time.Date(2026, 4, 29, 0, 0, 0, 0, time.UTC),
+		EndDate:    time.Date(2026, 4, 30, 0, 0, 0, 0, time.UTC),
+		MaxPollAge: time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	// Find the T56 row.
+	var got *EdgeRow
+	for i := range res.Rows {
+		if res.Rows[i].Ticker == "KXLOWTNYC-26APR29-T56" {
+			got = &res.Rows[i]
+			break
+		}
+	}
+	if got == nil {
+		t.Fatalf("T56 row missing; rows=%d skipped=%v", len(res.Rows), res.SkippedReason)
+	}
+	// Synthetic poll TMINs (members 00/01/02): 4°C/5°C/6°C → 39.2/41.0/42.8°F.
+	// Sibling-aware low-side resolution (-Inf, 56) → all 3 are inside → p_fair = 1.0.
+	// Buggy default high-side [56, +Inf) → 0/3 = 0. We assert 1.0.
+	if got.PFairNaive != 1.0 {
+		t.Errorf("KXLOWT T56 PFairNaive = %v, want 1.0 (low-side resolution detected via siblings; default high-side would give 0)",
+			got.PFairNaive)
+	}
+	if got.NMembersInBkt != 3 {
+		t.Errorf("KXLOWT T56 NMembersInBkt = %d, want 3", got.NMembersInBkt)
+	}
+}
+
 // envelope mirrors internal/replay.Envelope for fixture writing.
 type envelope struct {
 	Wall    int64           `json:"t"`
