@@ -110,7 +110,7 @@ func reportKalshi(dir string, files []string) {
 			}
 		}
 
-		if replay.ApplyFrameToBooks(books, nil, env, f) {
+		if malformed, _ := replay.ApplyFrameToBooks(books, nil, env, f); malformed {
 			bookErrors++
 		}
 		return nil
