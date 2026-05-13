@@ -83,6 +83,13 @@ type Result struct {
 	Rows          []EdgeRow
 	SkippedReason map[string]int
 
+	// MembersSkipped counts ensemble members dropped across all paired
+	// trades for failing the MinHourlySamplesPerMember coverage check.
+	// A non-zero value here means at least one member was sparse on at
+	// least one poll, but the row was still produced from the surviving
+	// member subset (previous behaviour was to drop the whole trade).
+	MembersSkipped int
+
 	// Backtest aggregates — only populated when ScanOptions.Truth is set.
 	BacktestEnabled bool
 	TradesEntered   int // rows where OurSide != ""
@@ -185,7 +192,7 @@ func Scan(opts ScanOptions) (*Result, error) {
 			res.SkippedReason["unknown_station_tz"]++
 			return nil
 		}
-		extremes, err := poll.DailyExtremesF(spec.ValidDate, tz)
+		extremes, skipped, err := poll.DailyExtremesFWithSkip(spec.ValidDate, tz)
 		if err != nil {
 			if errors.Is(err, ErrInsufficientCoverage) {
 				res.SkippedReason["insufficient_poll_coverage"]++
@@ -193,6 +200,11 @@ func Scan(opts ScanOptions) (*Result, error) {
 			}
 			return fmt.Errorf("daily extremes: %w", err)
 		}
+		// Diagnostic: how many ensemble members were dropped for partial
+		// coverage on this trade-poll pairing. Aggregate counter only —
+		// not a per-row field, since the row's NMembers already reflects
+		// the surviving subset.
+		res.MembersSkipped += skipped
 
 		// Resolution. T-brackets default to high-side (≥ K). The first-pass
 		// scan over Kalshi files (above) groups every observed Spec by
