@@ -13,7 +13,22 @@
 //     read buffers (this matters for coder/websocket which re-uses the
 //     read-buffer between Read calls).
 //
+// Backpressure visibility (ADR-0011):
+//   - On every drop, a monotonic atomic counter increments and (every Nth
+//     drop) a sampled slog.Debug record fires. Read the counter via
+//     Dropped().
+//   - The writer goroutine samples the counter once per second; when the
+//     drop rate has been at or above AlarmThreshold drops/sec continuously
+//     for AlarmSustain, the OnDropAlarm hook is invoked exactly once per
+//     crossing edge. Default hook is a structured slog.Warn — production
+//     deploys should install a real sink (Phase 6 wires Prometheus).
+//   - The legacy 60-second "frames dropped" warn line is demoted to an
+//     info-level cumulative heartbeat; the alarm hook is now the primary
+//     operator signal.
+//
 // The on-disk shape is stable JSONL: one envelope per line, NDJSON-friendly.
+// ADR-0011 does NOT bump the on-disk format — instrumentation is in-process
+// only and tapes remain replayable by any pre-existing reader.
 package journal
 
 import (
@@ -55,6 +70,11 @@ type envelope struct {
 }
 
 // Options configure the Journal.
+//
+// The four backpressure-visibility fields (OnDropAlarm, AlarmThreshold,
+// AlarmSustain, SampleEvery) are documented end-to-end in
+// docs/decisions/0011-journal-backpressure.md. Zero values pick safe
+// defaults so journal.Options{Dir,Source} remains a working configuration.
 type Options struct {
 	Dir              string
 	Source           string
@@ -63,7 +83,37 @@ type Options struct {
 	FlushEvery       time.Duration
 	QueueSize        int
 	CompressOnRotate bool
+
+	// OnDropAlarm is invoked at most once per crossing edge when the
+	// drop rate has been at or above AlarmThreshold drops/sec for at
+	// least AlarmSustain. The hook receives the source label, the
+	// cumulative drop count, and the duration since the first drop in
+	// the current sustained window.
+	//
+	// If nil, a default hook emits a structured slog.Warn. ADR-0011
+	// is explicit that production runs SHOULD install a non-default
+	// hook (Phase 6 wires a Prometheus counter through this seam).
+	OnDropAlarm func(src string, drops uint64, since time.Duration)
+
+	// AlarmThreshold is the minimum sustained drops/sec rate that arms
+	// the alarm. 0 → 1 drop/sec.
+	AlarmThreshold uint64
+
+	// AlarmSustain is how long the rate must stay at or above
+	// AlarmThreshold before OnDropAlarm fires. 0 → 60s.
+	AlarmSustain time.Duration
+
+	// SampleEvery controls the per-drop debug-log sampling cadence:
+	// every Nth dropped frame produces a slog.Debug record. 0 → 1024.
+	// Set to math.MaxUint64 to effectively disable the sampled log.
+	SampleEvery uint64
 }
+
+// dropLogSampleEvery is the default sampling cadence for the per-drop
+// debug log. ADR-0011 §3 picks 1024 — high enough that an at-debug
+// crank does not flood stderr during a typical burst, low enough that a
+// 5-minute investigation window will see hits.
+const dropLogSampleEvery uint64 = 1024
 
 // Journal is a per-source append-only writer with rotation and batched fsync.
 type Journal struct {
@@ -75,7 +125,28 @@ type Journal struct {
 	doneOnce sync.Once
 	done     chan struct{}
 
+	// dropped is the monotonic per-instance drop counter. Exposed via
+	// Dropped(). ADR-0011 §5 keeps this name for back-compat with the
+	// existing accessor and the health-check.sh operator script.
 	dropped atomic.Uint64
+
+	// Alarm machinery. droppedAtLastTick is the counter value sampled
+	// at the previous 1-second alarm tick; the delta is the per-second
+	// drop rate. alarmActive is the edge-trigger debounce — true while
+	// the hook has been fired and the rate has not cleared back below
+	// threshold. alarmFirstSeenNanos is the unix-nano timestamp of the
+	// first second in the current sustained-breach window; (now - that)
+	// is the "since" duration passed to the hook.
+	droppedAtLastTick   atomic.Uint64
+	alarmActive         atomic.Bool
+	alarmFirstSeenNanos atomic.Int64
+
+	// Resolved option values (post-default-fill). Kept on the struct so
+	// the run goroutine and Write don't re-read opts on every call.
+	sampleEvery    uint64
+	alarmThreshold uint64
+	alarmSustain   time.Duration
+	onDropAlarm    func(src string, drops uint64, since time.Duration)
 }
 
 // Open creates a Journal and starts its writer goroutine. Stop with Close.
@@ -89,18 +160,68 @@ func Open(opts Options, logger *slog.Logger) (*Journal, error) {
 	if opts.FlushEvery <= 0 {
 		opts.FlushEvery = 250 * time.Millisecond
 	}
+	if opts.SampleEvery == 0 {
+		opts.SampleEvery = dropLogSampleEvery
+	}
+	if opts.AlarmThreshold == 0 {
+		opts.AlarmThreshold = 1
+	}
+	if opts.AlarmSustain <= 0 {
+		opts.AlarmSustain = 60 * time.Second
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
-	j := &Journal{
-		opts:   opts,
-		logger: logger.With("component", "journal", "src", opts.Source),
-		in:     make(chan envelope, opts.QueueSize),
-		closed: make(chan struct{}),
-		done:   make(chan struct{}),
+	scopedLogger := logger.With("component", "journal", "src", opts.Source)
+
+	// Per ADR-0011 detection plan: announce which sink the alarm path
+	// will use at startup. A custom hook gets an info line; the fallback
+	// gets a Warn line because production runs should not rely on it.
+	hookName := "custom"
+	hook := opts.OnDropAlarm
+	if hook == nil {
+		hookName = "default-slog-warn"
+		hook = defaultDropAlarmHook(scopedLogger, opts.AlarmThreshold, opts.AlarmSustain)
 	}
+
+	j := &Journal{
+		opts:           opts,
+		logger:         scopedLogger,
+		in:             make(chan envelope, opts.QueueSize),
+		closed:         make(chan struct{}),
+		done:           make(chan struct{}),
+		sampleEvery:    opts.SampleEvery,
+		alarmThreshold: opts.AlarmThreshold,
+		alarmSustain:   opts.AlarmSustain,
+		onDropAlarm:    hook,
+	}
+
+	if opts.OnDropAlarm != nil {
+		j.logger.Info("journal: drop-alarm sink installed", "sink", hookName)
+	} else {
+		j.logger.Warn("journal: drop-alarm sink is default slog.Warn — wire a real alarm for prod",
+			"sink", hookName)
+	}
+
 	go j.run()
 	return j, nil
+}
+
+// defaultDropAlarmHook returns the fallback OnDropAlarm sink. It emits a
+// structured slog.Warn with the source label, cumulative drop count, the
+// "since" window, and the threshold/sustain config so an operator who
+// grep-discovers it can answer "is this fresh or stale, and how loud is
+// it?" without consulting the code.
+func defaultDropAlarmHook(logger *slog.Logger, threshold uint64, sustain time.Duration) func(string, uint64, time.Duration) {
+	return func(src string, drops uint64, since time.Duration) {
+		logger.Warn("journal: drop-alarm fired",
+			"src", src,
+			"drops", drops,
+			"since", since,
+			"threshold_per_sec", threshold,
+			"sustained_for", sustain,
+		)
+	}
 }
 
 // Write enqueues a frame. It never blocks; if the queue is full the frame
@@ -124,11 +245,26 @@ func (j *Journal) Write(f Frame) {
 	select {
 	case j.in <- e:
 	default:
-		j.dropped.Add(1)
+		n := j.dropped.Add(1)
+		// Sampled debug log: every Nth drop emits one structured
+		// record. At debug level this is off in prod; an operator can
+		// crank to debug for 5 minutes to localize a burst without
+		// flooding stderr. ADR-0011 §3.
+		if j.sampleEvery > 0 && n%j.sampleEvery == 0 {
+			j.logger.Debug("journal: frame dropped (queue full)",
+				"src", j.opts.Source,
+				"total_drops", n,
+				"queue_depth", len(j.in),
+				"queue_capacity", cap(j.in),
+				"kind", f.Kind,
+			)
+		}
 	}
 }
 
 // Dropped returns the number of frames dropped due to a full queue.
+// ADR-0011 §5 preserves this name for the operator health-check.sh
+// script and existing test assertions.
 func (j *Journal) Dropped() uint64 { return j.dropped.Load() }
 
 // Close stops the writer goroutine, draining the queue and fsyncing the
@@ -151,10 +287,15 @@ func (j *Journal) Wait(ctx context.Context) {
 // Internal ticker intervals. Kept as package-level vars (not Options
 // fields) so they remain invisible to normal callers but swappable in
 // tests that would otherwise pay real-time seconds to exercise
-// age-based rotation or the dropped-frames warning.
+// age-based rotation, the alarm crossing path, or the cumulative-drop
+// heartbeat.
 var (
 	rotateCheckInterval = 15 * time.Second
 	dropReportInterval  = 60 * time.Second
+	// alarmCheckInterval is the cadence at which the run goroutine
+	// samples the drop counter and decides whether the alarm hook
+	// should fire. ADR-0011 §4 picks 1s; tests swap this down to ms.
+	alarmCheckInterval = 1 * time.Second
 )
 
 // run is the single owner of the on-disk file.
@@ -256,8 +397,13 @@ func (j *Journal) run() {
 	defer flushTimer.Stop()
 	rotateTimer := time.NewTicker(rotateCheckInterval)
 	defer rotateTimer.Stop()
+	// The 60s ticker, post-ADR-0011, is a low-noise cumulative
+	// heartbeat — the primary "operator should look" signal is the
+	// rate-aware alarm hook fired from alarmTimer below.
 	dropReport := time.NewTicker(dropReportInterval)
 	defer dropReport.Stop()
+	alarmTimer := time.NewTicker(alarmCheckInterval)
+	defer alarmTimer.Stop()
 
 	for {
 		select {
@@ -295,12 +441,70 @@ func (j *Journal) run() {
 				}
 			}
 
+		case <-alarmTimer.C:
+			j.checkDropAlarm()
+
 		case <-dropReport.C:
+			// Demoted to Info: this is the cumulative heartbeat now,
+			// not the primary alert. ADR-0011: the rate-aware alarm
+			// is what an operator should react to.
 			if d := j.dropped.Load(); d > 0 {
-				j.logger.Warn("frames dropped (queue full)", "count", d)
+				j.logger.Info("journal: cumulative drops",
+					"src", j.opts.Source,
+					"total_drops", d,
+				)
 			}
 		}
 	}
+}
+
+// checkDropAlarm samples the per-instance drop counter once per
+// alarmCheckInterval, computes the per-second rate against the previous
+// sample, and edge-fires j.onDropAlarm when the rate has been at or
+// above j.alarmThreshold continuously for at least j.alarmSustain.
+//
+// Edge-trigger semantics (ADR-0011 §4): the hook fires exactly once per
+// crossing. While the rate stays above threshold the hook does not
+// re-fire. The rate must drop back below threshold (alarm cleared) for
+// the next crossing to re-arm.
+//
+// "since" passed to the hook is (now - first-sustained-tick), so the
+// operator can see how long the breach has been building.
+func (j *Journal) checkDropAlarm() {
+	now := time.Now()
+	cur := j.dropped.Load()
+	prev := j.droppedAtLastTick.Swap(cur)
+	// Convert the per-tick delta into a per-second rate. With the
+	// 1-second default tick, the delta IS the rate; the divide keeps
+	// the math right under a test-shortened alarmCheckInterval.
+	tickSec := alarmCheckInterval.Seconds()
+	if tickSec <= 0 {
+		tickSec = 1
+	}
+	deltaPerSec := uint64(float64(cur-prev) / tickSec)
+
+	if deltaPerSec >= j.alarmThreshold {
+		// Mark the start of a sustained-breach window the first time
+		// we see a breach after a clear period.
+		if j.alarmFirstSeenNanos.Load() == 0 {
+			j.alarmFirstSeenNanos.Store(now.UnixNano())
+		}
+		firstSeen := time.Unix(0, j.alarmFirstSeenNanos.Load())
+		since := now.Sub(firstSeen)
+		if since >= j.alarmSustain && !j.alarmActive.Load() {
+			// Edge-trigger: arm and fire exactly once for this crossing.
+			j.alarmActive.Store(true)
+			if j.onDropAlarm != nil {
+				j.onDropAlarm(j.opts.Source, cur, since)
+			}
+		}
+		return
+	}
+
+	// Rate has fallen back below threshold: clear the window and
+	// re-arm the edge-trigger so a future sustained breach fires again.
+	j.alarmFirstSeenNanos.Store(0)
+	j.alarmActive.Store(false)
 }
 
 // newPath builds dir/source/YYYY-MM-DD/source-HHMMSS.NNNNNNNNN.jsonl,
