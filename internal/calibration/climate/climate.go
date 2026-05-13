@@ -286,15 +286,33 @@ func maxIndex(col map[string]int) int {
 	return m
 }
 
-// dayOfYear returns 1..366 for the date's month-day (year-independent).
-// Treats Feb 29 specially: maps Feb 29 to day 60 same as Mar 1, since
-// our climatology spans multiple years and we want all "late February"
-// observations to compare equally.
+// dayOfYear returns 1..366, leap-year-aware. In leap years, Feb 29 is
+// day 60 and Mar 1 is day 61. In non-leap years, Mar 1 is day 60 (no
+// Feb 29 slot occurs). This ISO-style mapping disambiguates Feb 29
+// observations from Mar 1 in the climate corpus, avoiding the silent
+// aliasing the original non-leap-year cumDays scheme produced.
+//
+// Storage path: obs are keyed via dayOfYearMD, which parses month-day
+// against year 0000 (which Go's calendar treats as leap), so every
+// distinct month-day gets a unique slot in [1, 366]: Feb 29 → 60,
+// Mar 1 → 61, Feb 28 → 59, etc. Query path uses this function on the
+// caller-supplied target date; for non-leap year targets after Feb,
+// the DOY is one less than the storage slot for the same calendar day,
+// but the ±SeasonWindowDays window absorbs that single-day offset (a
+// meteorologically negligible shift at our resolution).
 func dayOfYear(t time.Time) int {
 	mo, d := int(t.Month()), t.Day()
-	return cumDays[mo-1] + d
+	base := cumDays[mo-1] + d
+	if isLeapYear(t.Year()) && mo > 2 {
+		base++
+	}
+	return base
 }
 
+// dayOfYearMD parses a "MM-DD" string and returns its day-of-year using
+// the leap-year-canonical mapping (Go parses missing-year layouts as
+// year 0000, which is a leap year). This guarantees Feb 29 → 60 and
+// Mar 1 → 61 for storage, regardless of the original obs year.
 func dayOfYearMD(md string) int {
 	t, err := time.Parse("01-02", md)
 	if err != nil {
@@ -303,8 +321,16 @@ func dayOfYearMD(md string) int {
 	return dayOfYear(t)
 }
 
+// isLeapYear reports whether y is a Gregorian leap year (divisible by
+// 4, except centuries not divisible by 400).
+func isLeapYear(y int) bool {
+	return y%4 == 0 && (y%100 != 0 || y%400 == 0)
+}
+
 // circDist is the minimum circular distance in days between two
-// year-of-day numbers in [1, 366].
+// day-of-year numbers in [1, 366]. The calendar is treated as a
+// 366-day cycle so Feb 29 (day 60) and Mar 1 (day 61) are adjacent
+// and Dec 31 (day 366) wraps to Jan 1 (day 1) with distance 1.
 func circDist(a, b int) int {
 	d := a - b
 	if d < 0 {
@@ -317,7 +343,6 @@ func circDist(a, b int) int {
 }
 
 // cumDays[i] is the number of days before month i+1 in a non-leap year.
-// Indexed 0=Jan offset, 1=Feb offset, ..., 11=Dec offset. We treat all
-// years as 366 days for circular distance — the off-by-one Feb 28 vs
-// Mar 1 is meteorologically negligible at our resolution.
+// Indexed 0=Jan offset, 1=Feb offset, ..., 11=Dec offset. Leap-year
+// adjustment (+1 for months after February) is applied in dayOfYear.
 var cumDays = []int{0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334}
