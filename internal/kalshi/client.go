@@ -114,11 +114,16 @@ func (c *Client) ResetRateLimit() {
 
 // throttle enforces a minimum gap between API calls. It computes the
 // required delay under the mutex, reserves the next slot by advancing
-// lastCall, then releases the lock BEFORE sleeping so concurrent
+// lastCall, then releases the lock BEFORE waiting so concurrent
 // callers can queue their own slots instead of serializing on the
-// sleep. Without this correction, N concurrent callers would wait
+// wait. Without this correction, N concurrent callers would wait
 // N*minDelay total even though the rate limit is per-process.
-func (c *Client) throttle() {
+//
+// The wait is ctx-aware: a cancelled context returns immediately with
+// the ctx error rather than holding the caller until the (potentially
+// 2s) sleep elapses. Every caller threads ctx through, so this is
+// drop-in.
+func (c *Client) throttle(ctx context.Context) error {
 	c.rateMu.Lock()
 	now := c.now()
 	gap := c.minDelay - now.Sub(c.lastCall)
@@ -128,8 +133,16 @@ func (c *Client) throttle() {
 	// Reserve our slot at now+gap; subsequent callers will queue past us.
 	c.lastCall = now.Add(gap)
 	c.rateMu.Unlock()
-	if gap > 0 {
-		time.Sleep(gap)
+	if gap <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(gap)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -554,7 +567,9 @@ func (c *Client) doRaw(ctx context.Context, req *http.Request) ([]byte, error) {
 	isGET := req.Method == http.MethodGet
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		c.throttle()
+		if err := c.throttle(ctx); err != nil {
+			return nil, err
+		}
 
 		// Clone request body for retries.
 		if req.Body != nil && req.GetBody != nil {
