@@ -308,12 +308,12 @@ func Scan(opts ScanOptions) (*Result, error) {
 		case len(fitModelSet) == 0:
 			// Coefficients with empty FitModelSet — treat as a fatal
 			// mismatch for every poll. Logged once at the top of Scan.
-			obsModelSet := pollModelSet(extremes)
+			obsModelSet := poll.ModelSet
 			mosSkipReason = fmt.Sprintf("model_set_mismatch:%svs",
 				strings.Join(obsModelSet, "+"))
 			res.SkippedReason[mosSkipReason]++
 		default:
-			obsModelSet := pollModelSet(extremes)
+			obsModelSet := poll.ModelSet
 			if !mos.ModelSetEqual(obsModelSet, fitModelSet) {
 				key := strings.Join(obsModelSet, "+") + "|" + strings.Join(fitModelSet, "+")
 				if _, loaded := mmLogOnce.LoadOrStore(key, struct{}{}); !loaded {
@@ -467,12 +467,37 @@ func Scan(opts ScanOptions) (*Result, error) {
 // the short tags mos.ModelGFS / mos.ModelECMWF respectively so they can
 // be compared against [mos.Coefficients.FitModelSet] via
 // [mos.ModelSetEqual].
+//
+// This signature takes the post-coverage-filter extremes map because
+// historically the scan hot path passed that view. In the typical case
+// (all members surviving the [MinHourlySamplesPerMember] check) it
+// agrees with [pollModelSetFromMembers] computed from the full member
+// set. The pathological case — every member of an ENTIRE model failing
+// coverage on the same poll — would yield a smaller set here than the
+// precomputed [Poll.ModelSet]; that case is rare enough that A11 caches
+// the full-member view and surfaces such polls as model-set mismatches
+// (which they functionally are). Retained for the cache-consistency
+// regression test and as the canonical derivation reference.
 func pollModelSet(extremes map[string]MemberDaily) []string {
 	if len(extremes) == 0 {
 		return nil
 	}
 	tags := make([]string, 0, 2)
 	for id := range extremes {
+		tags = append(tags, memberModelTag(id))
+	}
+	return mos.CanonicalModelSet(tags)
+}
+
+// pollModelSetFromMembers is the [pollModelSet] equivalent that operates
+// directly on [Poll.Members]. Used by [ParsePoll] to precompute
+// [Poll.ModelSet] once per poll-load instead of per trade.
+func pollModelSetFromMembers(members map[string][]float64) []string {
+	if len(members) == 0 {
+		return nil
+	}
+	tags := make([]string, 0, 2)
+	for id := range members {
 		tags = append(tags, memberModelTag(id))
 	}
 	return mos.CanonicalModelSet(tags)
