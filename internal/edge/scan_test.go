@@ -623,6 +623,58 @@ func TestScan_EndToEndMOS(t *testing.T) {
 	}
 }
 
+// TestPollModelSet_CacheConsistency locks in the equivalence claim made
+// by the A11 caching change (perf/poll-modelset-cache): the precomputed
+// Poll.ModelSet field, populated once by ParsePoll, must equal the
+// per-trade pollModelSet(extremes) computation that the scan hot path
+// previously did, for the typical case where all members survive the
+// MinHourlySamplesPerMember coverage filter.
+//
+// Verifies for two representative shapes:
+//   - single-model GFS-only (matches synthPoll: 3 bare-numeric members)
+//   - multi-model GFS+ECMWF (matches synthMultiModelPoll: one of each)
+//
+// Each case parses the poll the same way Scan does, derives the
+// extremes map via DailyExtremesF (the unfiltered, all-coverage path
+// would be even simpler but DailyExtremesF is what Scan actually
+// calls), then asserts ModelSetEqual(poll.ModelSet, pollModelSet(extremes)).
+// If this ever drifts, A11's "cache is safe" claim has regressed.
+func TestPollModelSet_CacheConsistency(t *testing.T) {
+	tz, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatalf("LoadLocation: %v", err)
+	}
+	civilDate := time.Date(2026, 4, 29, 0, 0, 0, 0, time.UTC)
+
+	cases := []struct {
+		name string
+		raw  []byte
+	}{
+		{"single-model GFS bare-numeric (synthPoll)", synthPoll(t)},
+		{"multi-model GFS+ECMWF prefixed (synthMultiModelPoll)", synthMultiModelPoll(t)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			poll, parseErr := ParsePoll(tc.raw)
+			if parseErr != nil {
+				t.Fatalf("ParsePoll: %v", parseErr)
+			}
+			extremes, extErr := poll.DailyExtremesF(civilDate, tz)
+			if extErr != nil {
+				t.Fatalf("DailyExtremesF: %v", extErr)
+			}
+			fromExtremes := pollModelSet(extremes)
+			if !mos.ModelSetEqual(poll.ModelSet, fromExtremes) {
+				t.Errorf("Poll.ModelSet=%v != pollModelSet(extremes)=%v; the cached precompute drifted from the per-trade derivation",
+					poll.ModelSet, fromExtremes)
+			}
+			if len(poll.ModelSet) == 0 {
+				t.Errorf("Poll.ModelSet is empty; ParsePoll must populate it for every non-empty Members map")
+			}
+		})
+	}
+}
+
 // envelope mirrors internal/replay.Envelope for fixture writing.
 type envelope struct {
 	Wall    int64           `json:"t"`

@@ -10,6 +10,9 @@ import (
 // multi-model Open-Meteo response. The temperature series themselves are
 // not load-bearing for pollModelSet — only the member-ID prefix patterns
 // are exercised — so values are deliberately empty.
+//
+// Poll.ModelSet is populated here too (mirroring what ParsePoll does),
+// so callers can exercise the cached read path.
 func buildMultiModelPoll(gfsN, ecmwfN int) *Poll {
 	members := make(map[string][]float64, gfsN+ecmwfN)
 	// GFS: "ncep_gefs_seamless:00" .. "ncep_gefs_seamless:NN"
@@ -20,7 +23,10 @@ func buildMultiModelPoll(gfsN, ecmwfN int) *Poll {
 	for i := 0; i < ecmwfN; i++ {
 		members[fmt.Sprintf("ecmwf_ifs025_ensemble:%02d", i)] = nil
 	}
-	return &Poll{Members: members}
+	return &Poll{
+		Members:  members,
+		ModelSet: pollModelSetFromMembers(members),
+	}
 }
 
 // buildExtremesMap constructs the map[string]MemberDaily that the scan
@@ -50,5 +56,21 @@ func BenchmarkPollModelSet_NoCache(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		_ = pollModelSet(extremes)
+	}
+}
+
+// BenchmarkPollModelSet_Cached measures the cached read path that the
+// scan hot path now uses: a single field read on *Poll. Mirrors the
+// structure of BenchmarkPollModelSet_NoCache exactly (same poll, same
+// loop body) so deltas are directly comparable. Allocs/op should be 0;
+// ns/op should be small constant (load+return).
+func BenchmarkPollModelSet_Cached(b *testing.B) {
+	poll := buildMultiModelPoll(31, 31)
+	_ = buildExtremesMap(poll) // parity with NoCache setup; not read in the loop
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = poll.ModelSet
 	}
 }
