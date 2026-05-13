@@ -10,6 +10,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -29,6 +31,7 @@ import (
 	"github.com/wh0o0pz/isobar/internal/env"
 	"github.com/wh0o0pz/isobar/internal/journal"
 	"github.com/wh0o0pz/isobar/internal/kalshi"
+	"github.com/wh0o0pz/isobar/internal/market"
 	"github.com/wh0o0pz/isobar/internal/obs"
 	"github.com/wh0o0pz/isobar/internal/openmeteo"
 )
@@ -51,7 +54,14 @@ func main() {
 	}
 
 	if _, err := env.LoadNearest(""); err != nil {
-		fmt.Fprintln(os.Stderr, "warn: load .env:", err)
+		// Insecure-mode errors are fatal: refusing to boot with a
+		// world/group-readable .env is the whole point of the check.
+		// Other read errors (corrupt file, EISDIR) are also fatal here
+		// since the operator opted in to a .env by placing one in the
+		// walk path. The earlier behaviour of warning-and-continuing
+		// silently masked credential-loading failures.
+		fmt.Fprintln(os.Stderr, "fatal: load .env:", err)
+		os.Exit(1)
 	}
 
 	logger := obs.Init(os.Getenv("ISOBAR_LOG_LEVEL"))
@@ -64,29 +74,99 @@ func main() {
 		os.Exit(1)
 	}
 
+	// SHA-256 the raw config bytes so the boot frame can stamp a stable
+	// fingerprint of the operator's deployed configuration. We re-read
+	// the file rather than threading it through config.Load to keep the
+	// config package's API unchanged. Empty path (test runs) → "".
+	configSHA := computeConfigSHA(*cfgPath, logger)
+
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	if err := run(ctx, logger, cfg); err != nil {
+	if err := run(ctx, logger, cfg, configSHA); err != nil {
 		logger.Error("tape exited with error", "err", err)
 		os.Exit(1)
 	}
 	logger.Info("tape exited cleanly")
 }
 
-func run(ctx context.Context, logger *slog.Logger, cfg config.Config) error {
+// computeConfigSHA returns the lowercase hex SHA-256 of the bytes at
+// path. If path is empty or the read fails, returns "" and logs at
+// warn — the boot frame still ships but with an empty fingerprint, so
+// downstream cutover detection just becomes "different from previous
+// boot frame" (which still works as a segmentation signal).
+func computeConfigSHA(path string, logger *slog.Logger) string {
+	if path == "" {
+		return ""
+	}
+	b, err := os.ReadFile(path) //nolint:gosec // operator-supplied config flag, not user input; already read by config.Load
+	if err != nil {
+		logger.Warn("boot frame: could not re-read config for SHA-256", "path", path, "err", err)
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+func run(ctx context.Context, logger *slog.Logger, cfg config.Config, configSHA string) error {
 	g, ctx := errgroup.WithContext(ctx)
 
 	if cfg.Kalshi.Enabled {
-		g.Go(func() error { return startKalshi(ctx, logger, cfg) })
+		g.Go(func() error { return startKalshi(ctx, logger, cfg, configSHA, g) })
 	}
 	if cfg.OpenMeteo.Enabled {
-		g.Go(func() error { return startOpenMeteo(ctx, logger, cfg) })
+		g.Go(func() error { return startOpenMeteo(ctx, logger, cfg, configSHA) })
 	}
 	return g.Wait()
 }
 
-func startKalshi(ctx context.Context, logger *slog.Logger, cfg config.Config) error {
+// bootSchemaVersion identifies the on-disk shape of the boot frame's
+// payload. Bump when fields are renamed/removed (additions are
+// backward-compatible). Downstream tools (edge-scan, analyze) match
+// on this string before trusting field names.
+const bootSchemaVersion = "isobar-tape.boot/v1"
+
+// bootPayload is the JSON shape carried in the boot frame's Payload
+// field. Field order/names are part of the public tape format.
+type bootPayload struct {
+	ConfigSHA256  string           `json:"config_sha256"`
+	BuildCommit   string           `json:"build_commit"`
+	BuildVersion  string           `json:"build_version,omitempty"`
+	BuildTime     string           `json:"build_time,omitempty"`
+	Stations      []market.Station `json:"stations"`
+	SchemaVersion string           `json:"schema_version"`
+}
+
+// writeBootFrame emits a single cutover-marker frame at journal open.
+// The frame's src is "isobar-tape" (not the per-source journal name)
+// so downstream readers can identify it across both kalshi/ and
+// openmeteo/ streams with one predicate. Kind is "boot".
+func writeBootFrame(jrn *journal.Journal, configSHA string) {
+	payload := bootPayload{
+		ConfigSHA256:  configSHA,
+		BuildCommit:   commit,
+		BuildVersion:  version,
+		BuildTime:     buildTime,
+		Stations:      market.AllStationsCanonical(),
+		SchemaVersion: bootSchemaVersion,
+	}
+	b, err := json.Marshal(&payload)
+	if err != nil {
+		// json.Marshal on a flat struct of strings + market.Station
+		// (no pointers, no channels) will not fail in practice. Log
+		// at warn rather than swallow silently.
+		slog.Warn("boot frame: marshal failed; skipping", "err", err)
+		return
+	}
+	jrn.Write(journal.Frame{
+		Stamp:   clock.Now(),
+		Source:  "isobar-tape",
+		Kind:    "boot",
+		Payload: b,
+	})
+}
+
+func startKalshi(ctx context.Context, logger *slog.Logger, cfg config.Config, configSHA string, g *errgroup.Group) error {
 	pemBytes, source, err := loadKalshiPEM(cfg.Kalshi)
 	if err != nil {
 		return err
@@ -102,6 +182,7 @@ func startKalshi(ctx context.Context, logger *slog.Logger, cfg config.Config) er
 		return err
 	}
 	defer func() { _ = jrn.Close() }()
+	writeBootFrame(jrn, configSHA)
 
 	rest := kalshi.NewClient(cfg.Kalshi.APIBase, signer)
 	tickers, err := rest.DiscoverOpenTickers(ctx, cfg.Kalshi.Series, logger)
@@ -128,7 +209,9 @@ func startKalshi(ctx context.Context, logger *slog.Logger, cfg config.Config) er
 	})
 
 	if cfg.Kalshi.RediscoverInterval > 0 {
-		go runRediscovery(ctx, logger, rest, sub, cfg.Kalshi.Series, cfg.Kalshi.RediscoverInterval)
+		g.Go(func() error {
+			return runRediscovery(ctx, logger, rest, sub, cfg.Kalshi.Series, cfg.Kalshi.RediscoverInterval)
+		})
 	}
 
 	return sub.Run(ctx)
@@ -138,15 +221,34 @@ func startKalshi(ctx context.Context, logger *slog.Logger, cfg config.Config) er
 // subscriber if the open-ticker set changed. This prevents the recorder
 // from going dead after configured series' brackets settle (the next-day
 // markets exist in Kalshi's catalog but were not in the initial
-// subscription). Returns when ctx is cancelled.
-func runRediscovery(ctx context.Context, logger *slog.Logger, rest *kalshi.Client, sub *kalshi.Subscriber, series []string, interval time.Duration) {
+// subscription).
+//
+// Lifecycle: returns nil on ctx cancellation (graceful shutdown). A
+// panic inside the loop is recovered and converted into an error so
+// the parent errgroup kills the whole process rather than leaving an
+// orphaned goroutine with the tape running blind.
+func runRediscovery(ctx context.Context, logger *slog.Logger, rest *kalshi.Client, sub *kalshi.Subscriber, series []string, interval time.Duration) (retErr error) {
+	defer func() {
+		if r := recover(); r != nil {
+			// Use the default logger as a fallback: if the supplied
+			// logger is what panicked (e.g. nil deref), calling it
+			// again here would re-panic past the recover boundary.
+			lg := logger
+			if lg == nil {
+				lg = slog.Default()
+			}
+			lg.Error("kalshi: rediscovery panicked — failing the errgroup", "recover", r)
+			retErr = fmt.Errorf("kalshi: rediscovery panic: %v", r)
+		}
+	}()
+
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	logger.Info("kalshi: rediscovery started", "interval", interval)
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 		case <-t.C:
 			fresh, err := rest.DiscoverOpenTickers(ctx, series, logger)
 			if err != nil {
@@ -211,12 +313,13 @@ func sample(s []string, n int) []string {
 	return s[:n]
 }
 
-func startOpenMeteo(ctx context.Context, logger *slog.Logger, cfg config.Config) error {
+func startOpenMeteo(ctx context.Context, logger *slog.Logger, cfg config.Config, configSHA string) error {
 	jrn, err := openJournal(cfg, "openmeteo", logger)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = jrn.Close() }()
+	writeBootFrame(jrn, configSHA)
 
 	locs := make([]openmeteo.Location, 0, len(cfg.OpenMeteo.Locations))
 	for _, l := range cfg.OpenMeteo.Locations {
