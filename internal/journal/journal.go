@@ -60,12 +60,22 @@ type Frame struct {
 	Payload json.RawMessage
 }
 
+// EnvelopeSchemaVersion is stamped into every envelope's "v" field at
+// write time. It identifies the on-disk shape so a future reader can
+// switch behavior based on schema generation. Readers tolerate the
+// field's absence (frames written before this constant existed decode
+// with v == "" and are re-labeled at read time — see
+// internal/replay.EnvelopeSchemaLegacyV0). Reader-side migration
+// policy beyond "tolerate absence" is held for Phase 2.
+const EnvelopeSchemaVersion = "isobar.journal/v1"
+
 // envelope is the on-disk JSON shape: flat, compact, NDJSON-friendly.
 type envelope struct {
 	Wall    int64           `json:"t"`
 	Mono    int64           `json:"m"`
 	Source  string          `json:"src"`
 	Kind    string          `json:"k"`
+	Version string          `json:"v"`
 	Payload json.RawMessage `json:"p,omitempty"`
 }
 
@@ -240,6 +250,7 @@ func (j *Journal) Write(f Frame) {
 		Mono:    f.Stamp.Mono,
 		Source:  f.Source,
 		Kind:    f.Kind,
+		Version: EnvelopeSchemaVersion,
 		Payload: p,
 	}
 	select {

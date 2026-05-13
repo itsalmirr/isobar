@@ -178,6 +178,63 @@ func TestForEachFramePropagatesFnError(t *testing.T) {
 	require.ErrorIs(t, err, sentinel)
 }
 
+// TestEnvelope_LegacyReadAsV0 is the read-side back-compat tripwire
+// for the envelope schema-version field. Tape predating the "v"
+// stamp decodes with Version == "" off-disk; the reader must
+// transparently rewrite that to EnvelopeSchemaLegacyV0 so downstream
+// consumers can always switch on env.Version without nil checks. The
+// test writes a synthetic line with no "v" key — through the stdlib
+// json package directly, NOT through the journal writer — so we
+// control exactly what hits disk, then asserts the reader stamps the
+// legacy label.
+func TestEnvelope_LegacyReadAsV0(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "legacy.jsonl")
+	// Hand-crafted legacy frame: no "v" field. This is the literal
+	// shape of every frame in the ~700 MB of prod tape recorded
+	// before the schema stamp landed.
+	writeJSONL(t, path, []string{
+		`{"t":1700000000000000000,"m":12345,"src":"kalshi","k":"ws","p":{"type":"trade"}}`,
+	})
+
+	var got []Envelope
+	require.NoError(t, ForEachFrame([]string{path}, func(env Envelope, _ int, _ bool) error {
+		got = append(got, env)
+		return nil
+	}))
+	require.Len(t, got, 1)
+	require.Equal(t, EnvelopeSchemaLegacyV0, got[0].Version,
+		"reader must label v-less legacy frames as %s", EnvelopeSchemaLegacyV0)
+	// Sanity: the rest of the envelope must still decode correctly so
+	// the version back-compat path doesn't introduce silent data loss.
+	require.Equal(t, "kalshi", got[0].Source)
+	require.Equal(t, "ws", got[0].Kind)
+	require.Equal(t, int64(1700000000000000000), got[0].Wall)
+}
+
+// TestEnvelope_CurrentVersionReadsThrough verifies a frame with a
+// populated "v" field flows through replay untouched by the legacy
+// back-compat path. Together with TestEnvelope_LegacyReadAsV0 this
+// pins both branches of the version-resolution behavior, so a future
+// reader change can't accidentally re-label v1 frames.
+func TestEnvelope_CurrentVersionReadsThrough(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "current.jsonl")
+	// Hand-crafted current-shape frame: "v" populated to the constant.
+	writeJSONL(t, path, []string{
+		`{"t":1700000000000000000,"m":12345,"src":"kalshi","k":"ws","v":"isobar.journal/v1","p":{"type":"trade"}}`,
+	})
+
+	var got []Envelope
+	require.NoError(t, ForEachFrame([]string{path}, func(env Envelope, _ int, _ bool) error {
+		got = append(got, env)
+		return nil
+	}))
+	require.Len(t, got, 1)
+	require.Equal(t, "isobar.journal/v1", got[0].Version,
+		"v1 frames must round-trip through replay without re-labeling")
+}
+
 func TestForEachFrameReadsLargeLines(t *testing.T) {
 	// 256 KiB payload, well under MaxLineBytes but above Scanner's 64 KiB default.
 	big := make([]byte, 256<<10)
