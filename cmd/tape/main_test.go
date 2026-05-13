@@ -14,6 +14,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/wh0o0pz/isobar/internal/config"
 	"github.com/wh0o0pz/isobar/internal/journal"
 	"github.com/wh0o0pz/isobar/internal/kalshi"
 )
@@ -33,6 +34,7 @@ func TestWriteBootFrameShape(t *testing.T) {
 		MaxFileAge:   time.Hour,
 		QueueSize:    16,
 		FlushEvery:   10 * time.Millisecond,
+		OnDropAlarm:  journal.NoopAlarmHook,
 	}, logger)
 	require.NoError(t, err)
 
@@ -92,6 +94,7 @@ func TestWriteBootFrameWritesToBothStreams(t *testing.T) {
 				MaxFileAge:   time.Hour,
 				QueueSize:    8,
 				FlushEvery:   10 * time.Millisecond,
+				OnDropAlarm:  journal.NoopAlarmHook,
 			}, logger)
 			require.NoError(t, err)
 			writeBootFrame(j, "sha-"+src)
@@ -225,6 +228,151 @@ func TestRunRediscoveryRecoversPanic(t *testing.T) {
 		require.Contains(t, err.Error(), "panic")
 	case <-time.After(5 * time.Second):
 		t.Fatal("runRediscovery did not return within 5s of panic")
+	}
+}
+
+// TestProdJournalHasAlarmHookWired is the static tripwire for A1
+// (ADR-0011). It exercises the production journal-construction path
+// (openJournal) with a representative config fixture and asserts the
+// returned journal succeeded — which is only possible if openJournal
+// passed a non-nil OnDropAlarm to journal.Open (Open returns
+// ErrAlarmHookRequired otherwise).
+//
+// This is the regression detector: if anyone ever drops the hook
+// wiring from openJournal (or rebuilds it with a typo), this test
+// fails on the build, before the unwired binary can ship.
+func TestProdJournalHasAlarmHookWired(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cfg := config.Config{
+		DataDir: t.TempDir(),
+		Journal: config.Journal{
+			MaxFileBytes:     1 << 20,
+			MaxFileAge:       time.Hour,
+			FlushEvery:       250 * time.Millisecond,
+			QueueSize:        16,
+			CompressOnRotate: false,
+		},
+	}
+	alarms := newAlarmSink(cfg.DataDir, logger)
+	t.Cleanup(func() { _ = alarms.Close() })
+
+	for _, src := range []string{"kalshi", "openmeteo"} {
+		t.Run(src, func(t *testing.T) {
+			j, err := openJournal(cfg, src, logger, alarms)
+			require.NoError(t, err,
+				"openJournal must construct successfully with a wired hook; "+
+					"if it returns ErrAlarmHookRequired here, the alarm hook "+
+					"has been silently dropped from cmd/tape's wiring")
+			t.Cleanup(func() { _ = j.Close() })
+		})
+	}
+}
+
+// TestProdJournalAlarmHookEmitsCounterLogAndFile is the dynamic
+// regression test for A1. It forces enough drops through a journal
+// built by openJournal to cross the alarm threshold, then asserts the
+// three sinks the hook wires:
+//
+//  1. JournalDropsTotal() bumps by at least N (the process-wide
+//     counter, future Prometheus surface).
+//  2. The alarms file exists at <DataDir>/alarms/<YYYY-MM-DD>.jsonl.
+//  3. The file contains at least one well-formed alarm record with
+//     the documented fields (ts, src, dropped, queue_depth,
+//     since_last_drop_ms).
+//
+// Without the A1 hook wiring this test fails at JournalDropsTotal()
+// (still zero) AND at the file-exists assertion. With it, all three
+// pass. The test overrides journal.alarmCheckInterval and
+// alarmSustainForTest so the breach window collapses to ms.
+func TestProdJournalAlarmHookEmitsCounterLogAndFile(t *testing.T) {
+	prev := journal.SetAlarmCheckIntervalForTest(5 * time.Millisecond)
+	t.Cleanup(func() { journal.SetAlarmCheckIntervalForTest(prev) })
+
+	// Reduce AlarmSustain so the crossing-edge fires within the test
+	// run instead of waiting the 60s production default.
+	prevSustain := alarmSustainForTest
+	prevThreshold := alarmThresholdForTest
+	alarmSustainForTest = 20 * time.Millisecond
+	alarmThresholdForTest = 1 // 1 drop/sec is plenty for the burst below
+	t.Cleanup(func() {
+		alarmSustainForTest = prevSustain
+		alarmThresholdForTest = prevThreshold
+	})
+
+	// Snapshot the process counter so we can measure the delta this
+	// test contributes; other parallel tests in the same binary may
+	// have left non-zero state behind.
+	before := JournalDropsTotal()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	dataDir := t.TempDir()
+	cfg := config.Config{
+		DataDir: dataDir,
+		Journal: config.Journal{
+			MaxFileBytes: 1 << 20,
+			MaxFileAge:   time.Hour,
+			FlushEvery:   time.Hour, // park the flush so the queue stays full
+			QueueSize:    2,         // tiny — guaranteed overflow
+		},
+	}
+	alarms := newAlarmSink(dataDir, logger)
+	t.Cleanup(func() { _ = alarms.Close() })
+
+	j, err := openJournal(cfg, "kalshi", logger, alarms)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = j.Close() })
+
+	// Hammer drops in a tight loop, yielding occasionally so the
+	// alarm-check tick goroutine actually runs. Mirrors the pattern
+	// from internal/journal/journal_test.go's alarm tests.
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		for k := 0; k < 1000; k++ {
+			j.Write(journal.Frame{Source: "kalshi", Kind: "x", Payload: []byte(`"x"`)})
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// (1) Process counter — bump means the hook fired at least once.
+	require.Eventually(t, func() bool {
+		return JournalDropsTotal() > before
+	}, 500*time.Millisecond, 5*time.Millisecond,
+		"JournalDropsTotal must bump after sustained drops; before=%d now=%d drops=%d",
+		before, JournalDropsTotal(), j.Dropped())
+
+	// (2) Alarms file exists at the documented path.
+	day := time.Now().UTC().Format("2006-01-02")
+	alarmFile := filepath.Join(dataDir, "alarms", day+".jsonl")
+	require.Eventually(t, func() bool {
+		_, statErr := os.Stat(alarmFile)
+		return statErr == nil
+	}, 500*time.Millisecond, 5*time.Millisecond,
+		"alarms file should exist at %s after sustained drops", alarmFile)
+
+	// (3) File has at least one well-formed record with the spec's
+	// fields. May have more than one if debounce permits a clear+
+	// re-cross during the burst — we assert at-least, not equals.
+	data, err := os.ReadFile(alarmFile) //nolint:gosec // test-local path under t.TempDir()
+	require.NoError(t, err)
+	require.NotEmpty(t, data, "alarms file is empty after sustained drops")
+
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	require.GreaterOrEqual(t, len(lines), 1, "expected at least one alarm record")
+	for _, line := range lines {
+		var rec map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &rec),
+			"alarm record must be valid JSON: %s", line)
+		require.Contains(t, rec, "ts", "alarm record missing ts: %s", line)
+		require.Contains(t, rec, "src", "alarm record missing src: %s", line)
+		require.Equal(t, "kalshi", rec["src"])
+		require.Contains(t, rec, "dropped", "alarm record missing dropped: %s", line)
+		require.Contains(t, rec, "queue_depth", "alarm record missing queue_depth: %s", line)
+		require.Contains(t, rec, "since_last_drop_ms", "alarm record missing since_last_drop_ms: %s", line)
+		// ts must parse as RFC3339Nano so log shippers can normalize.
+		tsStr, ok := rec["ts"].(string)
+		require.True(t, ok, "ts must be a string")
+		_, err := time.Parse(time.RFC3339Nano, tsStr)
+		require.NoError(t, err, "ts must be RFC3339Nano: %s", tsStr)
 	}
 }
 

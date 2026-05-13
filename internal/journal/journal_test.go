@@ -35,6 +35,13 @@ func newTestJournal(t *testing.T, opts Options) (*Journal, string) {
 	if opts.FlushEvery == 0 {
 		opts.FlushEvery = 50 * time.Millisecond
 	}
+	// OnDropAlarm is required after A1. Tests that don't care about
+	// drop events get a no-op; tests that need to assert on hook
+	// behavior use newTestJournalWithHook, which preserves the
+	// caller-supplied hook intact.
+	if opts.OnDropAlarm == nil {
+		opts.OnDropAlarm = NoopAlarmHook
+	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	j, err := Open(opts, logger)
 	require.NoError(t, err)
@@ -188,10 +195,29 @@ func TestJournalPayloadCopyDetachesCallerBuffer(t *testing.T) {
 // — the happy-path tests always pass valid options so these branches
 // stayed uncovered.
 func TestOpenRejectsEmptyDirAndSource(t *testing.T) {
-	_, err := Open(Options{Dir: "", Source: "x"}, nil)
+	_, err := Open(Options{Dir: "", Source: "x", OnDropAlarm: NoopAlarmHook}, nil)
 	require.ErrorContains(t, err, "required")
-	_, err = Open(Options{Dir: "x", Source: ""}, nil)
+	_, err = Open(Options{Dir: "x", Source: "", OnDropAlarm: NoopAlarmHook}, nil)
 	require.ErrorContains(t, err, "required")
+}
+
+// TestOpenRejectsNilAlarmHook is the regression detector for the A1
+// change to Open semantics: ADR-0011's default slog.Warn fallback was
+// deleted because every prod cmd/tape run was accidentally accepting
+// it. A nil OnDropAlarm must now fail construction with
+// ErrAlarmHookRequired so production deploys cannot silently regress
+// back to "running blind to journal drops".
+func TestOpenRejectsNilAlarmHook(t *testing.T) {
+	dir := t.TempDir()
+	_, err := Open(Options{
+		Dir:          dir,
+		Source:       "test",
+		MaxFileBytes: 1 << 20,
+		MaxFileAge:   time.Hour,
+		// OnDropAlarm intentionally nil — must error.
+	}, nil)
+	require.ErrorIs(t, err, ErrAlarmHookRequired,
+		"Open must reject a nil OnDropAlarm with ErrAlarmHookRequired")
 }
 
 // TestOpenAcceptsNilLoggerAndDefaultsQueue verifies the two default-fill
@@ -205,6 +231,7 @@ func TestOpenAcceptsNilLoggerAndDefaultsQueue(t *testing.T) {
 		Source:       "test",
 		MaxFileBytes: 1 << 20,
 		MaxFileAge:   time.Hour,
+		OnDropAlarm:  NoopAlarmHook,
 	}, nil)
 	require.NoError(t, err)
 	j.Write(Frame{Source: "test", Kind: "x", Payload: json.RawMessage(`"ok"`)})
@@ -229,6 +256,7 @@ func TestOpenInitialOpenFailsEntersDrainMode(t *testing.T) {
 		MaxFileBytes: 1 << 20,
 		MaxFileAge:   time.Hour,
 		QueueSize:    4,
+		OnDropAlarm:  NoopAlarmHook,
 	}, nil)
 	require.NoError(t, err, "Open returns; run() fails asynchronously")
 
@@ -453,6 +481,7 @@ func TestWrite_SampledDebugLogFires(t *testing.T) {
 		QueueSize:    2,
 		FlushEvery:   time.Hour, // park flush
 		SampleEvery:  10,
+		OnDropAlarm:  NoopAlarmHook,
 	}, logger)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = j.Close() })
@@ -698,71 +727,6 @@ func TestClose_DoesNotPanicOnConcurrentWrite(t *testing.T) {
 	wg.Wait()
 }
 
-// TestDefaultAlarmHook_FiresStructuredWarn verifies the default
-// fallback hook (used when Options.OnDropAlarm is nil) emits a
-// structured slog.Warn record with the expected field shape.
-// ADR-0011 §4 default-hook contract.
-func TestDefaultAlarmHook_FiresStructuredWarn(t *testing.T) {
-	withShortAlarmInterval(t, 5*time.Millisecond)
-
-	buf := &syncBuf{}
-	handler := slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})
-	logger := slog.New(handler)
-
-	dir := t.TempDir()
-	j, err := Open(Options{
-		Dir:            dir,
-		Source:         "test",
-		MaxFileBytes:   1 << 20,
-		MaxFileAge:     time.Hour,
-		QueueSize:      2,
-		FlushEvery:     time.Hour,
-		AlarmThreshold: 1,
-		AlarmSustain:   20 * time.Millisecond,
-		// OnDropAlarm intentionally nil -> default sink.
-	}, logger)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = j.Close() })
-
-	// First, expect a startup Warn line about the default sink itself.
-	require.Eventually(t, func() bool {
-		return strings.Contains(buf.String(), "drop-alarm sink is default slog.Warn")
-	}, 200*time.Millisecond, 5*time.Millisecond, "startup warn line missing")
-
-	// Burst drops to force a sustained breach.
-	deadline := time.Now().Add(300 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		for k := 0; k < 1000; k++ {
-			j.Write(Frame{Source: "test", Kind: "x", Payload: json.RawMessage(`"x"`)})
-		}
-		time.Sleep(time.Millisecond)
-	}
-
-	// Wait for the alarm-fired log line.
-	require.Eventually(t, func() bool {
-		return strings.Contains(buf.String(), "drop-alarm fired")
-	}, 500*time.Millisecond, 5*time.Millisecond, "expected default warn fire")
-
-	// Verify the fired record has the documented shape.
-	var found bool
-	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
-		var rec map[string]any
-		if err := json.Unmarshal([]byte(line), &rec); err != nil {
-			continue
-		}
-		if rec["msg"] == "journal: drop-alarm fired" && rec["level"] == "WARN" {
-			require.Equal(t, "test", rec["src"])
-			require.NotNil(t, rec["drops"])
-			require.NotNil(t, rec["since"])
-			require.NotNil(t, rec["threshold_per_sec"])
-			require.NotNil(t, rec["sustained_for"])
-			found = true
-			break
-		}
-	}
-	require.True(t, found, "expected at least one drop-alarm fired record at WARN level")
-}
-
 // TestOnDropAlarm_PanicDoesNotKillWriter installs a hook that always
 // panics, induces sustained drops, and asserts:
 //  1. AlarmHookPanicTotal() rises (the panic was caught and counted);
@@ -833,8 +797,8 @@ func TestOnDropAlarm_PanicDoesNotKillWriter(t *testing.T) {
 	require.NotEmpty(t, files, "expected at least one journal file")
 	var found bool
 	for _, p := range files {
-		data, err := os.ReadFile(p)
-		require.NoError(t, err)
+		data, readErr := os.ReadFile(p) //nolint:gosec // test-local path under t.TempDir()
+		require.NoError(t, readErr)
 		if strings.Contains(string(data), `"survived":true`) {
 			found = true
 			break
