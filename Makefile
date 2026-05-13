@@ -93,9 +93,18 @@ vet:
 	$(GO) vet $(PKGS)
 
 .PHONY: lint
-lint:
+lint: clockcheck
 	@command -v golangci-lint >/dev/null || { echo "install: https://golangci-lint.run/welcome/install/"; exit 1; }
 	golangci-lint run
+
+# clockcheck: enforce ADR-0012 time-source discipline. Runs the custom
+# x/tools/go/analysis analyzer at tools/clockcheck against ./internal/...
+# and fails the build on any direct time.Now / time.Since / time.Until
+# outside the allowlist (internal/clock, cmd/*/main.go, *_test.go,
+# //nolint:clockcheck lines, and the temporary internal/journal exempt).
+.PHONY: clockcheck
+clockcheck:
+	$(GO) run ./tools/clockcheck/cmd/clockcheck ./internal/...
 
 .PHONY: fmt
 fmt:
