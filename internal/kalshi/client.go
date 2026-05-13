@@ -661,9 +661,38 @@ func (c *Client) doRaw(ctx context.Context, req *http.Request) ([]byte, error) {
 		if status < 200 || status >= 300 {
 			return nil, fmt.Errorf("kalshi: API error %d: %s", status, string(bodyBytes))
 		}
+		c.recordSuccess()
 		return bodyBytes, nil
 	}
 	return nil, fmt.Errorf("kalshi: exhausted retries")
+}
+
+// recordSuccess implements the success-counter decay for minDelay.
+// After every 2xx, increment consecutive2x. When the counter reaches
+// successDecayThreshold, halve minDelay (floor at baseMinDelay) and
+// reset the counter. Without this decay, a single 429 cluster would
+// leave minDelay clamped at maxAdaptiveDelay (2s) for process lifetime
+// because the only previous reset was the rarely-called ResetRateLimit().
+//
+// Threshold of 10 was chosen so callers see decay after a short healthy
+// burst but transient single-call 2xx flickers don't immediately undo
+// the protective throttle bump from a 429.
+const successDecayThreshold = 10
+
+func (c *Client) recordSuccess() {
+	c.rateMu.Lock()
+	defer c.rateMu.Unlock()
+	c.consecutive2x++
+	if c.consecutive2x < successDecayThreshold {
+		return
+	}
+	c.consecutive2x = 0
+	if c.minDelay > c.baseMinDelay {
+		c.minDelay /= 2
+		if c.minDelay < c.baseMinDelay {
+			c.minDelay = c.baseMinDelay
+		}
+	}
 }
 
 func (c *Client) do(ctx context.Context, req *http.Request, out interface{}) error {
