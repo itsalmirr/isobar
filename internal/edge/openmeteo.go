@@ -17,11 +17,19 @@ import (
 // control / deterministic forecast is keyed as "00" (Open-Meteo serves
 // it without a `_member` suffix); the 30 perturbations are "01" through
 // "30". Phase 0 expects 31 members for gfs_seamless ensemble.
+//
+// ModelSet is the canonical sorted model-tag set derived from Members
+// at parse time (see [pollModelSet] and [memberModelTag] in scan.go for
+// the derivation). It is invariant per *Poll — the underlying member
+// IDs don't change — so the edge scanner reads it directly instead of
+// recomputing per trade. Empty if the Poll was constructed without
+// going through [ParsePoll] (test-only).
 type Poll struct {
 	Latitude    float64
 	Longitude   float64
 	HourlyTimes []time.Time          // UTC, parallel to each Members value
 	Members     map[string][]float64 // memberID ("00" + "01".."30") → hourly °C
+	ModelSet    []string             // canonical sorted model tags (e.g. ["ecmwf", "gfs"]); see ParsePoll
 }
 
 // MemberCount returns the number of members successfully decoded.
@@ -107,6 +115,7 @@ func ParsePoll(raw []byte) (*Poll, error) {
 		Longitude:   om.Longitude,
 		HourlyTimes: times,
 		Members:     members,
+		ModelSet:    pollModelSetFromMembers(members),
 	}, nil
 }
 
