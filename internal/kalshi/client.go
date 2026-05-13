@@ -410,7 +410,7 @@ const perRequestTimeout = 10 * time.Second
 // This ensures no naked client.Do can hang past perRequestTimeout even
 // if the caller forgot a deadline.
 func withCallDeadline(ctx context.Context) (context.Context, context.CancelFunc) {
-	if d, ok := ctx.Deadline(); ok && time.Until(d) <= perRequestTimeout {
+	if d, ok := ctx.Deadline(); ok && time.Until(d) <= perRequestTimeout { //nolint:clockcheck // ctx.Deadline returns wall time; comparison is intrinsically wall-bound
 		return ctx, func() {}
 	}
 	return context.WithTimeout(ctx, perRequestTimeout)
