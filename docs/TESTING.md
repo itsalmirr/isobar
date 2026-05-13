@@ -62,20 +62,22 @@
 
 | package                | line coverage target | notes                              |
 | ---------------------- | -------------------- | ---------------------------------- |
-| `internal/clock`       | 100%                 | Pure; there's no excuse.           |
+| `internal/clock`       | 100%                 | Pure; there's no excuse. Now includes `Clock` interface + `FakeClock` per ADR-0012. |
 | `internal/env`         | 95%                  | Multi-line quote paths included.   |
 | `internal/obs`         | 90%                  | Level parsing + handler shape.     |
 | `internal/config`      | 95%                  | Every `Validate` branch.           |
-| `internal/journal`     | 90%                  | Rotation, drop, roundtrip, shutdown. *Currently ~86%.* |
+| `internal/journal`     | 90%                  | Rotation, drop, roundtrip, shutdown, `OnDropAlarm` edge-trigger + panic safety + envelope `v` (ADR-0011). |
 | `internal/kalshi`      | 85%                  | All REST verbs + signer + ws subscribe msg + DiscoverOpenTickers + throttle + SetTickers/Reload. |
 | `internal/edge`        | 85%                  | Ticker parser + fee model + poll pairing + scan/backtest math. |
-| `internal/market`      | 90%                  | Station registry round-trip + market ticker parser. |
-| `internal/openmeteo`   | 80%                  | URL build, error propagation, live poller behavior. |
-| `internal/replay`      | 90%                  | Journal read + Kalshi frame decode + orderbook apply + ApplyFrameToBooks helper. |
+| `internal/market`      | 90%                  | Station registry round-trip (market-ticker parser was deleted as dead — A9). |
+| `internal/openmeteo`   | 80%                  | URL build, error propagation, live poller behavior, 7-case retry-policy table (A6). |
+| `internal/replay`      | 90%                  | Journal read + Kalshi frame decode + orderbook apply (incl. uninitialized-book state machine + typed errors + counters — A3). |
 | `internal/retry`       | 95%                  | Jitter, Next, Do happy-path + ctx + max-attempts. |
 | `internal/calibration/cliparse` | 85%         | NWS bulletin parser + dedupe + gap report. |
-| `internal/calibration/mos`      | 90%         | OLS fit + Predict + ProbBelow + degenerate sigma. |
-| `internal/calibration/climate`  | 85%         | Frequency lookup + range probability + season window + ShrinkP + missing-column failure. |
+| `internal/calibration/mos`      | 90%         | OLS fit (clock-injected for determinism) + Predict + ProbBelow + degenerate sigma. |
+| `internal/calibration/climate`  | 85%         | Frequency lookup + range probability + season window + ShrinkP + leap-year-aware day-of-year (A7) + missing-column failure. |
+| `internal/calibration/bayesian` | 85%         | `Update`, `LoadKernel`, schema reject + `MinKernelN` floor + `MinObsVariance` floor (ADR-0010 foundation). |
+| `tools/clockcheck`     | n/a (analyzer)       | `analysistest.Run` against testdata fixtures verifies ADR-0012 enforcement: bans direct `time.Now/Since/Until` outside the allowlist. |
 
 Coverage is a floor, not a ceiling, and not a substitute for
 thinking — a 100%-covered function can still be wrong. But a package under
@@ -162,9 +164,35 @@ c := NewClient(srv.URL, signer)
 | `make test-short`  | `-short` for pre-commit speed                |
 | `make bench`       | `go test -bench=.` on hot paths              |
 | `make coverage`    | race-tested run with HTML coverage report    |
-| `make lint`        | golangci-lint with repo config               |
+| `make lint`        | `clockcheck` (custom analyzer, ADR-0012) + golangci-lint |
 | `make vet`         | `go vet ./...`                               |
 | `make all`         | lint + vet + test + build                    |
+
+## Lint discipline
+
+`make lint` runs `golangci-lint` plus `clockcheck`, a custom
+`x/tools/go/analysis` analyzer at
+[`tools/clockcheck/`](../tools/clockcheck/clockcheck.go). Per ADR-0012,
+clockcheck flags direct `time.Now` / `time.Since` / `time.Until` calls
+outside the allowlist: `internal/clock`, `cmd/*/main.go`, `*_test.go`,
+`//nolint:clockcheck` lines, and `internal/journal` (scoped exemption
+until that package's clock migration lands). Everywhere else,
+wall-time reads flow through `clock.Clock` or a `now func() time.Time`
+struct field — see `internal/kalshi/client.go` for the existing
+`now`-func pattern, and `withCallDeadline` for the
+`//nolint:clockcheck` escape hatch (`ctx.Deadline` is intrinsically
+wall-bound).
+
+Tests use `clock.Fake(initial)` for deterministic timing.
+`internal/calibration/mos.TestFit_DeterministicAcrossCalls` is the A8
+regression: with a fixed `FakeClock`, `Fit` is byte-identical across
+calls — was not true under the pre-A8 `time.Now()` stamp.
+
+Error-handling discipline test patterns (typed-error / counter /
+slog-handler-capture / alarm-hook) are proposed in
+[`audit/02-architecture.md`](../audit/02-architecture.md) §2.1.6
+(pending per-decision sign-off as ADR-0014). The A3
+`internal/replay/orderbook_test.go` changeset is the working exemplar.
 
 ## CI expectations
 
@@ -188,14 +216,55 @@ make all
 go test -race -count=100 -run TestJournalRotatesOnSize ./internal/journal
 ```
 
+## Tripwires & post-audit test inventory
+
+Bucket A (post-Phase-1 hardening) shipped three live regression
+tripwires plus several new test files. Pinned here because they're
+load-bearing — losing one of these silently means losing an audit
+finding:
+
+- [`cmd/tape/main_test.go`](../cmd/tape/main_test.go) —
+  `TestProdJournalHasAlarmHookWired` fails the build if `journal.Open`
+  is ever called from `cmd/tape` without a non-nil `OnDropAlarm`
+  (ADR-0011, A1). Also exercises the alarm-crossing path against a
+  shortened `AlarmSustain` via the test-only knob.
+- [`internal/journal/journal_test.go`](../internal/journal/journal_test.go)
+  — drop-counter, panic-safe hook (A2), envelope `v` field
+  (`isobar.journal/v1` + `v0-legacy` read path, S4), and alarm-hook
+  edge-trigger semantics.
+- [`internal/replay/orderbook_test.go`](../internal/replay/orderbook_test.go)
+  — A3 state-machine tests: typed `ErrBookUninitialized` /
+  `ErrSnapshotApplyFailed`, counters (`ResetCountersForTest`),
+  `logOnceOrSuppress`-via-slog-handler-capture pattern.
+- [`internal/calibration/bayesian/bayesian_test.go`](../internal/calibration/bayesian/bayesian_test.go)
+  — math primitive + kernel-loader + schema-reject + floor enforcement
+  (ADR-0010 foundation).
+- [`internal/openmeteo/client_retry_test.go`](../internal/openmeteo/client_retry_test.go)
+  — A6 retry-policy table: 7 cases covering 429/5xx/4xx/`Retry-After`
+  parsing.
+- [`tools/clockcheck/clockcheck_test.go`](../tools/clockcheck/clockcheck_test.go)
+  — `analysistest.Run` against `testdata/` fixtures: positive
+  (banned call) + allowlist (entry point / test file / `//nolint`) +
+  package-exempt (internal/clock, internal/journal) cases. Shipped
+  with ADR-0012.
+
+The three regression tripwires (alarm-hook + clockcheck +
+gitignore-vs-tracked) are summarized in
+[audit/01-line-audit.md](../audit/01-line-audit.md) Bucket A appendix.
+
 ## Known non-goals
 
 - **We do not test the real Kalshi/Open-Meteo APIs from CI.** They
   change, they rate-limit, and they'd block developers without secrets.
   Manual smoke tests happen in staging with a `-dry-run` flag.
-- **We do not test `main` directly.** `cmd/tape/main.go` is a 50-line
-  wiring file — its behavior is covered by the integration tests of the
-  packages it wires.
+- **We do not test `main` directly** beyond the alarm-hook tripwire
+  above. `cmd/tape/main.go` is otherwise a thin wiring file — its
+  behavior is covered by the integration tests of the packages it
+  wires. The four other `cmd/*` binaries have zero tests today; a
+  Phase 2 proposal (ADR-0019, in `audit/02-architecture.md` §4.2)
+  decides which of them survive consolidation and what test tier each
+  warrants. Pending per-decision sign-off — do not assume it's policy
+  yet.
 
 ## When tests break
 
