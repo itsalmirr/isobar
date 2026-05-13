@@ -193,8 +193,8 @@ func (s *Subscriber) runOnce(ctx context.Context) error {
 
 	conn.SetReadLimit(8 << 20) // 8 MiB max single message
 
-	if err := s.subscribe(runCtx, conn); err != nil {
-		return fmt.Errorf("subscribe: %w", err)
+	if subErr := s.subscribe(runCtx, conn); subErr != nil {
+		return fmt.Errorf("subscribe: %w", subErr)
 	}
 	s.mu.RLock()
 	tickerCount := len(s.tickers)
@@ -229,9 +229,9 @@ func (s *Subscriber) runOnce(ctx context.Context) error {
 
 	g.Go(func() error {
 		for {
-			_, data, err := conn.Read(gctx)
-			if err != nil {
-				return err
+			_, data, readErr := conn.Read(gctx)
+			if readErr != nil {
+				return readErr
 			}
 			// Update lastFrameTime before fan-out so OnFrame can never
 			// race with the watchdog seeing a stale value.
