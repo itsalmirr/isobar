@@ -37,8 +37,30 @@ type BinCoeffs struct {
 	B        float64 `json:"b"`         // slope (dimensionless)
 	Sigma    float64 `json:"sigma"`     // residual stdev (°F)
 	NTrain   int     `json:"n_train"`   // training pair count
-	NHoldout int     `json:"n_holdout"` // holdout pair count (recorded but not used in fit)
+	NHoldout int     `json:"n_holdout"` // holdout pair count (held out from fit, used for σ when ≥ MinHoldoutForSigma)
+	// SigmaSource records whether σ came from the OOS holdout residuals
+	// ("holdout") or from the training residuals as a fallback when the
+	// holdout was too small ("training-fallback"). In-sample residual σ
+	// underestimates predictive uncertainty (over-confident gaussian),
+	// which inflates downstream MOS probabilities and tail-bracket edges.
+	// Loaders that read older coefficients with no SigmaSource field get
+	// an empty string — interpret as training-fallback for back-compat.
+	SigmaSource string `json:"sigma_source,omitempty"`
 }
+
+// MinHoldoutForSigma is the smallest holdout sample we'll trust to
+// estimate σ. Below this the bin keeps the training-residual σ and
+// records SigmaSource = "training-fallback" so downstream code can flag
+// the over-confidence risk. 30 is the conventional rule-of-thumb for
+// stdev estimation; the literature supports 20-50 as a reasonable band.
+const MinHoldoutForSigma = 30
+
+// SigmaSourceHoldout / SigmaSourceTrainingFallback are the canonical
+// values of BinCoeffs.SigmaSource.
+const (
+	SigmaSourceHoldout          = "holdout"
+	SigmaSourceTrainingFallback = "training-fallback"
+)
 
 // CoefficientsSchemaVersion identifies the on-disk shape of a
 // Coefficients JSON. Bump on any change to bin-key format, BinCoeffs
@@ -122,6 +144,21 @@ func Fit(pairs []Pair, holdoutDays int) (Coefficients, error) {
 		}
 		c.NTrain = len(b.train)
 		c.NHoldout = len(b.holdout)
+		// σ from OOS holdout when we have enough samples; otherwise the
+		// in-sample training σ (already in c.Sigma) is kept and labelled.
+		// Holdout σ is the more honest predictive-uncertainty estimate —
+		// training σ understates it because the fitted a, b were chosen
+		// to minimise the same residuals.
+		if len(b.holdout) >= MinHoldoutForSigma {
+			if sig, ok := holdoutSigma(b.holdout, c.A, c.B); ok {
+				c.Sigma = sig
+				c.SigmaSource = SigmaSourceHoldout
+			} else {
+				c.SigmaSource = SigmaSourceTrainingFallback
+			}
+		} else {
+			c.SigmaSource = SigmaSourceTrainingFallback
+		}
 		out.Bins[key] = c
 	}
 
@@ -169,6 +206,27 @@ func fitOLS(pairs []Pair) (BinCoeffs, bool) {
 		return BinCoeffs{}, false
 	}
 	return BinCoeffs{A: a, B: b, Sigma: sigma}, true
+}
+
+// holdoutSigma computes the sample stdev (n−1 denominator) of residuals
+// observed − (a + b·forecast) on the holdout pairs, using the already-fit
+// (a, b). This is the OOS predictive-uncertainty estimate. Returns
+// ok=false on degenerate σ (zero, NaN, Inf, or fewer than 2 pairs).
+func holdoutSigma(holdout []Pair, a, b float64) (float64, bool) {
+	n := len(holdout)
+	if n < 2 {
+		return 0, false
+	}
+	var ss float64
+	for _, p := range holdout {
+		r := p.Observed - (a + b*p.Forecast)
+		ss += r * r
+	}
+	sigma := math.Sqrt(ss / float64(n-1))
+	if sigma == 0 || math.IsNaN(sigma) || math.IsInf(sigma, 0) {
+		return 0, false
+	}
+	return sigma, true
 }
 
 // Predict returns the calibrated (μ, σ) for a forecast at a given station
