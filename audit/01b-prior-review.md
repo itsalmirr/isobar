@@ -3,6 +3,15 @@
 > audit/01-line-audit.md on 2026-05-13. Retained for net-new coverage. Treat findings as input
 > requiring corroboration, not as authoritative output of this audit run.
 
+> **Cross-reference (2026-05-13, post-Bucket-A)**: This review's §3 ADR-gap table called out a
+> "calibration-eval harness (ADR-0012)" slot. Slot 0012 was instead claimed by time-source
+> discipline (clock injection + clockcheck analyzer + nolint policy) during Bucket A's A4
+> implementation. Slot **0013** records the retirement of the PR#9 paper-trader/scoring lineage
+> from `origin/main`'s direct history — capability work explicitly deferred per the
+> no-new-features framing of the audit; recovery paths documented therein. See
+> [docs/decisions/0013-retire-pr9-paper-trader-lineage.md](../docs/decisions/0013-retire-pr9-paper-trader-lineage.md).
+> The forthcoming calibration-eval ADR will land in slot 0014+ during Phase 2.
+
 # audit/01b-prior-review.md — Consolidated code, design, ADR audit (origin unknown)
 
 **Project**: `isobar` · **Date**: 2026-05-13 · **HEAD**: `5687c5e` (per `audit/00-map.md`)
