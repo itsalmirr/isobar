@@ -15,10 +15,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"os"
 	"sort"
 	"time"
+)
+
+// ModelGFS / ModelECMWF are the canonical short tags for the forecast
+// models we deal with. FitModelSet stores these in sorted order so
+// downstream comparisons can be a simple string-slice equality check
+// after both sides are canonicalized.
+const (
+	ModelGFS   = "gfs"
+	ModelECMWF = "ecmwf"
 )
 
 // Pair is one training/eval datum: a forecast for (station, valid_date,
@@ -37,8 +47,30 @@ type BinCoeffs struct {
 	B        float64 `json:"b"`         // slope (dimensionless)
 	Sigma    float64 `json:"sigma"`     // residual stdev (°F)
 	NTrain   int     `json:"n_train"`   // training pair count
-	NHoldout int     `json:"n_holdout"` // holdout pair count (recorded but not used in fit)
+	NHoldout int     `json:"n_holdout"` // holdout pair count (held out from fit, used for σ when ≥ MinHoldoutForSigma)
+	// SigmaSource records whether σ came from the OOS holdout residuals
+	// ("holdout") or from the training residuals as a fallback when the
+	// holdout was too small ("training-fallback"). In-sample residual σ
+	// underestimates predictive uncertainty (over-confident gaussian),
+	// which inflates downstream MOS probabilities and tail-bracket edges.
+	// Loaders that read older coefficients with no SigmaSource field get
+	// an empty string — interpret as training-fallback for back-compat.
+	SigmaSource string `json:"sigma_source,omitempty"`
 }
+
+// MinHoldoutForSigma is the smallest holdout sample we'll trust to
+// estimate σ. Below this the bin keeps the training-residual σ and
+// records SigmaSource = "training-fallback" so downstream code can flag
+// the over-confidence risk. 30 is the conventional rule-of-thumb for
+// stdev estimation; the literature supports 20-50 as a reasonable band.
+const MinHoldoutForSigma = 30
+
+// SigmaSourceHoldout / SigmaSourceTrainingFallback are the canonical
+// values of BinCoeffs.SigmaSource.
+const (
+	SigmaSourceHoldout          = "holdout"
+	SigmaSourceTrainingFallback = "training-fallback"
+)
 
 // CoefficientsSchemaVersion identifies the on-disk shape of a
 // Coefficients JSON. Bump on any change to bin-key format, BinCoeffs
@@ -50,11 +82,20 @@ const CoefficientsSchemaVersion = "isobar.mos/v1"
 // Coefficients is the full fitted model: one BinCoeffs per
 // (station, season, variable) bin keyed as "STA|SEASON|VAR".
 type Coefficients struct {
-	SchemaVersion      string               `json:"schema_version"`
-	FittedAt           time.Time            `json:"fitted_at"`
-	TrainingWindowEnd  string               `json:"training_window_end"`  // YYYY-MM-DD inclusive
-	HoldoutWindowStart string               `json:"holdout_window_start"` // YYYY-MM-DD inclusive
-	Bins               map[string]BinCoeffs `json:"bins"`
+	SchemaVersion      string    `json:"schema_version"`
+	FittedAt           time.Time `json:"fitted_at"`
+	TrainingWindowEnd  string    `json:"training_window_end"`  // YYYY-MM-DD inclusive
+	HoldoutWindowStart string    `json:"holdout_window_start"` // YYYY-MM-DD inclusive
+	// FitModelSet is the sorted, canonical set of forecast model names
+	// the coefficients were fit against (e.g. ["gfs"] or ["ecmwf","gfs"]).
+	// At scan-time, the scanner checks the observed poll's model set
+	// against this — applying GFS-only-trained MOS to an ECMWF+GFS poll
+	// would silently feed the regression a different μ scale than it was
+	// fit on, producing biased calibrated probabilities. Empty in legacy
+	// files (pre-FitModelSet) is treated by [LoadCoefficients] as
+	// ["gfs"] for back-compat.
+	FitModelSet []string             `json:"fit_model_set,omitempty"`
+	Bins        map[string]BinCoeffs `json:"bins"`
 }
 
 // MinTrainPerBin is the smallest number of training pairs we'll fit a
@@ -122,6 +163,21 @@ func Fit(pairs []Pair, holdoutDays int) (Coefficients, error) {
 		}
 		c.NTrain = len(b.train)
 		c.NHoldout = len(b.holdout)
+		// σ from OOS holdout when we have enough samples; otherwise the
+		// in-sample training σ (already in c.Sigma) is kept and labelled.
+		// Holdout σ is the more honest predictive-uncertainty estimate —
+		// training σ understates it because the fitted a, b were chosen
+		// to minimise the same residuals.
+		if len(b.holdout) >= MinHoldoutForSigma {
+			if sig, ok := holdoutSigma(b.holdout, c.A, c.B); ok {
+				c.Sigma = sig
+				c.SigmaSource = SigmaSourceHoldout
+			} else {
+				c.SigmaSource = SigmaSourceTrainingFallback
+			}
+		} else {
+			c.SigmaSource = SigmaSourceTrainingFallback
+		}
 		out.Bins[key] = c
 	}
 
@@ -169,6 +225,27 @@ func fitOLS(pairs []Pair) (BinCoeffs, bool) {
 		return BinCoeffs{}, false
 	}
 	return BinCoeffs{A: a, B: b, Sigma: sigma}, true
+}
+
+// holdoutSigma computes the sample stdev (n−1 denominator) of residuals
+// observed − (a + b·forecast) on the holdout pairs, using the already-fit
+// (a, b). This is the OOS predictive-uncertainty estimate. Returns
+// ok=false on degenerate σ (zero, NaN, Inf, or fewer than 2 pairs).
+func holdoutSigma(holdout []Pair, a, b float64) (float64, bool) {
+	n := len(holdout)
+	if n < 2 {
+		return 0, false
+	}
+	var ss float64
+	for _, p := range holdout {
+		r := p.Observed - (a + b*p.Forecast)
+		ss += r * r
+	}
+	sigma := math.Sqrt(ss / float64(n-1))
+	if sigma == 0 || math.IsNaN(sigma) || math.IsInf(sigma, 0) {
+		return 0, false
+	}
+	return sigma, true
 }
 
 // Predict returns the calibrated (μ, σ) for a forecast at a given station
@@ -230,6 +307,12 @@ func binKey(station, season, variable string) string {
 // and refuses any file whose schema_version doesn't match
 // CoefficientsSchemaVersion. The schema check is the read-side enforcement
 // of the "bump on math change" rule documented on the constant.
+//
+// Legacy files written before FitModelSet existed load with an empty
+// FitModelSet; in that case a warning is emitted via stdlib log.Printf
+// and the field is defaulted to ["gfs"] (the only model the project
+// trained on before this field was added). The on-disk file is left
+// untouched — re-fit to remove the warning.
 func LoadCoefficients(path string) (Coefficients, error) {
 	b, err := os.ReadFile(path) //nolint:gosec // path is operator-supplied CLI/config input
 	if err != nil {
@@ -246,7 +329,45 @@ func LoadCoefficients(path string) (Coefficients, error) {
 	if len(c.Bins) == 0 {
 		return Coefficients{}, fmt.Errorf("mos: %s has no fitted bins", path)
 	}
+	if len(c.FitModelSet) == 0 {
+		log.Printf("mos: %s has no fit_model_set; defaulting to [%q] for back-compat — re-fit recommended",
+			path, ModelGFS)
+		c.FitModelSet = []string{ModelGFS}
+	}
+	c.FitModelSet = CanonicalModelSet(c.FitModelSet)
 	return c, nil
+}
+
+// CanonicalModelSet returns a sorted, deduplicated copy of models so two
+// sets can be compared by simple slice equality. Empty strings are
+// dropped. The returned slice is always non-nil and may be empty.
+func CanonicalModelSet(models []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(models))
+	for _, m := range models {
+		if m == "" || seen[m] {
+			continue
+		}
+		seen[m] = true
+		out = append(out, m)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ModelSetEqual reports whether two canonical model sets contain the
+// same elements. Both inputs should already be canonicalized (see
+// [CanonicalModelSet]); the function does not re-canonicalize.
+func ModelSetEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // SortedBinKeys returns the bin keys in deterministic order. Useful for
