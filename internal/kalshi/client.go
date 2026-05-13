@@ -27,6 +27,11 @@ type Client struct {
 	rateMu   sync.Mutex
 	lastCall time.Time
 	minDelay time.Duration // minimum delay between requests
+
+	// now is the wall-time source for throttle accounting. Defaults to
+	// time.Now in NewClient; tests override via SetNowForTest to make
+	// rate-limit timing deterministic. Per ADR-0012.
+	now func() time.Time
 }
 
 // NewClient creates a Kalshi API client with built-in rate limiting.
@@ -45,7 +50,21 @@ func NewClient(baseURL string, signer *Signer) *Client {
 			Timeout: 10 * time.Second,
 		},
 		minDelay: 1000 * time.Millisecond, // ~1 req/s to stay within Kalshi rate limits
+		now:      time.Now,
 	}
+}
+
+// SetNowForTest overrides the wall-time source used by throttle accounting.
+// Test-only — production code must not call this. Passing nil restores the
+// default time.Now source.
+func (c *Client) SetNowForTest(now func() time.Time) {
+	c.rateMu.Lock()
+	defer c.rateMu.Unlock()
+	if now == nil {
+		c.now = time.Now
+		return
+	}
+	c.now = now
 }
 
 // ResetRateLimit resets the adaptive rate limit delay back to the base rate.
@@ -64,7 +83,7 @@ func (c *Client) ResetRateLimit() {
 // N*minDelay total even though the rate limit is per-process.
 func (c *Client) throttle() {
 	c.rateMu.Lock()
-	now := time.Now()
+	now := c.now()
 	gap := c.minDelay - now.Sub(c.lastCall)
 	if gap < 0 {
 		gap = 0
