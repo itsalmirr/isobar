@@ -35,6 +35,13 @@ func newTestJournal(t *testing.T, opts Options) (*Journal, string) {
 	if opts.FlushEvery == 0 {
 		opts.FlushEvery = 50 * time.Millisecond
 	}
+	// OnDropAlarm is required after A1. Tests that don't care about
+	// drop events get a no-op; tests that need to assert on hook
+	// behavior use newTestJournalWithHook, which preserves the
+	// caller-supplied hook intact.
+	if opts.OnDropAlarm == nil {
+		opts.OnDropAlarm = NoopAlarmHook
+	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	j, err := Open(opts, logger)
 	require.NoError(t, err)
@@ -188,10 +195,29 @@ func TestJournalPayloadCopyDetachesCallerBuffer(t *testing.T) {
 // — the happy-path tests always pass valid options so these branches
 // stayed uncovered.
 func TestOpenRejectsEmptyDirAndSource(t *testing.T) {
-	_, err := Open(Options{Dir: "", Source: "x"}, nil)
+	_, err := Open(Options{Dir: "", Source: "x", OnDropAlarm: NoopAlarmHook}, nil)
 	require.ErrorContains(t, err, "required")
-	_, err = Open(Options{Dir: "x", Source: ""}, nil)
+	_, err = Open(Options{Dir: "x", Source: "", OnDropAlarm: NoopAlarmHook}, nil)
 	require.ErrorContains(t, err, "required")
+}
+
+// TestOpenRejectsNilAlarmHook is the regression detector for the A1
+// change to Open semantics: ADR-0011's default slog.Warn fallback was
+// deleted because every prod cmd/tape run was accidentally accepting
+// it. A nil OnDropAlarm must now fail construction with
+// ErrAlarmHookRequired so production deploys cannot silently regress
+// back to "running blind to journal drops".
+func TestOpenRejectsNilAlarmHook(t *testing.T) {
+	dir := t.TempDir()
+	_, err := Open(Options{
+		Dir:          dir,
+		Source:       "test",
+		MaxFileBytes: 1 << 20,
+		MaxFileAge:   time.Hour,
+		// OnDropAlarm intentionally nil — must error.
+	}, nil)
+	require.ErrorIs(t, err, ErrAlarmHookRequired,
+		"Open must reject a nil OnDropAlarm with ErrAlarmHookRequired")
 }
 
 // TestOpenAcceptsNilLoggerAndDefaultsQueue verifies the two default-fill
@@ -205,6 +231,7 @@ func TestOpenAcceptsNilLoggerAndDefaultsQueue(t *testing.T) {
 		Source:       "test",
 		MaxFileBytes: 1 << 20,
 		MaxFileAge:   time.Hour,
+		OnDropAlarm:  NoopAlarmHook,
 	}, nil)
 	require.NoError(t, err)
 	j.Write(Frame{Source: "test", Kind: "x", Payload: json.RawMessage(`"ok"`)})
@@ -229,6 +256,7 @@ func TestOpenInitialOpenFailsEntersDrainMode(t *testing.T) {
 		MaxFileBytes: 1 << 20,
 		MaxFileAge:   time.Hour,
 		QueueSize:    4,
+		OnDropAlarm:  NoopAlarmHook,
 	}, nil)
 	require.NoError(t, err, "Open returns; run() fails asynchronously")
 
@@ -453,6 +481,7 @@ func TestWrite_SampledDebugLogFires(t *testing.T) {
 		QueueSize:    2,
 		FlushEvery:   time.Hour, // park flush
 		SampleEvery:  10,
+		OnDropAlarm:  NoopAlarmHook,
 	}, logger)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = j.Close() })
@@ -698,16 +727,24 @@ func TestClose_DoesNotPanicOnConcurrentWrite(t *testing.T) {
 	wg.Wait()
 }
 
-// TestDefaultAlarmHook_FiresStructuredWarn verifies the default
-// fallback hook (used when Options.OnDropAlarm is nil) emits a
-// structured slog.Warn record with the expected field shape.
-// ADR-0011 §4 default-hook contract.
-func TestDefaultAlarmHook_FiresStructuredWarn(t *testing.T) {
+// TestOnDropAlarm_PanicDoesNotKillWriter installs a hook that always
+// panics, induces sustained drops, and asserts:
+//  1. AlarmHookPanicTotal() rises (the panic was caught and counted);
+//  2. Close() completes cleanly (the writer goroutine survived);
+//  3. Writes after the panic are still serviced — i.e. the writer
+//     keeps draining the queue rather than wedging.
+//
+// ADR-0011 §Consequences enumerates "buggy hook silently kills all
+// journaling" as the failure mode this guard exists to prevent. The
+// test is the regression detector for that guarantee.
+func TestOnDropAlarm_PanicDoesNotKillWriter(t *testing.T) {
 	withShortAlarmInterval(t, 5*time.Millisecond)
 
-	buf := &syncBuf{}
-	handler := slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})
-	logger := slog.New(handler)
+	var hookCalls atomic.Uint64
+	panickyHook := func(src string, drops uint64, since time.Duration) {
+		hookCalls.Add(1)
+		panic("test: hook intentionally panics")
+	}
 
 	dir := t.TempDir()
 	j, err := Open(Options{
@@ -716,20 +753,14 @@ func TestDefaultAlarmHook_FiresStructuredWarn(t *testing.T) {
 		MaxFileBytes:   1 << 20,
 		MaxFileAge:     time.Hour,
 		QueueSize:      2,
-		FlushEvery:     time.Hour,
+		FlushEvery:     time.Hour, // park flush so queue fills
 		AlarmThreshold: 1,
 		AlarmSustain:   20 * time.Millisecond,
-		// OnDropAlarm intentionally nil -> default sink.
-	}, logger)
+		OnDropAlarm:    panickyHook,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = j.Close() })
 
-	// First, expect a startup Warn line about the default sink itself.
-	require.Eventually(t, func() bool {
-		return strings.Contains(buf.String(), "drop-alarm sink is default slog.Warn")
-	}, 200*time.Millisecond, 5*time.Millisecond, "startup warn line missing")
-
-	// Burst drops to force a sustained breach.
+	// Force sustained drops so the alarm fires (and the hook panics).
 	deadline := time.Now().Add(300 * time.Millisecond)
 	for time.Now().Before(deadline) {
 		for k := 0; k < 1000; k++ {
@@ -738,29 +769,46 @@ func TestDefaultAlarmHook_FiresStructuredWarn(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 
-	// Wait for the alarm-fired log line.
+	// Wait for the panic counter to bump. If the writer had died, no
+	// further alarm ticks would fire and this Eventually times out.
 	require.Eventually(t, func() bool {
-		return strings.Contains(buf.String(), "drop-alarm fired")
-	}, 500*time.Millisecond, 5*time.Millisecond, "expected default warn fire")
+		return j.AlarmHookPanicTotal() >= 1
+	}, 500*time.Millisecond, 5*time.Millisecond,
+		"alarm hook should have been invoked (and panicked) at least once; hookCalls=%d panics=%d drops=%d",
+		hookCalls.Load(), j.AlarmHookPanicTotal(), j.Dropped())
 
-	// Verify the fired record has the documented shape.
+	// Subsequent writes must still drain — proves the writer goroutine
+	// survived the panic. Use a queue that's currently quiet, with a
+	// small payload, and a short FlushEvery so the data lands on disk
+	// before Close() returns.
+	postDrops := j.Dropped()
+	// Brief calm so the alarm ticks see a sub-threshold rate and clear.
+	time.Sleep(30 * time.Millisecond)
+	j.Write(Frame{Source: "test", Kind: "post-panic", Payload: json.RawMessage(`{"survived":true}`)})
+
+	// Close cleanly — fails (hangs or panics) if the writer died.
+	require.NoError(t, j.Close(), "Close must complete after hook panicked; writer must survive")
+
+	// Confirm something actually landed on disk after the panic by
+	// reading the file back. We don't require the exact one frame we
+	// posted (the queue may have had backlog), but the file must
+	// exist and the post-panic frame's "survived":true must be in it.
+	files := walkExt(t, dir, ".jsonl")
+	require.NotEmpty(t, files, "expected at least one journal file")
 	var found bool
-	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
-		var rec map[string]any
-		if err := json.Unmarshal([]byte(line), &rec); err != nil {
-			continue
-		}
-		if rec["msg"] == "journal: drop-alarm fired" && rec["level"] == "WARN" {
-			require.Equal(t, "test", rec["src"])
-			require.NotNil(t, rec["drops"])
-			require.NotNil(t, rec["since"])
-			require.NotNil(t, rec["threshold_per_sec"])
-			require.NotNil(t, rec["sustained_for"])
+	for _, p := range files {
+		data, readErr := os.ReadFile(p) //nolint:gosec // test-local path under t.TempDir()
+		require.NoError(t, readErr)
+		if strings.Contains(string(data), `"survived":true`) {
 			found = true
 			break
 		}
 	}
-	require.True(t, found, "expected at least one drop-alarm fired record at WARN level")
+	require.True(t, found, "post-panic Write did not reach disk — writer goroutine appears dead")
+	require.GreaterOrEqual(t, j.AlarmHookPanicTotal(), uint64(1),
+		"AlarmHookPanicTotal must reflect at least one recovered panic")
+	require.GreaterOrEqual(t, j.Dropped(), postDrops,
+		"drop counter must remain monotonic across the panic")
 }
 
 // newTestJournalWithHook is a variant of newTestJournal that respects
@@ -786,6 +834,43 @@ func newTestJournalWithHook(t *testing.T, opts Options) (*Journal, string) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = j.Close() })
 	return j, dir
+}
+
+// TestEnvelope_NewWritesHaveV1 is the write-side tripwire for the
+// envelope schema-version field. It opens a journal, writes a single
+// frame, closes (which drains + fsyncs), reads the raw on-disk bytes
+// back, and asserts the serialized line carries
+// `"v":"isobar.journal/v1"`. This is a regression detector: if a
+// future change accidentally drops the schema stamp from the writer,
+// this test fails before the unstamped bytes can land in a production
+// tape. The constant value is pinned because a bump requires a
+// reader-side migration policy decision (held for Phase 2).
+func TestEnvelope_NewWritesHaveV1(t *testing.T) {
+	j, dir := newTestJournal(t, Options{
+		MaxFileBytes: 1 << 20,
+		MaxFileAge:   time.Hour,
+		QueueSize:    16,
+	})
+	j.Write(Frame{
+		Stamp:   clock.Now(),
+		Source:  "test",
+		Kind:    "ws",
+		Payload: json.RawMessage(`{"hello":"world"}`),
+	})
+	require.NoError(t, j.Close())
+
+	files := walkExt(t, dir, ".jsonl")
+	require.Len(t, files, 1)
+	raw, err := os.ReadFile(files[0])
+	require.NoError(t, err)
+
+	// Substring assertion on the raw bytes — the on-disk format is
+	// part of the public tape contract and a struct-level decode
+	// would hide a field-drop regression.
+	require.Contains(t, string(raw), `"v":"`+EnvelopeSchemaVersion+`"`,
+		"envelope must carry the schema-version field; got: %s", string(raw))
+	require.Equal(t, "isobar.journal/v1", EnvelopeSchemaVersion,
+		"EnvelopeSchemaVersion constant must remain isobar.journal/v1 — bump requires reader migration policy decision")
 }
 
 func walkExt(t *testing.T, dir, suffix string) []string {
