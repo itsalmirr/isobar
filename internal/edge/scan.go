@@ -5,8 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"path/filepath"
 	"sort"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/wh0o0pz/isobar/internal/calibration/mos"
@@ -57,21 +60,30 @@ type EdgeRow struct {
 	Side            string
 	TradePriceCents int
 	PFairNaive      float64
-	PFairMOS        float64 // 0 if no MOS coeffs or bin missing
-	PFair           float64 // the p_fair actually used for edge math (MOS if available, else naive)
+	PFairMOS        float64 // 0 if no MOS coeffs, bin missing, or model-set mismatch
+	PFair           float64 // the p_fair actually used for edge math (MOS if applied, naive otherwise)
 	MOSApplied      bool
-	NMembers        int
-	NMembersInBkt   int
-	PollAgeS        int
-	FeeCents        int
-	EdgeCents       int
+
+	// SkippedReason is a per-row tag explaining why MOS was NOT applied
+	// to this trade. Possible values:
+	//   ""                              MOS was applied (MOSApplied=true)
+	//   "no_coeffs"                     ScanOptions.MOS was nil
+	//   "no_bin"                        no fitted bin for (station, season, variable)
+	//   "model_set_mismatch:<obs>vs<fit>"  poll's models ≠ coefficients.FitModelSet
+	SkippedReason string
+
+	NMembers      int
+	NMembersInBkt int
+	PollAgeS      int
+	FeeCents      int
+	EdgeCents     int
 
 	// Backtest fields — populated only when ScanOptions.Truth is set.
-	HasTruth     bool   // true iff truth was looked up successfully
-	ActualTempF  int    // observed TMAX (KXHIGH*) or TMIN (KXLOWT*) on valid_date
-	YesResolved  bool   // bracket would have paid YES
-	OurSide      string // "yes", "no", or "" (skipped — no edge band)
-	OurPnLCents  int    // realized PnL after entry fee (0 if OurSide=="")
+	HasTruth    bool   // true iff truth was looked up successfully
+	ActualTempF int    // observed TMAX (KXHIGH*) or TMIN (KXLOWT*) on valid_date
+	YesResolved bool   // bracket would have paid YES
+	OurSide     string // "yes", "no", or "" (skipped — no edge band)
+	OurPnLCents int    // realized PnL after entry fee (0 if OurSide=="")
 }
 
 // Result is the output of Scan: per-trade rows plus aggregate counters.
@@ -148,6 +160,22 @@ func Scan(opts ScanOptions) (*Result, error) {
 	siblings, err := collectSiblings(kalshiFiles)
 	if err != nil {
 		return nil, fmt.Errorf("collect siblings: %w", err)
+	}
+
+	// Once-per-distinct-pair throttle for "observed vs fit" model-set
+	// mismatch warnings, so a single misconfigured run doesn't flood the
+	// logs with one line per trade.
+	var mmLogOnce sync.Map // key = "obs|fit" string → struct{}
+	var fitModelSet []string
+	if opts.MOS != nil {
+		fitModelSet = mos.CanonicalModelSet(opts.MOS.FitModelSet)
+		if len(fitModelSet) == 0 {
+			// Defensive: an in-memory Coefficients{} built without
+			// LoadCoefficients may have no FitModelSet. Log a single
+			// warning and proceed; the per-trade guard below will skip
+			// every MOS apply via the model_set_mismatch branch.
+			log.Printf("edge: MOSCoefficients.FitModelSet is empty; MOS will not be applied to any row")
+		}
 	}
 
 	err = replay.ForEachFrame(kalshiFiles, func(env replay.Envelope, _ int, _ bool) error {
@@ -236,29 +264,60 @@ func Scan(opts ScanOptions) (*Result, error) {
 
 		// MOS-calibrated p_fair, if coefficients were provided. We feed
 		// the ensemble mean into the fitted (μ=a+b·f, σ) and integrate
-		// the normal across the bracket [Lo, Hi). Bins that weren't fit
-		// (e.g. too few training pairs) fall back to naive — never silent.
+		// the normal across the bracket [Lo, Hi). Skip paths:
+		//   - no coefficients loaded                  → "no_coeffs"
+		//   - model-set mismatch (observed vs fit)    → "model_set_mismatch:<obs>vs<fit>"
+		//   - no fitted bin for (station, season, variable) → "no_bin"
+		// All fall back to naive p_fair so the backtest never silently
+		// disappears them.
 		pFair := pFairNaive
-		var pFairMOS float64
-		mosApplied := false
-		if opts.MOS != nil {
-			variable := "tmax"
-			if !spec.IsHigh() {
-				variable = "tmin"
-			}
-			mean := sumT / float64(nMembers)
-			mu, sigma, ok := opts.MOS.Predict(station, spec.ValidDate, variable, mean)
-			if ok {
-				pFairMOS = mos.ProbBelow(resolution.Hi, mu, sigma) -
-					mos.ProbBelow(resolution.Lo, mu, sigma)
-				if pFairMOS < 0 {
-					pFairMOS = 0
+		var (
+			pFairMOS      float64
+			mosApplied    bool
+			mosSkipReason string
+		)
+		switch {
+		case opts.MOS == nil:
+			mosSkipReason = "no_coeffs"
+		case len(fitModelSet) == 0:
+			// Coefficients with empty FitModelSet — treat as a fatal
+			// mismatch for every poll. Logged once at the top of Scan.
+			obsModelSet := pollModelSet(extremes)
+			mosSkipReason = fmt.Sprintf("model_set_mismatch:%svs",
+				strings.Join(obsModelSet, "+"))
+			res.SkippedReason[mosSkipReason]++
+		default:
+			obsModelSet := pollModelSet(extremes)
+			if !mos.ModelSetEqual(obsModelSet, fitModelSet) {
+				key := strings.Join(obsModelSet, "+") + "|" + strings.Join(fitModelSet, "+")
+				if _, loaded := mmLogOnce.LoadOrStore(key, struct{}{}); !loaded {
+					log.Printf("edge: MOS model-set mismatch — observed=%v fit=%v; falling back to naive p_fair",
+						obsModelSet, fitModelSet)
 				}
-				if pFairMOS > 1 {
-					pFairMOS = 1
+				mosSkipReason = fmt.Sprintf("model_set_mismatch:%svs%s",
+					strings.Join(obsModelSet, "+"), strings.Join(fitModelSet, "+"))
+				res.SkippedReason[mosSkipReason]++
+			} else {
+				variable := "tmax"
+				if !spec.IsHigh() {
+					variable = "tmin"
 				}
-				pFair = pFairMOS
-				mosApplied = true
+				mean := sumT / float64(nMembers)
+				mu, sigma, ok := opts.MOS.Predict(station, spec.ValidDate, variable, mean)
+				if ok {
+					pFairMOS = mos.ProbBelow(resolution.Hi, mu, sigma) -
+						mos.ProbBelow(resolution.Lo, mu, sigma)
+					if pFairMOS < 0 {
+						pFairMOS = 0
+					}
+					if pFairMOS > 1 {
+						pFairMOS = 1
+					}
+					pFair = pFairMOS
+					mosApplied = true
+				} else {
+					mosSkipReason = "no_bin"
+				}
 			}
 		}
 
@@ -281,6 +340,7 @@ func Scan(opts ScanOptions) (*Result, error) {
 			PFairMOS:        pFairMOS,
 			PFair:           pFair,
 			MOSApplied:      mosApplied,
+			SkippedReason:   mosSkipReason,
 			NMembers:        nMembers,
 			NMembersInBkt:   nIn,
 			PollAgeS:        int(age.Seconds()),
@@ -354,6 +414,48 @@ func Scan(opts ScanOptions) (*Result, error) {
 	// Stable sort by ts for deterministic CSV output.
 	sort.Slice(res.Rows, func(i, j int) bool { return res.Rows[i].TsMs < res.Rows[j].TsMs })
 	return res, nil
+}
+
+// pollModelSet returns the canonical sorted model set observed in the
+// poll, derived from member-ID prefixes. Bare numeric IDs ("00".."30")
+// are GFS (single-model default). Prefixed IDs like
+// "ncep_gefs_seamless:NN" / "ecmwf_ifs025_ensemble:NN" canonicalize to
+// the short tags mos.ModelGFS / mos.ModelECMWF respectively so they can
+// be compared against [mos.Coefficients.FitModelSet] via
+// [mos.ModelSetEqual].
+func pollModelSet(extremes map[string]MemberDaily) []string {
+	if len(extremes) == 0 {
+		return nil
+	}
+	tags := make([]string, 0, 2)
+	for id := range extremes {
+		tags = append(tags, memberModelTag(id))
+	}
+	return mos.CanonicalModelSet(tags)
+}
+
+// memberModelTag maps a parser-emitted member ID to the canonical short
+// model name (mos.ModelGFS / mos.ModelECMWF / "<full-prefix>" for
+// unknown). Bare numeric IDs are GFS; prefixed IDs split on ":" and the
+// prefix is matched against known model-name patterns.
+func memberModelTag(memberID string) string {
+	colon := strings.Index(memberID, ":")
+	if colon < 0 {
+		// Bare "00".."30" → GFS (single-model default).
+		return mos.ModelGFS
+	}
+	prefix := memberID[:colon]
+	switch {
+	case strings.HasPrefix(prefix, "ecmwf"):
+		return mos.ModelECMWF
+	case strings.HasPrefix(prefix, "ncep_gefs"), strings.HasPrefix(prefix, "gfs"):
+		return mos.ModelGFS
+	default:
+		// Unknown model prefix — surface verbatim. The mismatch guard
+		// will reject the poll against any coefficients.FitModelSet
+		// that doesn't list this exact tag.
+		return prefix
+	}
 }
 
 // siblingKey is the canonical bucket for "specs in the same market family

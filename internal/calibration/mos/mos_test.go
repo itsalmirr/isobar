@@ -1,8 +1,11 @@
 package mos
 
 import (
+	"encoding/json"
 	"math"
 	"math/rand/v2"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -370,6 +373,112 @@ func TestFitFlagsTrainingFallbackWhenHoldoutTooSmall(t *testing.T) {
 	if math.Abs(bc.Sigma-trueSigma) > 0.3 {
 		t.Errorf("Sigma = %v, want ≈ %v (training residual stdev)",
 			bc.Sigma, trueSigma)
+	}
+}
+
+// TestLoadCoefficients_LegacyFileBackCompat: a Coefficients JSON written
+// before FitModelSet existed must still load — defaulting to ["gfs"] —
+// rather than erroring. Without this back-compat, every existing
+// calibration artifact on disk would silently lose its fitted model.
+func TestLoadCoefficients_LegacyFileBackCompat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "legacy.json")
+	// Hand-roll a JSON with the v1 schema version and NO fit_model_set
+	// key, mimicking a file written before this field was added.
+	body := []byte(`{
+		"schema_version": "isobar.mos/v1",
+		"fitted_at": "2025-01-01T00:00:00Z",
+		"training_window_end": "2024-12-31",
+		"holdout_window_start": "2025-01-01",
+		"bins": {
+			"KNYC|MAM|tmax": {"a": 1.0, "b": 1.0, "sigma": 2.0, "n_train": 30, "n_holdout": 5}
+		}
+	}`)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadCoefficients(path)
+	if err != nil {
+		t.Fatalf("LoadCoefficients: %v", err)
+	}
+	if len(c.FitModelSet) != 1 || c.FitModelSet[0] != ModelGFS {
+		t.Errorf("FitModelSet = %v, want [%q] (legacy back-compat default)",
+			c.FitModelSet, ModelGFS)
+	}
+}
+
+// TestLoadCoefficients_RoundTripsModelSet: a Coefficients with an
+// explicit FitModelSet (e.g. ["gfs"] written by today's calibrate-fit)
+// must round-trip through JSON without dropping or mutating the field.
+func TestLoadCoefficients_RoundTripsModelSet(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "modern.json")
+	orig := Coefficients{
+		SchemaVersion:      CoefficientsSchemaVersion,
+		FittedAt:           time.Now().UTC().Truncate(time.Second),
+		TrainingWindowEnd:  "2024-12-31",
+		HoldoutWindowStart: "2025-01-01",
+		FitModelSet:        []string{ModelGFS},
+		Bins: map[string]BinCoeffs{
+			"KNYC|MAM|tmax": {A: 0.5, B: 1.0, Sigma: 2.0, NTrain: 100, NHoldout: 30, SigmaSource: SigmaSourceHoldout},
+		},
+	}
+	body, err := json.Marshal(orig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if werr := os.WriteFile(path, body, 0o600); werr != nil {
+		t.Fatal(werr)
+	}
+	got, err := LoadCoefficients(path)
+	if err != nil {
+		t.Fatalf("LoadCoefficients: %v", err)
+	}
+	if len(got.FitModelSet) != 1 || got.FitModelSet[0] != ModelGFS {
+		t.Errorf("FitModelSet = %v, want [%q]", got.FitModelSet, ModelGFS)
+	}
+}
+
+func TestCanonicalModelSet(t *testing.T) {
+	cases := []struct {
+		in, want []string
+	}{
+		{nil, []string{}},
+		{[]string{"gfs"}, []string{"gfs"}},
+		{[]string{"gfs", "ecmwf"}, []string{"ecmwf", "gfs"}},
+		{[]string{"gfs", "gfs", "ecmwf"}, []string{"ecmwf", "gfs"}}, // dedupe
+		{[]string{"", "gfs"}, []string{"gfs"}},                      // skip empty
+	}
+	for _, tc := range cases {
+		got := CanonicalModelSet(tc.in)
+		if len(got) != len(tc.want) {
+			t.Errorf("CanonicalModelSet(%v) = %v, want %v", tc.in, got, tc.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != tc.want[i] {
+				t.Errorf("CanonicalModelSet(%v) = %v, want %v", tc.in, got, tc.want)
+				break
+			}
+		}
+	}
+}
+
+func TestModelSetEqual(t *testing.T) {
+	cases := []struct {
+		a, b []string
+		want bool
+	}{
+		{[]string{"gfs"}, []string{"gfs"}, true},
+		{[]string{"gfs"}, []string{"ecmwf"}, false},
+		{[]string{"ecmwf", "gfs"}, []string{"ecmwf", "gfs"}, true},
+		{[]string{"gfs"}, []string{"ecmwf", "gfs"}, false},
+		{[]string{}, []string{}, true},
+	}
+	for _, tc := range cases {
+		if got := ModelSetEqual(tc.a, tc.b); got != tc.want {
+			t.Errorf("ModelSetEqual(%v, %v) = %v, want %v", tc.a, tc.b, got, tc.want)
+		}
 	}
 }
 

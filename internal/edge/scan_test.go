@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/wh0o0pz/isobar/internal/calibration/mos"
 )
 
 // TestScan_EndToEndSynthetic stands up a synthetic data tree with one
@@ -348,6 +351,124 @@ func TestScan_LowSideTBracketResolution_KXLOWT(t *testing.T) {
 	}
 	if got.NMembersInBkt != 3 {
 		t.Errorf("KXLOWT T56 NMembersInBkt = %d, want 3", got.NMembersInBkt)
+	}
+}
+
+// synthMultiModelPoll builds an Open-Meteo payload that contains BOTH a
+// GFS control member AND an ECMWF control member. Used by the model-set
+// mismatch test to verify the scanner detects a multi-model poll and
+// refuses to apply GFS-only-trained MOS coefficients to it.
+//
+// Temperatures are deterministic. GFS control = i, ECMWF control = i+1;
+// same 72-hour window as synthPoll.
+func synthMultiModelPoll(t *testing.T) []byte {
+	t.Helper()
+	t0, _ := time.Parse("2006-01-02T15:04", "2026-04-29T00:00")
+	times := make([]string, 72)
+	for i := 0; i < 72; i++ {
+		times[i] = t0.Add(time.Duration(i) * time.Hour).Format("2006-01-02T15:04")
+	}
+	gfsCtl := make([]float64, 72)
+	ecmwfCtl := make([]float64, 72)
+	for i := range gfsCtl {
+		gfsCtl[i] = float64(i)
+		ecmwfCtl[i] = float64(i) + 1
+	}
+	body := map[string]interface{}{
+		"latitude":  40.78,
+		"longitude": -73.97,
+		"hourly": map[string]interface{}{
+			"time":                                 times,
+			"temperature_2m_ncep_gefs_seamless":    gfsCtl,
+			"temperature_2m_ecmwf_ifs025_ensemble": ecmwfCtl,
+		},
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("synthMultiModelPoll marshal: %v", err)
+	}
+	return raw
+}
+
+// TestScan_MOSModelSetMismatch_FallsBackToNaive: coefficients trained on
+// GFS only ([gfs]) cannot be safely applied to a poll that contains both
+// GFS and ECMWF members. The scanner must detect the mismatch, set
+// MOSApplied=false, record a "model_set_mismatch" SkippedReason, and let
+// edge math fall back to naive p_fair.
+func TestScan_MOSModelSetMismatch_FallsBackToNaive(t *testing.T) {
+	dir := t.TempDir()
+	pollTime := time.Date(2026, 4, 29, 7, 30, 0, 0, time.UTC)
+	tradeTime := pollTime.Add(20 * time.Minute)
+
+	if err := writeJournal(t, filepath.Join(dir, "openmeteo", "2026-04-29"), "om.jsonl",
+		[]envelope{{Wall: pollTime.UnixNano(), Source: "openmeteo", Kind: "rest:NY", Payload: synthMultiModelPoll(t)}}); err != nil {
+		t.Fatal(err)
+	}
+
+	tradeMsg, _ := json.Marshal(map[string]interface{}{
+		"market_ticker": "KXHIGHNY-26APR29-B62.5",
+		"yes_price":     45,
+		"no_price":      55,
+		"side":          "yes",
+		"ts_ms":         tradeTime.UnixMilli(),
+	})
+	frame, _ := json.Marshal(map[string]interface{}{
+		"type": "trade", "msg": json.RawMessage(tradeMsg),
+	})
+	if err := writeJournal(t, filepath.Join(dir, "kalshi", "2026-04-29"), "k.jsonl",
+		[]envelope{{Wall: tradeTime.UnixNano(), Source: "kalshi", Kind: "ws", Payload: frame}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Coefficients claim GFS-only training; a fitted bin exists so the
+	// "no_bin" path can't be the reason MOS is skipped — only the model
+	// mismatch should be.
+	coeffs := &mos.Coefficients{
+		FitModelSet: []string{mos.ModelGFS},
+		Bins: map[string]mos.BinCoeffs{
+			"KNYC|MAM|tmax": {A: 0, B: 1, Sigma: 5},
+		},
+	}
+
+	res, err := Scan(ScanOptions{
+		DataDir:    dir,
+		StartDate:  time.Date(2026, 4, 29, 0, 0, 0, 0, time.UTC),
+		EndDate:    time.Date(2026, 4, 30, 0, 0, 0, 0, time.UTC),
+		MaxPollAge: time.Hour,
+		MOS:        coeffs,
+	})
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(res.Rows))
+	}
+	row := res.Rows[0]
+	if row.MOSApplied {
+		t.Errorf("MOSApplied = true, want false (poll has GFS+ECMWF members, coeffs fit on GFS only)")
+	}
+	if row.PFairMOS != 0 {
+		t.Errorf("PFairMOS = %v, want 0 when MOSApplied=false", row.PFairMOS)
+	}
+	// Falls back to naive: PFair == PFairNaive, EdgeCents computed from naive.
+	if row.PFair != row.PFairNaive {
+		t.Errorf("PFair=%v vs PFairNaive=%v: must match when MOSApplied=false",
+			row.PFair, row.PFairNaive)
+	}
+	if row.SkippedReason == "" || !strings.Contains(row.SkippedReason, "model_set_mismatch") {
+		t.Errorf("row.SkippedReason = %q, want a value containing %q",
+			row.SkippedReason, "model_set_mismatch")
+	}
+	// Aggregate counter mirrors the per-row tag.
+	totalMismatch := 0
+	for k, v := range res.SkippedReason {
+		if strings.Contains(k, "model_set_mismatch") {
+			totalMismatch += v
+		}
+	}
+	if totalMismatch != 1 {
+		t.Errorf("aggregate model_set_mismatch count = %d, want 1; full=%v",
+			totalMismatch, res.SkippedReason)
 	}
 }
 
