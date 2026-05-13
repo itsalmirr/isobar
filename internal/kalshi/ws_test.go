@@ -320,3 +320,120 @@ func TestSubscriberConcurrentOnFrameIsLocal(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	require.GreaterOrEqual(t, seen.Load(), int64(1))
 }
+
+// TestSubscriber_ReconnectsOnFrameStarvation verifies that the liveness
+// watchdog forces a reconnect when no frames arrive for longer than
+// MaxIdleBetweenFrames. The stub server accepts subscribe and then goes
+// silent; the client must detect the gap and re-enter retry.Do.
+func TestSubscriber_ReconnectsOnFrameStarvation(t *testing.T) {
+	// Stub server that accepts subscribe + sends nothing.
+	var subscribes atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/trade-api/ws/v2", func(rw http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(rw, r, &websocket.AcceptOptions{
+			InsecureSkipVerify: true,
+		})
+		if err != nil {
+			return
+		}
+		ctx := r.Context()
+		if _, _, err := conn.Read(ctx); err == nil {
+			subscribes.Add(1)
+		}
+		<-ctx.Done()
+		_ = conn.Close(websocket.StatusNormalClosure, "test done")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	_, pem := testKeyPair(t)
+	signer, err := NewSigner("keyid", pem)
+	require.NoError(t, err)
+
+	sub := NewSubscriber(SubscriberOptions{
+		WSURL:                "ws" + strings.TrimPrefix(srv.URL, "http") + "/trade-api/ws/v2",
+		Signer:               signer,
+		Channels:             []string{"orderbook_delta"},
+		Tickers:              []string{"X"},
+		Logger:               discardLogger(),
+		PingInterval:         100 * time.Millisecond,
+		MaxIdleBetweenFrames: 200 * time.Millisecond,
+		Reconnect: ReconnectOptions{
+			InitialBackoff: 10 * time.Millisecond,
+			MaxBackoff:     20 * time.Millisecond,
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() { _ = sub.Run(ctx) }()
+
+	// Wait for at least two subscribe attempts — the first connect plus a
+	// reconnect after the watchdog trips. Detect within ~2*PingInterval +
+	// reconnect overhead.
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if subscribes.Load() >= 2 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("expected watchdog to trigger reconnect, got %d subscribes", subscribes.Load())
+}
+
+// TestSubscriber_PingFailureTriggersReconnect verifies that a peer that
+// closes the connection mid-stream (so the watchdog's Ping fails) causes
+// a reconnect. We close on the second read (the first read returns the
+// subscribe message; the second is the Ping read) by hijacking the conn
+// and closing it.
+func TestSubscriber_PingFailureTriggersReconnect(t *testing.T) {
+	var subscribes atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/trade-api/ws/v2", func(rw http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(rw, r, &websocket.AcceptOptions{
+			InsecureSkipVerify: true,
+		})
+		if err != nil {
+			return
+		}
+		ctx := r.Context()
+		if _, _, err := conn.Read(ctx); err == nil {
+			subscribes.Add(1)
+		}
+		// Immediately abnormally close so the next Ping fails.
+		_ = conn.CloseNow()
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	_, pem := testKeyPair(t)
+	signer, err := NewSigner("keyid", pem)
+	require.NoError(t, err)
+
+	sub := NewSubscriber(SubscriberOptions{
+		WSURL:                "ws" + strings.TrimPrefix(srv.URL, "http") + "/trade-api/ws/v2",
+		Signer:               signer,
+		Channels:             []string{"orderbook_delta"},
+		Tickers:              []string{"X"},
+		Logger:               discardLogger(),
+		PingInterval:         100 * time.Millisecond,
+		MaxIdleBetweenFrames: 10 * time.Second, // High so only Ping failure can trip
+		Reconnect: ReconnectOptions{
+			InitialBackoff: 10 * time.Millisecond,
+			MaxBackoff:     20 * time.Millisecond,
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() { _ = sub.Run(ctx) }()
+
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if subscribes.Load() >= 2 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("expected ping failure to trigger reconnect, got %d subscribes", subscribes.Load())
+}
