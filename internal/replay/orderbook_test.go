@@ -145,6 +145,7 @@ func TestPriceDollarsToCents(t *testing.T) {
 }
 
 func TestApplyFrameToBooks(t *testing.T) {
+	ResetCountersForTest()
 	books := map[string]*Book{}
 	walls := map[string]int64{}
 
@@ -154,35 +155,50 @@ func TestApplyFrameToBooks(t *testing.T) {
 	// Snapshot creates book and updates wall.
 	env1 := Envelope{Wall: 100}
 	f1 := KalshiFrame{Type: "orderbook_snapshot", Msg: snapshotPayload}
-	require.False(t, ApplyFrameToBooks(books, walls, env1, f1))
+	malformed, err := ApplyFrameToBooks(books, walls, env1, f1)
+	require.False(t, malformed)
+	require.NoError(t, err)
 	require.Len(t, books, 1)
 	require.Equal(t, int64(100), walls["KXHIGHNY-26APR22-T64"])
 	require.Equal(t, 100.0, books["KXHIGHNY-26APR22-T64"].Yes[45])
+	require.True(t, books["KXHIGHNY-26APR22-T64"].IsReady())
 
 	// Delta after snapshot updates book and wall.
 	env2 := Envelope{Wall: 200}
 	f2 := KalshiFrame{Type: "orderbook_delta", Msg: deltaPayload}
-	require.False(t, ApplyFrameToBooks(books, walls, env2, f2))
+	malformed, err = ApplyFrameToBooks(books, walls, env2, f2)
+	require.False(t, malformed)
+	require.NoError(t, err)
 	require.Equal(t, int64(200), walls["KXHIGHNY-26APR22-T64"])
 	require.Equal(t, 110.0, books["KXHIGHNY-26APR22-T64"].Yes[45])
 
-	// Delta before snapshot for unknown ticker is silently skipped.
+	// Delta before snapshot for unknown ticker is silently skipped
+	// (no book exists in the map yet).
 	otherDelta := json.RawMessage(`{"market_ticker":"OTHER","price_dollars":"0.5","delta_fp":"5","side":"yes"}`)
 	f3 := KalshiFrame{Type: "orderbook_delta", Msg: otherDelta}
-	require.False(t, ApplyFrameToBooks(books, walls, Envelope{Wall: 300}, f3))
+	malformed, err = ApplyFrameToBooks(books, walls, Envelope{Wall: 300}, f3)
+	require.False(t, malformed)
+	require.NoError(t, err)
 	require.Len(t, books, 1)
 
 	// Frame with no ticker is no-op.
 	f4 := KalshiFrame{Type: "subscribed", Msg: json.RawMessage(`{}`)}
-	require.False(t, ApplyFrameToBooks(books, walls, Envelope{Wall: 400}, f4))
+	malformed, err = ApplyFrameToBooks(books, walls, Envelope{Wall: 400}, f4)
+	require.False(t, malformed)
+	require.NoError(t, err)
 
-	// Malformed snapshot returns true.
+	// Malformed snapshot returns malformed=true and a typed error.
 	f5 := KalshiFrame{Type: "orderbook_snapshot", Msg: json.RawMessage(`{"market_ticker":"BAD","yes_dollars_fp":"not-an-array"}`)}
-	require.True(t, ApplyFrameToBooks(books, walls, Envelope{Wall: 500}, f5))
+	malformed, err = ApplyFrameToBooks(books, walls, Envelope{Wall: 500}, f5)
+	require.True(t, malformed)
+	require.ErrorIs(t, err, ErrSnapshotApplyFailed)
+	require.False(t, books["BAD"].IsReady(), "malformed snapshot must leave book uninitialized")
 
 	// nil walls map is allowed (analyze case).
 	books2 := map[string]*Book{}
-	require.False(t, ApplyFrameToBooks(books2, nil, env1, f1))
+	malformed, err = ApplyFrameToBooks(books2, nil, env1, f1)
+	require.False(t, malformed)
+	require.NoError(t, err)
 	require.Len(t, books2, 1)
 }
 

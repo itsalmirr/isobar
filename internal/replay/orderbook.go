@@ -1,11 +1,16 @@
 package replay
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/bytedance/sonic"
 )
@@ -19,15 +24,40 @@ import (
 // contract for P cents, and a level on the No side at price P means
 // someone will sell a No contract for P cents. By arbitrage,
 // Yes_ask = 1 - No_bid (in cents, 100 - BestNoBid).
+//
+// A Book has a lifecycle: it starts uninitialized and becomes ready
+// after the first successful ApplySnapshot. A snapshot apply error
+// (malformed payload) resets state back to uninitialized and clears
+// the level maps — a stale partial book is more dangerous than no book.
+// Deltas applied while uninitialized would mutate against an empty
+// state and produce phantom levels; ApplyFrameToBooks rejects them
+// for that reason. Callers reading top-of-book scalars (BestYesBid,
+// MidYesCents, …) on an uninitialized book get zero values — gate
+// reads with IsReady() if you need to distinguish "no levels yet" from
+// "no book yet".
 type Book struct {
 	Yes map[int]float64
 	No  map[int]float64
+
+	// initialized tracks whether this book has received a valid snapshot.
+	// Lifecycle: false → ApplySnapshot success → true; ApplySnapshot
+	// error → false (and Yes/No are cleared so a partial state can't
+	// linger). ApplyDelta does not transition this state.
+	initialized bool
 }
 
-// NewBook returns an empty book with non-nil level maps.
+// NewBook returns an empty book with non-nil level maps. The book is
+// in the uninitialized state until the first successful ApplySnapshot.
 func NewBook() *Book {
 	return &Book{Yes: map[int]float64{}, No: map[int]float64{}}
 }
+
+// IsReady reports whether the book has received a valid snapshot and
+// is safe to read or apply deltas against. A book is ready after the
+// first successful ApplySnapshot and stays ready across subsequent
+// successful snapshots and deltas. A snapshot apply error reverts the
+// book to uninitialized (not-ready) and clears its level maps.
+func (b *Book) IsReady() bool { return b.initialized }
 
 // snapshotMsg is the Msg payload of an `orderbook_snapshot` frame.
 type snapshotMsg struct {
@@ -49,9 +79,20 @@ type deltaMsg struct {
 // ApplySnapshot replaces the book with the levels carried by a
 // snapshot frame's Msg. The book is wiped first — snapshots are
 // authoritative.
+//
+// On success the book transitions to the ready state (IsReady()==true).
+// On parse failure the book is left in the uninitialized state with
+// empty Yes/No maps: a partial snapshot is worse than no snapshot
+// because subsequent deltas would mutate against levels that may not
+// reflect the true exchange state.
 func (b *Book) ApplySnapshot(msg json.RawMessage) error {
 	var s snapshotMsg
 	if err := sonic.Unmarshal(msg, &s); err != nil {
+		// Wipe state and stay uninitialized. A half-decoded snapshot
+		// is exactly the failure mode we're hardening against.
+		b.Yes = map[int]float64{}
+		b.No = map[int]float64{}
+		b.initialized = false
 		return fmt.Errorf("parse snapshot: %w", err)
 	}
 	b.Yes = make(map[int]float64, len(s.YesDollarsFP))
@@ -70,11 +111,18 @@ func (b *Book) ApplySnapshot(msg json.RawMessage) error {
 		}
 		b.No[pc] = qty
 	}
+	b.initialized = true
 	return nil
 }
 
 // ApplyDelta adjusts one level by the signed delta quantity. A delta
 // that drives a level to zero (or below) removes that level.
+//
+// This is a low-level primitive: it does not gate on IsReady().
+// The state-machine enforcement lives in ApplyFrameToBooks, which
+// is the supported entrypoint for replaying tape frames. Callers
+// that invoke ApplyDelta directly are responsible for ensuring the
+// book has a valid snapshot first.
 func (b *Book) ApplyDelta(msg json.RawMessage) error {
 	var d deltaMsg
 	if err := sonic.Unmarshal(msg, &d); err != nil {
@@ -106,41 +154,202 @@ func (b *Book) ApplyDelta(msg json.RawMessage) error {
 	return nil
 }
 
+// --- typed errors & observability -------------------------------------------
+
+// ErrBookUninitialized is returned when a delta frame arrives for a
+// ticker whose book has not received a valid snapshot. Applying the
+// delta would mutate an empty state and produce phantom levels that
+// don't exist in any real snapshot, so the frame is dropped.
+var ErrBookUninitialized = errors.New("orderbook: book is uninitialized; awaiting snapshot")
+
+// ErrSnapshotApplyFailed wraps a snapshot-apply error. The book's
+// state has been reset to uninitialized and its level maps cleared;
+// subsequent deltas will be rejected with ErrBookUninitialized until
+// a fresh successful snapshot arrives.
+var ErrSnapshotApplyFailed = errors.New("orderbook: snapshot apply failed; book state was reset to uninitialized")
+
+// Package-level counters. atomic.Uint64 so reads in tests don't race
+// with the producer goroutine. Read via the accessors below.
+var (
+	rejectedDeltasTotal  atomic.Uint64
+	snapshotErrorsTotal  atomic.Uint64
+	orderbookLogSuppress sync.Map // key "<ticker>:<reason>" → *logSuppressEntry
+)
+
+// logSuppressEntry tracks per-(ticker, reason) log suppression so that
+// repeated identical failures don't spam the log. The first failure
+// in a window logs immediately (allocating the entry). Subsequent
+// failures increment current without logging. On recovery
+// (clearLogSuppression), current is moved into priorWindow and the
+// entry is removed; the next first-failure log entry for the same
+// key surfaces priorWindow as a "suppressed_prev_window" attribute so
+// operators can see how noisy the prior failure window actually was.
+type logSuppressEntry struct {
+	current atomic.Uint64
+}
+
+// priorSuppressed is a side table holding the suppressed-count from
+// the most recently closed window for each key. Reads consume the
+// entry — the next first-log emits it once, then it disappears.
+var priorSuppressed sync.Map // key "<ticker>:<reason>" → uint64
+
+// RejectedDeltasTotal returns the cumulative count of delta frames
+// dropped because the destination book was uninitialized. Exposed as
+// a counter accessor for tests and for the Phase 6 Prometheus bridge.
+func RejectedDeltasTotal() uint64 { return rejectedDeltasTotal.Load() }
+
+// SnapshotErrorsTotal returns the cumulative count of snapshot-apply
+// errors observed. Exposed as a counter accessor for tests and for
+// the Phase 6 Prometheus bridge.
+func SnapshotErrorsTotal() uint64 { return snapshotErrorsTotal.Load() }
+
+// ResetCountersForTest zeros all package-level counters and clears
+// the log-suppression maps. Intended for test isolation; do not call
+// from production code.
+func ResetCountersForTest() {
+	rejectedDeltasTotal.Store(0)
+	snapshotErrorsTotal.Store(0)
+	orderbookLogSuppress.Range(func(k, _ any) bool {
+		orderbookLogSuppress.Delete(k)
+		return true
+	})
+	priorSuppressed.Range(func(k, _ any) bool {
+		priorSuppressed.Delete(k)
+		return true
+	})
+}
+
+// logOnceOrSuppress dedupes log messages by (ticker, reason) key.
+// The first time a key is seen in a window, it logs immediately and
+// stores a suppression entry. Subsequent calls with the same key
+// increment the entry's `current` counter without logging. The first
+// log entry per key surfaces any suppressed-count carried over from
+// the previous window (set by clearLogSuppression) as a
+// `suppressed_prev_window` attribute so operators can see how noisy
+// the prior failure window actually was.
+//
+// clearLogSuppression(ticker) closes the current window for all keys
+// of that ticker — call it after a recovery event (successful
+// snapshot) so the next failure logs again.
+func logOnceOrSuppress(level slog.Level, ticker, reason, msg string, extra ...slog.Attr) {
+	key := ticker + ":" + reason
+	if _, loaded := orderbookLogSuppress.LoadOrStore(key, &logSuppressEntry{}); loaded {
+		// Already in a suppression window — bump current and skip.
+		if cur, ok := orderbookLogSuppress.Load(key); ok {
+			cur.(*logSuppressEntry).current.Add(1)
+		}
+		return
+	}
+	// First log in this window. Drain any prior-window suppressed
+	// count so we can surface it on this entry exactly once.
+	attrs := make([]slog.Attr, 0, len(extra)+3)
+	attrs = append(attrs, slog.String("ticker", ticker), slog.String("reason", reason))
+	if prev, ok := priorSuppressed.LoadAndDelete(key); ok {
+		if n, ok := prev.(uint64); ok && n > 0 {
+			attrs = append(attrs, slog.Uint64("suppressed_prev_window", n))
+		}
+	}
+	attrs = append(attrs, extra...)
+	slog.Default().LogAttrs(context.Background(), level, msg, attrs...)
+}
+
+// clearLogSuppression closes the suppression window for every key
+// belonging to a ticker. Any non-zero `current` count is moved to
+// priorSuppressed so the next first-log entry can surface it. After
+// this call, the next failure for the same (ticker, reason) logs
+// again as the start of a fresh window.
+func clearLogSuppression(ticker string) {
+	prefix := ticker + ":"
+	orderbookLogSuppress.Range(func(k, v any) bool {
+		ks, ok := k.(string)
+		if !ok {
+			return true
+		}
+		if !strings.HasPrefix(ks, prefix) {
+			return true
+		}
+		if entry, ok := v.(*logSuppressEntry); ok {
+			if n := entry.current.Load(); n > 0 {
+				priorSuppressed.Store(ks, n)
+			}
+		}
+		orderbookLogSuppress.Delete(k)
+		return true
+	})
+}
+
 // ApplyFrameToBooks updates the books map (and optional walls map) by
-// applying one Kalshi frame. Snapshots create or replace the book for a
-// ticker; deltas before any snapshot are silently skipped (book state is
-// undefined). Returns true if the frame was malformed and dropped.
+// applying one Kalshi frame. This is the supported entrypoint for
+// replaying tape frames: it enforces the book lifecycle state machine
+// (snapshot first, then deltas) and updates the package-level
+// observability counters.
+//
+// Return values:
+//   - malformed: true if the frame's payload could not be decoded or
+//     applied. Used by callers (cmd/analyze) for malformed-frame counts.
+//   - err: a typed error describing why the frame was not applied.
+//     nil on success and on no-op frames (no ticker, non-book frame
+//     type, stray delta for an unknown ticker). ErrSnapshotApplyFailed
+//     for a malformed snapshot (book is left uninitialized).
+//     ErrBookUninitialized for a delta whose target book has no valid
+//     snapshot yet (book is unchanged).
 //
 // This is the shared book-reconstruction kernel used by cmd/analyze and
 // cmd/edge-scan. Pass walls=nil if you don't need per-ticker wall stamps.
-func ApplyFrameToBooks(books map[string]*Book, walls map[string]int64, env Envelope, f KalshiFrame) (malformed bool) {
+func ApplyFrameToBooks(books map[string]*Book, walls map[string]int64, env Envelope, f KalshiFrame) (malformed bool, err error) {
 	ticker := f.MarketTicker()
 	if ticker == "" {
-		return false
+		return false, nil
 	}
 	switch f.Type {
 	case "orderbook_snapshot":
 		if books[ticker] == nil {
 			books[ticker] = NewBook()
 		}
-		if err := books[ticker].ApplySnapshot(f.Msg); err != nil {
-			return true
+		if applyErr := books[ticker].ApplySnapshot(f.Msg); applyErr != nil {
+			snapshotErrorsTotal.Add(1)
+			logOnceOrSuppress(slog.LevelError, ticker, "snapshot_apply_failed",
+				"orderbook: snapshot apply failed; book reset to uninitialized",
+				slog.String("err", applyErr.Error()),
+			)
+			return true, fmt.Errorf("%w: ticker=%s: %w", ErrSnapshotApplyFailed, ticker, applyErr)
 		}
+		// Successful snapshot — book is ready. Clear any prior
+		// suppression window so the next failure logs again (and
+		// includes the prior window's suppressed-count).
+		clearLogSuppression(ticker)
 		if walls != nil {
 			walls[ticker] = env.Wall
 		}
+		return false, nil
 	case "orderbook_delta":
-		if books[ticker] == nil {
-			return false
+		book := books[ticker]
+		if book == nil {
+			// Stray delta for an unknown ticker — pre-existing
+			// behavior. No counter bump: this is the "no subscription
+			// yet" case, not the "snapshot failed" case.
+			return false, nil
 		}
-		if err := books[ticker].ApplyDelta(f.Msg); err != nil {
-			return true
+		if !book.IsReady() {
+			// Snapshot is missing or was reset by a prior failure.
+			// Rejecting the delta is the whole point of this state
+			// machine: applying it would mutate empty maps and produce
+			// phantom levels that don't exist in any real snapshot.
+			rejectedDeltasTotal.Add(1)
+			logOnceOrSuppress(slog.LevelWarn, ticker, "delta_uninitialized",
+				"orderbook: delta rejected; book is uninitialized",
+			)
+			return false, fmt.Errorf("%w: ticker=%s", ErrBookUninitialized, ticker)
+		}
+		if applyErr := book.ApplyDelta(f.Msg); applyErr != nil {
+			return true, fmt.Errorf("apply delta ticker=%s: %w", ticker, applyErr)
 		}
 		if walls != nil {
 			walls[ticker] = env.Wall
 		}
+		return false, nil
 	}
-	return false
+	return false, nil
 }
 
 // BestYesBid returns the highest yes-side price in cents, or 0 if the
