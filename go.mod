@@ -3,6 +3,7 @@ module github.com/wh0o0pz/isobar
 go 1.26
 
 require (
+	github.com/bytedance/sonic v1.15.1
 	github.com/coder/websocket v1.8.13
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/sync v0.20.0
@@ -11,7 +12,6 @@ require (
 
 require (
 	github.com/bytedance/gopkg v0.1.3 // indirect
-	github.com/bytedance/sonic v1.15.1 // indirect
 	github.com/bytedance/sonic/loader v0.5.1 // indirect
 	github.com/cloudwego/base64x v0.1.6 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect

@@ -204,6 +204,44 @@ func (l *Lookup) BracketProb(station, variable string, target time.Time, thresho
 	return float64(i) / float64(n)
 }
 
+// RangeProb returns the empirical frequency of historical observations inside
+// the half-open bracket [lo, hi). Open-ended ranges are supported with +/-Inf.
+func (l *Lookup) RangeProb(station, variable string, target time.Time, lo, hi float64) float64 {
+	vars, ok := l.byDay[station]
+	if !ok {
+		return math.NaN()
+	}
+	table, ok := vars[variable]
+	if !ok {
+		return math.NaN()
+	}
+	doy := dayOfYear(target)
+	if doy < 1 || doy > 366 {
+		return math.NaN()
+	}
+	window := table[doy-1]
+	n := len(window)
+	if n == 0 {
+		return math.NaN()
+	}
+	if lo >= hi {
+		return math.NaN()
+	}
+
+	start := 0
+	if !math.IsInf(lo, -1) {
+		start = sort.SearchFloat64s(window, lo)
+	}
+	end := n
+	if !math.IsInf(hi, +1) {
+		end = sort.Search(n, func(k int) bool { return window[k] >= hi })
+	}
+	if end < start {
+		return 0
+	}
+	return float64(end-start) / float64(n)
+}
+
 // ShrinkP combines naive ensemble probability and climate probability
 // using `w·climate + (1−w)·naive`. NaN climate falls back to naive
 // (i.e. behaves like w=0).

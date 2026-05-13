@@ -65,6 +65,38 @@ func TestLookupLoadAndBracketProb(t *testing.T) {
 	}
 }
 
+func TestRangeProb(t *testing.T) {
+	dir := t.TempDir()
+	rows := [][]string{}
+	for year := 2021; year <= 2025; year++ {
+		for d := 10; d <= 20; d++ {
+			ts := time.Date(year, 4, d, 0, 0, 0, 0, time.UTC).Format("2006-01-02")
+			tmax := 60 + (d - 10) // 60..70
+			rows = append(rows, []string{ts, formatInt(tmax), formatInt(tmax - 20)})
+		}
+	}
+	writeObsCSV(t, filepath.Join(dir, "KNYC.csv"), rows)
+
+	l := New()
+	if err := l.Load(dir, []string{"KNYC"}); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	target, _ := time.Parse("2006-01-02", "2026-04-15")
+
+	if got, want := l.RangeProb("KNYC", "tmax", target, 61.5, 63.5), 2.0/11.0; math.Abs(got-want) > 1e-9 {
+		t.Errorf("RangeProb [61.5,63.5) = %v, want %v", got, want)
+	}
+	if got, want := l.RangeProb("KNYC", "tmax", target, math.Inf(-1), 62), 2.0/11.0; math.Abs(got-want) > 1e-9 {
+		t.Errorf("RangeProb [-Inf,62) = %v, want %v", got, want)
+	}
+	if got, want := l.RangeProb("KNYC", "tmax", target, 70, math.Inf(+1)), 1.0/11.0; math.Abs(got-want) > 1e-9 {
+		t.Errorf("RangeProb [70,+Inf) = %v, want %v", got, want)
+	}
+	if got := l.RangeProb("KNYC", "tmax", target, 70, 60); !math.IsNaN(got) {
+		t.Errorf("invalid range = %v, want NaN", got)
+	}
+}
+
 // TestLoadFailsLoudlyOnMissingColumn proves the audit's P2.5 finding is
 // fixed: a CSV without a required column must error, not silently read
 // the wrong field. Pre-fix this would have read column 0 (returning the

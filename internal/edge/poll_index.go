@@ -2,6 +2,7 @@ package edge
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -51,14 +52,14 @@ func loadPolls(omRoot string, start, end time.Time) (*pollIndex, error) {
 	}
 	idx := &pollIndex{byStation: map[string]*stationSeries{}}
 
-	err = replay.ForEachFrame(files, func(env replay.Envelope, _ int, _ bool) error {
+	walkErr := replay.ForEachFrame(files, func(env replay.Envelope, _ int, _ bool) error {
 		station, ok := stationFromKind(env.Kind)
 		if !ok {
 			return nil
 		}
-		poll, err := ParsePoll(env.Payload)
-		if err != nil {
-			return nil // skip malformed; already counted at higher level
+		poll, parseErr := ParsePoll(env.Payload)
+		if parseErr != nil {
+			return nil //nolint:nilerr // malformed polls are skipped; scans count missing pairings downstream
 		}
 		ss := idx.byStation[station]
 		if ss == nil {
@@ -69,15 +70,28 @@ func loadPolls(omRoot string, start, end time.Time) (*pollIndex, error) {
 		ss.polls = append(ss.polls, poll)
 		return nil
 	})
-	if err != nil && err != io.EOF {
-		return nil, err
+	if walkErr != nil && !errors.Is(walkErr, io.EOF) {
+		return nil, walkErr
 	}
 	for _, ss := range idx.byStation {
 		// Polls were written in time order per source, but across rotated
 		// files we still resort to be safe.
-		sort.SliceStable(ss.times, func(i, j int) bool { return ss.times[i].Before(ss.times[j]) })
+		entries := make([]pollEntry, len(ss.times))
+		for i := range ss.times {
+			entries[i] = pollEntry{time: ss.times[i], poll: ss.polls[i]}
+		}
+		sort.SliceStable(entries, func(i, j int) bool { return entries[i].time.Before(entries[j].time) })
+		for i, entry := range entries {
+			ss.times[i] = entry.time
+			ss.polls[i] = entry.poll
+		}
 	}
 	return idx, nil
+}
+
+type pollEntry struct {
+	time time.Time
+	poll *Poll
 }
 
 // stationFromKind maps the Open-Meteo Frame.Kind ("rest:NY") to a Kalshi

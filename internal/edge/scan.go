@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"path/filepath"
 	"sort"
 	"time"
 
+	"github.com/wh0o0pz/isobar/internal/calibration/climate"
 	"github.com/wh0o0pz/isobar/internal/calibration/mos"
 	"github.com/wh0o0pz/isobar/internal/replay"
 )
@@ -44,34 +46,43 @@ type ScanOptions struct {
 	// Trades that hit a missing bin fall back to naive p_fair so the
 	// backtest never silently disappears them.
 	MOS *mos.Coefficients
+
+	// Climate, if non-nil, enables the climate-shrunk-naive baseline:
+	// p_climate_shrunk = w*climate + (1-w)*p_naive. This is reported
+	// alongside p_fair, not used as the trading model.
+	Climate *climate.Lookup
 }
 
 // EdgeRow is one trade-event record in the output CSV.
 type EdgeRow struct {
-	TsMs            int64
-	Ticker          string
-	Series          string
-	ValidDate       time.Time
-	BracketKind     string
-	BracketKey      float64
-	Side            string
-	TradePriceCents int
-	PFairNaive      float64
-	PFairMOS        float64 // 0 if no MOS coeffs or bin missing
-	PFair           float64 // the p_fair actually used for edge math (MOS if available, else naive)
-	MOSApplied      bool
-	NMembers        int
-	NMembersInBkt   int
-	PollAgeS        int
-	FeeCents        int
-	EdgeCents       int
+	TsMs             int64
+	Ticker           string
+	Series           string
+	ValidDate        time.Time
+	BracketKind      string
+	BracketKey       float64
+	Side             string
+	TradePriceCents  int
+	PFairNaive       float64
+	PFairMOS         float64 // 0 if no MOS coeffs or bin missing
+	PFair            float64 // the p_fair actually used for edge math (MOS if available, else naive)
+	MOSApplied       bool
+	ClimateP         float64 // NaN if no climate lookup or no matching observations
+	PFairClimate     float64 // climate-shrunk-naive p_fair; NaN if ClimateP is NaN
+	ClimateApplied   bool
+	EdgeClimateCents int
+	NMembers         int
+	NMembersInBkt    int
+	PollAgeS         int
+	FeeCents         int
+	EdgeCents        int
 
 	// Backtest fields — populated only when ScanOptions.Truth is set.
-	HasTruth     bool   // true iff truth was looked up successfully
-	ActualTempF  int    // observed TMAX (KXHIGH*) or TMIN (KXLOWT*) on valid_date
-	YesResolved  bool   // bracket would have paid YES
-	OurSide      string // "yes", "no", or "" (skipped — no edge band)
-	OurPnLCents  int    // realized PnL after entry fee (0 if OurSide=="")
+	HasTruth    bool   // true iff truth was looked up successfully
+	ActualTempF int    // observed TMAX (KXHIGH*) or TMIN (KXLOWT*) on valid_date
+	YesResolved bool   // bracket would have paid YES
+	OurSide     string // "yes", "no", or "" (skipped — no edge band)
+	OurPnLCents int    // realized PnL after entry fee (0 if OurSide=="")
 }
 
 // Result is the output of Scan: per-trade rows plus aggregate counters.
@@ -94,6 +105,11 @@ type Result struct {
 	// p_fair came from MOS, not naive fallback).
 	MOSEnabled bool
 	MOSApplied int
+
+	// ClimateEnabled is true iff opts.Climate was non-nil. ClimateApplied
+	// counts rows where a historical climate probability was available.
+	ClimateEnabled bool
+	ClimateApplied int
 }
 
 // Scan walks the data tree, pairs each Kalshi trade event with the
@@ -125,6 +141,7 @@ func Scan(opts ScanOptions) (*Result, error) {
 		SkippedReason:   map[string]int{},
 		BacktestEnabled: opts.Truth != nil,
 		MOSEnabled:      opts.MOS != nil,
+		ClimateEnabled:  opts.Climate != nil,
 	}
 
 	kalshiFiles, err := dailyFiles(filepath.Join(opts.DataDir, "kalshi"), opts.StartDate, opts.EndDate)
@@ -132,11 +149,12 @@ func Scan(opts ScanOptions) (*Result, error) {
 		return nil, fmt.Errorf("discover kalshi files: %w", err)
 	}
 
-	err = replay.ForEachFrame(kalshiFiles, func(env replay.Envelope, _ int, _ bool) error {
+	walkErr := replay.ForEachFrame(kalshiFiles, func(env replay.Envelope, _ int, _ bool) error {
 		res.TotalFrames++
 		var kf replay.KalshiFrame
-		if err := json.Unmarshal(env.Payload, &kf); err != nil {
-			return nil
+		if decodeErr := json.Unmarshal(env.Payload, &kf); decodeErr != nil {
+			res.SkippedReason["kalshi_frame_decode_error"]++
+			return nil //nolint:nilerr // malformed frames are counted and skipped, not fatal to a scan
 		}
 		if kf.Type != "trade" {
 			return nil
@@ -144,14 +162,14 @@ func Scan(opts ScanOptions) (*Result, error) {
 		res.TradeFrames++
 
 		var msg tradeMsg
-		if err := json.Unmarshal(kf.Msg, &msg); err != nil {
+		if decodeErr := json.Unmarshal(kf.Msg, &msg); decodeErr != nil {
 			res.SkippedReason["trade_decode_error"]++
-			return nil
+			return nil //nolint:nilerr // malformed trade messages are counted and skipped
 		}
-		spec, err := ParseTicker(msg.MarketTicker)
-		if err != nil {
+		spec, parseErr := ParseTicker(msg.MarketTicker)
+		if parseErr != nil {
 			res.SkippedReason["non_weather_ticker"]++
-			return nil
+			return nil //nolint:nilerr // non-weather tickers are expected noise in the tape
 		}
 		res.WeatherTrades++
 
@@ -169,18 +187,18 @@ func Scan(opts ScanOptions) (*Result, error) {
 			return nil
 		}
 
-		tz, err := stationLocation(station)
-		if err != nil {
+		tz, tzErr := stationLocation(station)
+		if tzErr != nil {
 			res.SkippedReason["unknown_station_tz"]++
-			return nil
+			return nil //nolint:nilerr // unknown stations are counted and skipped
 		}
-		extremes, err := poll.DailyExtremesF(spec.ValidDate, tz)
-		if err != nil {
-			if errors.Is(err, ErrInsufficientCoverage) {
+		extremes, extremesErr := poll.DailyExtremesF(spec.ValidDate, tz)
+		if extremesErr != nil {
+			if errors.Is(extremesErr, ErrInsufficientCoverage) {
 				res.SkippedReason["insufficient_poll_coverage"]++
-				return nil
+				return nil //nolint:nilerr // partial polls are counted and skipped
 			}
-			return fmt.Errorf("daily extremes: %w", err)
+			return fmt.Errorf("daily extremes: %w", extremesErr)
 		}
 
 		// Resolution; T-bracket direction needs sibling context — a future
@@ -216,11 +234,11 @@ func Scan(opts ScanOptions) (*Result, error) {
 		pFair := pFairNaive
 		var pFairMOS float64
 		mosApplied := false
+		variable := "tmax"
+		if !spec.IsHigh() {
+			variable = "tmin"
+		}
 		if opts.MOS != nil {
-			variable := "tmax"
-			if !spec.IsHigh() {
-				variable = "tmin"
-			}
 			mean := sumT / float64(nMembers)
 			mu, sigma, ok := opts.MOS.Predict(station, spec.ValidDate, variable, mean)
 			if ok {
@@ -243,24 +261,41 @@ func Scan(opts ScanOptions) (*Result, error) {
 			return nil
 		}
 
+		climateP := math.NaN()
+		pFairClimate := math.NaN()
+		edgeClimateCents := 0
+		climateApplied := false
+		if opts.Climate != nil {
+			climateP = opts.Climate.RangeProb(station, variable, spec.ValidDate, resolution.Lo, resolution.Hi)
+			if !math.IsNaN(climateP) {
+				pFairClimate = climate.ShrinkP(pFairNaive, climateP, climate.DefaultShrinkage)
+				edgeClimateCents = EdgeAfterFeeCents(pFairClimate, priceDollars)
+				climateApplied = true
+			}
+		}
+
 		row := EdgeRow{
-			TsMs:            msg.TsMs,
-			Ticker:          spec.Ticker,
-			Series:          spec.Series,
-			ValidDate:       spec.ValidDate,
-			BracketKind:     spec.Kind.String(),
-			BracketKey:      spec.Key,
-			Side:            msg.side(),
-			TradePriceCents: int(priceDollars*100 + 0.5),
-			PFairNaive:      pFairNaive,
-			PFairMOS:        pFairMOS,
-			PFair:           pFair,
-			MOSApplied:      mosApplied,
-			NMembers:        nMembers,
-			NMembersInBkt:   nIn,
-			PollAgeS:        int(age.Seconds()),
-			FeeCents:        FeePerContractCents(priceDollars),
-			EdgeCents:       EdgeAfterFeeCents(pFair, priceDollars),
+			TsMs:             msg.TsMs,
+			Ticker:           spec.Ticker,
+			Series:           spec.Series,
+			ValidDate:        spec.ValidDate,
+			BracketKind:      spec.Kind.String(),
+			BracketKey:       spec.Key,
+			Side:             msg.side(),
+			TradePriceCents:  int(priceDollars*100 + 0.5),
+			PFairNaive:       pFairNaive,
+			PFairMOS:         pFairMOS,
+			PFair:            pFair,
+			MOSApplied:       mosApplied,
+			ClimateP:         climateP,
+			PFairClimate:     pFairClimate,
+			ClimateApplied:   climateApplied,
+			EdgeClimateCents: edgeClimateCents,
+			NMembers:         nMembers,
+			NMembersInBkt:    nIn,
+			PollAgeS:         int(age.Seconds()),
+			FeeCents:         FeePerContractCents(priceDollars),
+			EdgeCents:        EdgeAfterFeeCents(pFair, priceDollars),
 		}
 
 		// Realized-PnL backtest path. If no truth available we skip with a
@@ -321,10 +356,13 @@ func Scan(opts ScanOptions) (*Result, error) {
 		if row.MOSApplied {
 			res.MOSApplied++
 		}
+		if row.ClimateApplied {
+			res.ClimateApplied++
+		}
 		return nil
 	})
-	if err != nil && !errors.Is(err, io.EOF) {
-		return nil, err
+	if walkErr != nil && !errors.Is(walkErr, io.EOF) {
+		return nil, walkErr
 	}
 	// Stable sort by ts for deterministic CSV output.
 	sort.Slice(res.Rows, func(i, j int) bool { return res.Rows[i].TsMs < res.Rows[j].TsMs })

@@ -63,8 +63,9 @@ internal/calibration/cliparse   NWS CLI bulletin parser (90.1% coverage).
 internal/calibration/mos        OLS bias correction + ProbBelow/Above.
 internal/calibration/climate    Historical-frequency lookup with seasonal window
                                 + p_shrunk = w·climate + (1-w)·naive.
-internal/market                 Ticker parsing, fee model, station/location/TZ.
-internal/openmeteo              31-member GFS ensemble decoder (live + historical).
+internal/edge                   Offline scan engine, fee model, recorded poll decoder.
+internal/market                 Ticker parsing and station/location/TZ registry.
+internal/openmeteo              Open-Meteo REST poller for live recording.
 internal/replay                 JSONL journal reader + orderbook reconstruction.
 internal/journal                Crash-safe rotating JSONL writer.
 internal/kalshi                 RSA-signed REST + authenticated WS subscriber
@@ -136,7 +137,7 @@ set -a && source .env && set +a
 ./bin/calibrate-parse-cli --zip data/calibration/cli/KNYC.zip \
                          --start 2024-04-29 --end 2026-05-04
 ./bin/calibrate-fit --out data/calibration/mos-coefficients.json --holdout-days 90
-./bin/edge-scan --data ./data --out data/edge-scan-v2.csv \
+./bin/edge-scan --data ./data --out data/calibration/edge-scan \
                 --mos data/calibration/mos-coefficients.json \
                 --climate data/calibration/obs
 ```

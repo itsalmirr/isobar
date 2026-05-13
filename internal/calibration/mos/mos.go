@@ -231,7 +231,7 @@ func binKey(station, season, variable string) string {
 // CoefficientsSchemaVersion. The schema check is the read-side enforcement
 // of the "bump on math change" rule documented on the constant.
 func LoadCoefficients(path string) (Coefficients, error) {
-	b, err := os.ReadFile(path)
+	b, err := os.ReadFile(path) //nolint:gosec // path is operator-supplied CLI/config input
 	if err != nil {
 		return Coefficients{}, fmt.Errorf("mos: read %s: %w", path, err)
 	}
