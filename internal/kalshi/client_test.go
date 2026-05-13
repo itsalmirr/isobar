@@ -684,6 +684,59 @@ func TestDoRaw_DoesNotRetry403(t *testing.T) {
 	require.Equal(t, int32(1), calls.Load(), "403 must not be retried")
 }
 
+// TestDoRaw_MinDelayDecaysAfterSuccessCluster verifies the
+// success-counter decay restores minDelay to baseline after a 429
+// cluster. Without this, a transient rate-limit storm would leave the
+// client throttled at maxAdaptiveDelay (2s) for process lifetime.
+func TestDoRaw_MinDelayDecaysAfterSuccessCluster(t *testing.T) {
+	var calls atomic.Int32
+	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := calls.Add(1)
+		if n == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"code":"rate_limited"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(getMarketResponse{
+			Market: Market{Ticker: "OK", Status: "open"},
+		}))
+	}))
+	// Speed up the test: tiny baseline so the 1s bit-shift backoff +
+	// 11 calls doesn't blow our timeout. Also tiny baseMinDelay so the
+	// decay floor matches.
+	c.baseMinDelay = 1 * time.Millisecond
+	c.minDelay = 1 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// First call hits 429, retries to 200. Observation: minDelay should
+	// be bumped to 2 * baseMinDelay (or capped at maxAdaptiveDelay).
+	_, err := c.GetMarket(ctx, "X")
+	require.NoError(t, err)
+
+	c.rateMu.Lock()
+	bumped := c.minDelay
+	c.rateMu.Unlock()
+	require.Greater(t, bumped, c.baseMinDelay, "429 must bump minDelay")
+
+	// Now drive 10 more successful 200s; minDelay should decay back to
+	// baseMinDelay after the 10th success (consecutive2x already has 1
+	// from the retried success, so 9 more is enough — be generous and
+	// drive 10 to be sure).
+	for i := 0; i < 10; i++ {
+		_, err := c.GetMarket(ctx, "X")
+		require.NoError(t, err)
+	}
+
+	c.rateMu.Lock()
+	final := c.minDelay
+	c.rateMu.Unlock()
+	require.Equal(t, c.baseMinDelay, final,
+		"minDelay should decay back to baseMinDelay after a success cluster")
+}
+
 // TestParseRetryAfter exercises the RFC 9110 parser in isolation.
 func TestParseRetryAfter(t *testing.T) {
 	now := time.Date(2026, 5, 13, 12, 0, 0, 0, time.UTC)
