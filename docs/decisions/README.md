@@ -29,6 +29,7 @@ the old one rather than editing history.
 | [0007](./0007-calibration-ground-truth-cli.md) | 2026-04-29 | Use NWS CLI bulletins as the calibration y-target | Accepted |
 | [0008](./0008-deterministic-historical-forecast.md) | 2026-05-02 | Use deterministic GFS historical forecasts for first-pass NGR/MOS | Accepted (canary fired — see 0009) |
 | [0009](./0009-mos-canary-fired-escalate-calibration.md) | 2026-05-05 | MOS canary fired; escalate calibration via ECMWF blend or T−3h Bayesian | Accepted |
+| [0010](./0010-t-minus-3h-bayesian-update.md) | 2026-05-13 | T−3h Bayesian update of MOS prior via intraday observations | Proposed |
 
 ## Template
 
