@@ -69,8 +69,9 @@ func TestFetchOneBuildsExpectedQuery(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	body, err := p.fetchOne(context.Background(), Location{Name: "NY", Lat: 40.7794, Lon: -73.9692})
+	body, status, err := p.fetchOne(context.Background(), Location{Name: "NY", Lat: 40.7794, Lon: -73.9692})
 	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, status)
 	require.Equal(t, `{"ok":true}`, string(body))
 
 	raw := gotURL.Load().(string)
@@ -99,8 +100,9 @@ func TestFetchOneReturnsErrorOnNon2xx(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	_, err = p.fetchOne(context.Background(), Location{Name: "NY", Lat: 40, Lon: -73})
+	_, status, err := p.fetchOne(context.Background(), Location{Name: "NY", Lat: 40, Lon: -73})
 	require.Error(t, err)
+	require.Equal(t, http.StatusTooManyRequests, status)
 	require.Contains(t, err.Error(), "429")
 }
 
@@ -177,7 +179,8 @@ func TestFetchOneRespectsBodyLimit(t *testing.T) {
 		Locations:    []Location{{Name: "NY", Lat: 40, Lon: -73}},
 	})
 	require.NoError(t, err)
-	body, err := p.fetchOne(context.Background(), Location{Name: "NY", Lat: 40, Lon: -73})
+	body, status, err := p.fetchOne(context.Background(), Location{Name: "NY", Lat: 40, Lon: -73})
 	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, status)
 	require.Equal(t, `{"ok":1}`, string(body))
 }
