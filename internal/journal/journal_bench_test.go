@@ -23,6 +23,7 @@ func BenchmarkJournalWrite(b *testing.B) {
 		MaxFileAge:   1 * time.Hour,
 		FlushEvery:   1 * time.Second,
 		QueueSize:    1 << 16,
+		OnDropAlarm:  NoopAlarmHook,
 	}, logger)
 	if err != nil {
 		b.Fatal(err)

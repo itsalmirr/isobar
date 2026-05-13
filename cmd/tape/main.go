@@ -111,11 +111,24 @@ func computeConfigSHA(path string, logger *slog.Logger) string {
 func run(ctx context.Context, logger *slog.Logger, cfg config.Config, configSHA string) error {
 	g, ctx := errgroup.WithContext(ctx)
 
+	// Single per-process alarm sink shared across both source journals.
+	// It owns the lazily-opened <DataDir>/alarms/<date>.jsonl file and
+	// the JournalDropsTotal counter. Closed via defer here so the file
+	// is fsynced + closed even on errgroup-error shutdown, matching
+	// the existing defer pattern for journals inside startKalshi /
+	// startOpenMeteo.
+	alarms := newAlarmSink(cfg.DataDir, logger)
+	defer func() {
+		if err := alarms.Close(); err != nil {
+			logger.Error("tape-alarm: close failed", "err", err)
+		}
+	}()
+
 	if cfg.Kalshi.Enabled {
-		g.Go(func() error { return startKalshi(ctx, logger, cfg, configSHA, g) })
+		g.Go(func() error { return startKalshi(ctx, logger, cfg, configSHA, g, alarms) })
 	}
 	if cfg.OpenMeteo.Enabled {
-		g.Go(func() error { return startOpenMeteo(ctx, logger, cfg, configSHA) })
+		g.Go(func() error { return startOpenMeteo(ctx, logger, cfg, configSHA, alarms) })
 	}
 	return g.Wait()
 }
@@ -166,7 +179,7 @@ func writeBootFrame(jrn *journal.Journal, configSHA string) {
 	})
 }
 
-func startKalshi(ctx context.Context, logger *slog.Logger, cfg config.Config, configSHA string, g *errgroup.Group) error {
+func startKalshi(ctx context.Context, logger *slog.Logger, cfg config.Config, configSHA string, g *errgroup.Group, alarms *alarmSink) error {
 	pemBytes, source, err := loadKalshiPEM(cfg.Kalshi)
 	if err != nil {
 		return err
@@ -177,7 +190,7 @@ func startKalshi(ctx context.Context, logger *slog.Logger, cfg config.Config, co
 	}
 	logger.Info("kalshi: credentials loaded", "key_id", redactKeyID(cfg.Kalshi.APIKeyID), "pem_source", source)
 
-	jrn, err := openJournal(cfg, "kalshi", logger)
+	jrn, err := openJournal(cfg, "kalshi", logger, alarms)
 	if err != nil {
 		return err
 	}
@@ -313,8 +326,8 @@ func sample(s []string, n int) []string {
 	return s[:n]
 }
 
-func startOpenMeteo(ctx context.Context, logger *slog.Logger, cfg config.Config, configSHA string) error {
-	jrn, err := openJournal(cfg, "openmeteo", logger)
+func startOpenMeteo(ctx context.Context, logger *slog.Logger, cfg config.Config, configSHA string, alarms *alarmSink) error {
+	jrn, err := openJournal(cfg, "openmeteo", logger, alarms)
 	if err != nil {
 		return err
 	}
@@ -349,9 +362,52 @@ func startOpenMeteo(ctx context.Context, logger *slog.Logger, cfg config.Config,
 	return poller.Run(ctx)
 }
 
-// openJournal creates a per-source journal under cfg.DataDir/<source>.
-func openJournal(cfg config.Config, source string, logger *slog.Logger) (*journal.Journal, error) {
-	return journal.Open(journal.Options{
+// alarmSustainForTest lets the cmd/tape regression test exercise the
+// alarm-crossing path without paying journal.Options' 60-second
+// default sustain window. Production runs leave this at zero, which
+// causes journal.Open to apply its default. Set ONLY from tests.
+var alarmSustainForTest time.Duration
+
+// alarmThresholdForTest mirrors alarmSustainForTest for the per-second
+// drops/sec threshold. Production leaves it zero (journal applies the
+// default of 1 drop/sec); tests can lower or raise it as needed.
+var alarmThresholdForTest uint64
+
+// openJournal creates a per-source journal under cfg.DataDir/<source>
+// and wires its OnDropAlarm hook to the process-wide alarms sink.
+//
+// The hook closes over a *journal.Journal so it can read live
+// QueueDepth/QueueCapacity at fire time (the structured log and the
+// alarms file both carry the saturation context). Note that the
+// returned hook is bound BEFORE the *journal.Journal is allocated;
+// the closure captures the local variable, which is then assigned
+// from Open's return. Open invokes the hook only from its writer
+// goroutine's alarm tick, which cannot fire before AlarmSustain (60s
+// default) has elapsed — there's no race in practice.
+//
+// ADR-0011 §A1: journal.Open returns ErrAlarmHookRequired if the
+// hook is nil, so this function is the only place a hook can be
+// silently omitted from the production code path. Tests
+// (cmd/tape/main_test.go) include a tripwire that asserts every
+// journal constructed here has OnDropAlarm bound.
+func openJournal(cfg config.Config, source string, logger *slog.Logger, alarms *alarmSink) (*journal.Journal, error) {
+	var jrn *journal.Journal
+	hook := alarms.hookFor(
+		source,
+		func() int {
+			if jrn == nil {
+				return 0
+			}
+			return jrn.QueueDepth()
+		},
+		func() int {
+			if jrn == nil {
+				return 0
+			}
+			return jrn.QueueCapacity()
+		},
+	)
+	j, err := journal.Open(journal.Options{
 		Dir:              filepath.Join(cfg.DataDir, source),
 		Source:           source,
 		MaxFileBytes:     cfg.Journal.MaxFileBytes,
@@ -359,7 +415,15 @@ func openJournal(cfg config.Config, source string, logger *slog.Logger) (*journa
 		FlushEvery:       cfg.Journal.FlushEvery,
 		QueueSize:        cfg.Journal.QueueSize,
 		CompressOnRotate: cfg.Journal.CompressOnRotate,
+		OnDropAlarm:      hook,
+		AlarmSustain:     alarmSustainForTest,   // 0 in prod → journal default
+		AlarmThreshold:   alarmThresholdForTest, // 0 in prod → journal default
 	}, logger)
+	if err != nil {
+		return nil, err
+	}
+	jrn = j
+	return j, nil
 }
 
 // makeWSFrameHandler returns an OnFrame callback that wraps a raw payload

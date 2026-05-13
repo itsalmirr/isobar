@@ -20,8 +20,14 @@
 //   - The writer goroutine samples the counter once per second; when the
 //     drop rate has been at or above AlarmThreshold drops/sec continuously
 //     for AlarmSustain, the OnDropAlarm hook is invoked exactly once per
-//     crossing edge. Default hook is a structured slog.Warn — production
-//     deploys should install a real sink (Phase 6 wires Prometheus).
+//     crossing edge. Hook invocation runs under a deferred recover; a
+//     panicking hook bumps AlarmHookPanicTotal() and is logged but
+//     cannot kill the writer goroutine.
+//   - OnDropAlarm is REQUIRED. ADR-0011 originally specified a default
+//     slog.Warn fallback; that fallback was deleted in A1 because every
+//     prod deploy of cmd/tape was running blind to journal drops by
+//     accepting the default. Open() now returns ErrAlarmHookRequired
+//     if Options.OnDropAlarm is nil. Tests can pass NoopAlarmHook.
 //   - The legacy 60-second "frames dropped" warn line is demoted to an
 //     info-level cumulative heartbeat; the alarm hook is now the primary
 //     operator signal.
@@ -101,9 +107,13 @@ type Options struct {
 	// cumulative drop count, and the duration since the first drop in
 	// the current sustained window.
 	//
-	// If nil, a default hook emits a structured slog.Warn. ADR-0011
-	// is explicit that production runs SHOULD install a non-default
-	// hook (Phase 6 wires a Prometheus counter through this seam).
+	// OnDropAlarm is REQUIRED. Open() returns ErrAlarmHookRequired if
+	// this field is nil. ADR-0011 originally specified a default
+	// slog.Warn fallback; A1 deleted that fallback because every prod
+	// cmd/tape run was accidentally accepting it. The hook is now the
+	// drop-visibility seam — wire it to a real sink (Prometheus, an
+	// alarms file, alertmanager). Tests that don't care about drop
+	// events may pass NoopAlarmHook.
 	OnDropAlarm func(src string, drops uint64, since time.Duration)
 
 	// AlarmThreshold is the minimum sustained drops/sec rate that arms
@@ -167,10 +177,26 @@ type Journal struct {
 	onDropAlarm    func(src string, drops uint64, since time.Duration)
 }
 
+// ErrAlarmHookRequired is returned by Open when Options.OnDropAlarm
+// is nil. ADR-0011 §A1 deleted the default-slog-warn fallback because
+// every prod cmd/tape run was accidentally accepting it; the hook is
+// now a startup-time prerequisite, the same way Dir and Source are.
+// Tests that don't exercise drop events should pass NoopAlarmHook.
+var ErrAlarmHookRequired = errors.New("journal: Options.OnDropAlarm required (use NoopAlarmHook for tests)")
+
+// NoopAlarmHook is a placeholder hook that does nothing. Use it in
+// tests that don't care about drop events; production code must wire
+// a real sink (Prometheus increment, alarms file, alertmanager push).
+func NoopAlarmHook(src string, drops uint64, since time.Duration) {}
+
 // Open creates a Journal and starts its writer goroutine. Stop with Close.
+// Returns ErrAlarmHookRequired if Options.OnDropAlarm is nil.
 func Open(opts Options, logger *slog.Logger) (*Journal, error) {
 	if opts.Dir == "" || opts.Source == "" {
 		return nil, errors.New("journal: Dir and Source required")
+	}
+	if opts.OnDropAlarm == nil {
+		return nil, ErrAlarmHookRequired
 	}
 	if opts.QueueSize <= 0 {
 		opts.QueueSize = 8192
@@ -192,16 +218,6 @@ func Open(opts Options, logger *slog.Logger) (*Journal, error) {
 	}
 	scopedLogger := logger.With("component", "journal", "src", opts.Source)
 
-	// Per ADR-0011 detection plan: announce which sink the alarm path
-	// will use at startup. A custom hook gets an info line; the fallback
-	// gets a Warn line because production runs should not rely on it.
-	hookName := "custom"
-	hook := opts.OnDropAlarm
-	if hook == nil {
-		hookName = "default-slog-warn"
-		hook = defaultDropAlarmHook(scopedLogger, opts.AlarmThreshold, opts.AlarmSustain)
-	}
-
 	j := &Journal{
 		opts:           opts,
 		logger:         scopedLogger,
@@ -211,35 +227,13 @@ func Open(opts Options, logger *slog.Logger) (*Journal, error) {
 		sampleEvery:    opts.SampleEvery,
 		alarmThreshold: opts.AlarmThreshold,
 		alarmSustain:   opts.AlarmSustain,
-		onDropAlarm:    hook,
+		onDropAlarm:    opts.OnDropAlarm,
 	}
 
-	if opts.OnDropAlarm != nil {
-		j.logger.Info("journal: drop-alarm sink installed", "sink", hookName)
-	} else {
-		j.logger.Warn("journal: drop-alarm sink is default slog.Warn — wire a real alarm for prod",
-			"sink", hookName)
-	}
+	j.logger.Info("journal: drop-alarm sink installed")
 
 	go j.run()
 	return j, nil
-}
-
-// defaultDropAlarmHook returns the fallback OnDropAlarm sink. It emits a
-// structured slog.Warn with the source label, cumulative drop count, the
-// "since" window, and the threshold/sustain config so an operator who
-// grep-discovers it can answer "is this fresh or stale, and how loud is
-// it?" without consulting the code.
-func defaultDropAlarmHook(logger *slog.Logger, threshold uint64, sustain time.Duration) func(string, uint64, time.Duration) {
-	return func(src string, drops uint64, since time.Duration) {
-		logger.Warn("journal: drop-alarm fired",
-			"src", src,
-			"drops", drops,
-			"since", since,
-			"threshold_per_sec", threshold,
-			"sustained_for", sustain,
-		)
-	}
 }
 
 // Write enqueues a frame. It never blocks; if the queue is full the frame
@@ -293,6 +287,18 @@ func (j *Journal) Dropped() uint64 { return j.dropped.Load() }
 // scrape, and operators observe how often the guard tripped.
 func (j *Journal) AlarmHookPanicTotal() uint64 { return j.alarmHookPanics.Load() }
 
+// QueueDepth returns the current number of envelopes queued for the
+// writer. Reads are racy by nature (len on a channel) but useful as a
+// point-in-time gauge — operator dashboards and the cmd/tape alarm
+// hook log this alongside QueueCapacity so a drop event carries the
+// "how saturated were we" context.
+func (j *Journal) QueueDepth() int { return len(j.in) }
+
+// QueueCapacity returns the static capacity of the writer queue
+// (== Options.QueueSize after default-fill). Constant for the life
+// of the Journal.
+func (j *Journal) QueueCapacity() int { return cap(j.in) }
+
 // Close stops the writer goroutine, draining the queue and fsyncing the
 // current file. Safe to call from any goroutine; idempotent.
 func (j *Journal) Close() error {
@@ -323,6 +329,21 @@ var (
 	// should fire. ADR-0011 §4 picks 1s; tests swap this down to ms.
 	alarmCheckInterval = 1 * time.Second
 )
+
+// SetAlarmCheckIntervalForTest swaps the alarm-check tick interval
+// for cross-package tests (notably cmd/tape's regression harness for
+// A1). The previous value is returned so callers can restore it on
+// cleanup. NOT safe to call concurrently with Open; intended for
+// test-time setup before any Journal exists.
+//
+// Production code MUST NOT call this. It exists only because tests in
+// cmd/tape need to exercise the alarm crossing path without paying
+// the 1-second default tick.
+func SetAlarmCheckIntervalForTest(d time.Duration) (prev time.Duration) {
+	prev = alarmCheckInterval
+	alarmCheckInterval = d
+	return prev
+}
 
 // run is the single owner of the on-disk file.
 func (j *Journal) run() {
