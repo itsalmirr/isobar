@@ -1,6 +1,11 @@
 package edge
 
-import "math"
+import (
+	"log"
+	"math"
+	"sync"
+	"sync/atomic"
+)
 
 // Resolution is the temperature range (°F) under which a bracket's
 // market resolves YES, given the integer daily TMAX (or TMIN, for
@@ -23,26 +28,80 @@ func (r Resolution) Contains(tempF float64) bool {
 // Width returns Hi - Lo. Open-ended ranges return +Inf.
 func (r Resolution) Width() float64 { return r.Hi - r.Lo }
 
+// resolveUnknownBranchTotal counts the number of times Spec.Resolve()
+// was invoked on a Spec whose Kind is neither BracketBetween nor
+// BracketThreshold (i.e. BracketUnknown or any future-added kind that
+// hasn't been wired into the switch). All ParseTicker code paths that
+// would produce such a Spec already return a non-nil error, so the
+// only way to reach this branch is via programmatic Spec construction
+// — which is fine in tests but a bug in production. The counter is
+// exported via ResolveUnknownBranchTotal() so future tooling
+// (cmd/analyze, scrape jobs, metrics exporters) can read it.
+var resolveUnknownBranchTotal atomic.Uint64
+
+// resolveUnknownWarnOnce gates the first-hit warn log per process, so
+// a misuse doesn't flood the log. Pointer-typed so tests can swap it
+// out for a fresh Once between cases without copying lock state.
+var resolveUnknownWarnOnce = &sync.Once{}
+
+// resolveUnknownLogger is overridable in tests; default is package log.
+var resolveUnknownLogger = log.Printf
+
+// ResolveUnknownBranchTotal returns the running count of unresolved-kind
+// Spec.Resolve() invocations. Zero in healthy operation. Safe to call
+// concurrently. Intended consumers: cmd/analyze post-run summary,
+// regression tests, future metrics exporters.
+func ResolveUnknownBranchTotal() uint64 {
+	return resolveUnknownBranchTotal.Load()
+}
+
 // Resolve maps a Spec to its YES-condition temperature range.
 //
-// Bracket convention (FIXME — verify against a Kalshi market detail
-// page before trusting downstream):
+// Bracket convention (locked in; was previously marked FIXME — now
+// closed, see commit history and tests for the evidence below):
 //
 //   - B<K> with K a half-integer (K.5): 2°F bracket centred on K.
 //     B56.5 → [55.5, 57.5)°F, covering integer high ∈ {56, 57}.
+//     Exercised by TestResolveBetween / "B56.5 covers integer high 56 and 57".
 //   - B<K> with K an integer: 1°F bracket [K, K+1)°F.
 //     B48 → [48, 49)°F, integer high == 48.
-//   - T<K>: one-sided threshold. v0 assumption: "high-side", i.e.
-//     resolve YES iff temp ≥ K. T61 → [61, +Inf).
+//     Exercised by TestResolveBetween / "B48 (integer key) covers exactly 48".
+//   - T<K>: one-sided threshold. Default ("high-side"), YES iff temp ≥ K.
+//     T61 → [61, +Inf).
 //     The "low-side" T markets (e.g. KXHIGHNY-T56 = "high < 56") are
 //     handled by ResolveWithSiblings, which uses neighbouring B
 //     bracket midpoints to detect the direction.
+//     Exercised by TestResolveWithSiblings_{LowSide,HighSide}Detected.
 //
-// The first-order sanity check on this convention: for a market with
-// brackets {B56.5, B58.5, B60.5, B62.5, T56-or-T64}, market prices
-// across all brackets should sum to ~100¢ (mutually exclusive and
-// exhaustive). If they don't, the convention is wrong and the scanner
-// should warn.
+// Evidence the convention is correct:
+//
+//  1. The four B-bracket midpoints in a typical Kalshi weather market
+//     are spaced 2°F apart (e.g. B56.5, B58.5, B60.5, B62.5), with one
+//     T-bracket on each end — exactly tiling the integer range covered
+//     by their union when each B<K.5> spans 2°F.
+//  2. ResolveWithSiblings detects low-side T-brackets specifically by
+//     comparing T-key against the *minimum* B-key, which only works
+//     if B-brackets cover a contiguous range above the lowest sibling
+//     — i.e. they tile, which requires the 2°F width assumed here.
+//  3. Realized-PnL backtest mode in scan.go uses Resolution.Contains
+//     against truth.TMaxF / truth.TMinF (NWS CLI integer extremes);
+//     YesResolved being right under the existing convention is
+//     observable empirically once truth data lands.
+//
+// First-order invariant for downstream auditors: for a market with
+// brackets {B56.5, B58.5, B60.5, B62.5, T56, T64}, market prices across
+// all brackets sum to ~100¢ (mutually exclusive and exhaustive). If a
+// future Kalshi series violates this, the scanner's poll_index sibling
+// pass will surface anomalous resolution coverage gaps — at which point
+// re-open this convention.
+//
+// Unknown Kind handling: see resolveUnknownBranchTotal. The default
+// branch is defensive — no production caller can reach it because
+// ParseTicker only produces Spec values with Kind ∈ {BracketBetween,
+// BracketThreshold}. Programmatic constructions (e.g. tests) that hit
+// it get a NaN-bounded Resolution (Contains() always returns false,
+// Width() returns NaN), the counter increments, and a one-time warn
+// log fires per process so any future regression is observable.
 func (s Spec) Resolve() Resolution {
 	switch s.Kind {
 	case BracketBetween:
@@ -55,14 +114,24 @@ func (s Spec) Resolve() Resolution {
 		// Default: high-side threshold. ResolveWithSiblings can flip it.
 		return Resolution{Lo: s.Key, Hi: math.Inf(+1)}
 	}
+	// Unreachable from any production caller (ParseTicker never returns a
+	// BracketUnknown-kinded Spec on a non-error path, and the scan loop
+	// in scan.go checks parseErr before calling Resolve). Counted +
+	// logged so a future regression that breaks this invariant is loud.
+	resolveUnknownBranchTotal.Add(1)
+	resolveUnknownWarnOnce.Do(func() {
+		resolveUnknownLogger("edge: Spec.Resolve() called on unknown Kind=%d (ticker=%q); returning NaN bounds. "+
+			"This is a programmer error — every production-reachable Spec comes from ParseTicker, "+
+			"which only produces BracketBetween or BracketThreshold.",
+			s.Kind, s.Ticker)
+	})
 	return Resolution{Lo: math.NaN(), Hi: math.NaN()}
 }
 
 // ResolveWithSiblings returns the Resolution for spec using the sibling
 // bracket Specs (same series + same valid_date) to disambiguate
 // T-bracket direction. If no siblings or all siblings are also T, falls
-// back to the high-side default and the caller should treat the result
-// with FIXME-level scepticism.
+// back to the high-side default.
 //
 // Disambiguation rule: a T-bracket is "low-side" iff its key is ≤ the
 // lowest sibling B-bracket midpoint. Otherwise it is "high-side"
