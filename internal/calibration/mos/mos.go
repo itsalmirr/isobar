@@ -20,6 +20,8 @@ import (
 	"os"
 	"sort"
 	"time"
+
+	"github.com/wh0o0pz/isobar/internal/clock"
 )
 
 // ModelGFS / ModelECMWF are the canonical short tags for the forecast
@@ -109,7 +111,19 @@ const MinTrainPerBin = 10
 //
 // Bins with fewer than MinTrainPerBin training pairs are dropped from the
 // output (Predict returns ok=false for missing bins).
-func Fit(pairs []Pair, holdoutDays int) (Coefficients, error) {
+//
+// The provided clk is the wall-time source stamped into FittedAt. Passing
+// a deterministic [clock.Fake] makes the entire output byte-identical
+// across runs with the same pairs and holdoutDays — that's the property
+// downstream backtest reproducibility and golden-file artifact diffing
+// depend on (see ADR-0012). Production callers pass [clock.Wall].
+//
+// Passing a nil clock panics rather than silently defaulting to time.Now;
+// the explicit-parameter discipline is the point.
+func Fit(pairs []Pair, holdoutDays int, clk clock.Clock) (Coefficients, error) {
+	if clk == nil {
+		panic("mos.Fit: nil clock; pass clock.Wall() in production or clock.Fake(t) in tests")
+	}
 	if len(pairs) == 0 {
 		return Coefficients{}, errors.New("mos: no pairs to fit")
 	}
@@ -147,7 +161,7 @@ func Fit(pairs []Pair, holdoutDays int) (Coefficients, error) {
 
 	out := Coefficients{
 		SchemaVersion:      CoefficientsSchemaVersion,
-		FittedAt:           time.Now().UTC(),
+		FittedAt:           clk.Now().UTC(),
 		TrainingWindowEnd:  trainEnd.Format("2006-01-02"),
 		HoldoutWindowStart: holdoutStart.Format("2006-01-02"),
 		Bins:               make(map[string]BinCoeffs, len(buckets)),

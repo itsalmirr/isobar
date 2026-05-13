@@ -87,6 +87,11 @@ type Poller struct {
 	// the poller's lifetime. Atomic so tests and future metrics exporters
 	// can read it without taking a lock.
 	fetchFailuresTotal atomic.Uint64
+
+	// now is the wall-time source for per-attempt latency measurement.
+	// Defaults to time.Now in NewPoller; tests override via SetNowForTest
+	// when they need deterministic latency values. Per ADR-0012.
+	now func() time.Time
 }
 
 // NewPoller validates options and returns a Poller. Call Run to start.
@@ -124,7 +129,11 @@ func NewPoller(opts Options) (*Poller, error) {
 	if opts.RetryMaxAttempts <= 0 {
 		opts.RetryMaxAttempts = retryMaxAttempts
 	}
-	return &Poller{opts: opts, logger: opts.Logger.With("component", "openmeteo")}, nil
+	return &Poller{
+		opts:   opts,
+		logger: opts.Logger.With("component", "openmeteo"),
+		now:    time.Now,
+	}, nil
 }
 
 // FetchFailuresTotal returns the cumulative count of locations that
@@ -132,6 +141,16 @@ func NewPoller(opts Options) (*Poller, error) {
 // tests, dashboards, and alerting hooks. Safe to call concurrently.
 func (p *Poller) FetchFailuresTotal() uint64 {
 	return p.fetchFailuresTotal.Load()
+}
+
+// SetNowForTest overrides the poller's wall-time source. Test-only —
+// production code must not call this. Passing nil restores time.Now.
+func (p *Poller) SetNowForTest(now func() time.Time) {
+	if now == nil {
+		p.now = time.Now
+		return
+	}
+	p.now = now
 }
 
 // Run polls locations on a fixed interval until ctx is cancelled.
@@ -200,9 +219,9 @@ func (p *Poller) fetchWithRetry(ctx context.Context, loc Location) ([]byte, erro
 	doErr := retry.Do(ctx, cfg, nil, func(attempt int) error {
 		attemptsUsed = attempt + 1
 
-		start := time.Now()
+		start := p.now()
 		b, statusCode, fetchErr := p.fetchOne(ctx, loc)
-		latency := time.Since(start)
+		latency := p.now().Sub(start)
 		lastStatus = statusCode
 
 		if fetchErr == nil {
