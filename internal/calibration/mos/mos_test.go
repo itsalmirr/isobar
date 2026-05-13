@@ -1,6 +1,7 @@
 package mos
 
 import (
+	"bytes"
 	"encoding/json"
 	"math"
 	"math/rand/v2"
@@ -8,7 +9,16 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/wh0o0pz/isobar/internal/clock"
 )
+
+// testClock returns a fixed FakeClock anchored at 2026-01-01 UTC so MOS
+// Fit produces byte-identical Coefficients given byte-identical pairs.
+// One canonical anchor across the file keeps test failures readable.
+func testClock() clock.Clock {
+	return clock.Fake(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+}
 
 func TestSeason(t *testing.T) {
 	tests := []struct {
@@ -92,7 +102,7 @@ func TestFitRecoversKnownLinearStructure(t *testing.T) {
 		}
 	}
 
-	coeffs, err := Fit(pairs, 0) // no holdout — use all data for fit
+	coeffs, err := Fit(pairs, 0, testClock()) // no holdout — use all data for fit
 	if err != nil {
 		t.Fatalf("Fit: %v", err)
 	}
@@ -142,7 +152,7 @@ func TestFitProducesMultipleBins(t *testing.T) {
 			}
 		}
 	}
-	c, err := Fit(pairs, 0)
+	c, err := Fit(pairs, 0, testClock())
 	if err != nil {
 		t.Fatalf("Fit: %v", err)
 	}
@@ -166,7 +176,7 @@ func TestFitDropsBinsBelowMinTrain(t *testing.T) {
 			Observed:  62 + float64(i),
 		}
 	}
-	_, err := Fit(pairs, 0)
+	_, err := Fit(pairs, 0, testClock())
 	// Either the bin is dropped (Fit returns "no bin had at least N pairs")
 	// or returns an empty Coefficients. Both are acceptable.
 	if err == nil {
@@ -221,7 +231,7 @@ func TestFitHandlesBiasCorrectly(t *testing.T) {
 			Observed:  y,
 		}
 	}
-	c, err := Fit(pairs, 0)
+	c, err := Fit(pairs, 0, testClock())
 	if err != nil {
 		t.Fatalf("Fit: %v", err)
 	}
@@ -249,7 +259,7 @@ func TestFitEmitsSchemaVersion(t *testing.T) {
 			Observed:  60 + rng.Float64()*20,
 		}
 	}
-	c, err := Fit(pairs, 0)
+	c, err := Fit(pairs, 0, testClock())
 	if err != nil {
 		t.Fatalf("Fit: %v", err)
 	}
@@ -304,7 +314,7 @@ func TestFitUsesHoldoutSigmaWhenSufficient(t *testing.T) {
 		})
 	}
 
-	c, err := Fit(pairs, holdoutDays)
+	c, err := Fit(pairs, holdoutDays, testClock())
 	if err != nil {
 		t.Fatalf("Fit: %v", err)
 	}
@@ -351,7 +361,7 @@ func TestFitFlagsTrainingFallbackWhenHoldoutTooSmall(t *testing.T) {
 			Forecast: x, Observed: y,
 		}
 	}
-	c, err := Fit(pairs, 0)
+	c, err := Fit(pairs, 0, testClock())
 	if err != nil {
 		t.Fatalf("Fit: %v", err)
 	}
@@ -497,4 +507,71 @@ func TestSortedBinKeys(t *testing.T) {
 			t.Errorf("SortedBinKeys()[%d] = %q, want %q", i, got[i], want[i])
 		}
 	}
+}
+
+// TestFit_DeterministicAcrossCalls is the A8 regression: with identical
+// pairs and an identical fake clock, two Fit calls must produce
+// byte-identical JSON. Before this fix FittedAt was time.Now().UTC()
+// inside Fit, so two back-to-back fits diverged by tens of nanoseconds —
+// enough to break any artifact-diffing reproducibility check.
+//
+// The JSON map iteration order in encoding/json sorts keys alphabetically,
+// so Bins won't perturb the comparison even though it is a map.
+func TestFit_DeterministicAcrossCalls(t *testing.T) {
+	rng := rand.New(rand.NewPCG(123, 456))
+	startDate, _ := time.Parse("2006-01-02", "2024-04-01")
+	pairs := make([]Pair, 80)
+	for i := range pairs {
+		date := startDate.AddDate(0, 0, i%50)
+		x := 60.0 + rng.Float64()*15
+		y := 0.5 + 1.0*x + rng.NormFloat64()*1.2
+		pairs[i] = Pair{
+			Station: "KNYC", ValidDate: date, Variable: "tmax",
+			Forecast: x, Observed: y,
+		}
+	}
+
+	// Reuse the same fake clock across both fits — the point is that
+	// Fit reads from the injected clock, not from time.Now, so identical
+	// inputs produce identical outputs.
+	clk := testClock()
+
+	c1, err := Fit(pairs, 0, clk)
+	if err != nil {
+		t.Fatalf("Fit (1st): %v", err)
+	}
+	c2, err := Fit(pairs, 0, clk)
+	if err != nil {
+		t.Fatalf("Fit (2nd): %v", err)
+	}
+
+	// FittedAt is the field that used to drift; cheap explicit check.
+	if !c1.FittedAt.Equal(c2.FittedAt) {
+		t.Errorf("FittedAt drifted: %v vs %v", c1.FittedAt, c2.FittedAt)
+	}
+
+	b1, err := json.Marshal(c1)
+	if err != nil {
+		t.Fatalf("marshal c1: %v", err)
+	}
+	b2, err := json.Marshal(c2)
+	if err != nil {
+		t.Fatalf("marshal c2: %v", err)
+	}
+	if !bytes.Equal(b1, b2) {
+		t.Errorf("Fit output diverged across calls with identical inputs.\n  c1=%s\n  c2=%s", b1, b2)
+	}
+}
+
+// TestFit_PanicsOnNilClock documents the explicit-parameter discipline:
+// passing nil panics rather than silently defaulting to time.Now. Tests
+// that need a clock construct clock.Fake; production constructs clock.Wall.
+func TestFit_PanicsOnNilClock(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatalf("Fit(_, _, nil) did not panic")
+		}
+	}()
+	_, _ = Fit([]Pair{{Station: "KNYC", Variable: "tmax", Forecast: 60, Observed: 62, ValidDate: time.Date(2024, 4, 1, 0, 0, 0, 0, time.UTC)}}, 0, nil)
 }

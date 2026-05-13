@@ -59,7 +59,7 @@ func BenchmarkFit(b *testing.B) {
 	_ = math.Erf
 	b.ResetTimer()
 	for range b.N {
-		_, err := Fit(pairs, 0)
+		_, err := Fit(pairs, 0, testClock())
 		if err != nil {
 			b.Fatal(err)
 		}

@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/wh0o0pz/isobar/internal/calibration/mos"
+	"github.com/wh0o0pz/isobar/internal/clock"
 	"github.com/wh0o0pz/isobar/internal/market"
 	"github.com/wh0o0pz/isobar/internal/obs"
 )
@@ -51,7 +52,7 @@ func main() {
 	}
 	logger.Info("loaded pairs", "n", len(pairs))
 
-	coeffs, err := mos.Fit(pairs, *holdoutDays)
+	coeffs, err := mos.Fit(pairs, *holdoutDays, clock.Wall())
 	if err != nil {
 		logger.Error("fit", "err", err)
 		os.Exit(1)
