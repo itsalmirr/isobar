@@ -260,7 +260,7 @@ func TestThrottleDoesNotSerializeCallers(t *testing.T) {
 	// (first goes immediately, then 1s * 3 for the queue). We keep the
 	// assertion loose so it's not flaky: wall time must be substantially
 	// less than the buggy serialization worst case of ~4s.
-	c := &Client{minDelay: 1000 * time.Millisecond}
+	c := &Client{minDelay: 1000 * time.Millisecond, now: time.Now}
 
 	var wg sync.WaitGroup
 	start := time.Now()
@@ -451,7 +451,7 @@ func TestGetBalanceAndRaw(t *testing.T) {
 
 func TestResetRateLimit(t *testing.T) {
 	// ResetRateLimit is a no-network setter; exercise it only for coverage.
-	c := &Client{minDelay: 2 * time.Second}
+	c := &Client{minDelay: 2 * time.Second, now: time.Now}
 	c.ResetRateLimit()
 	// Zeroing minDelay does not cause subsequent throttle calls to panic.
 	c.throttle()
