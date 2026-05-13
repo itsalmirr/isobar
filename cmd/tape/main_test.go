@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/wh0o0pz/isobar/internal/journal"
+	"github.com/wh0o0pz/isobar/internal/kalshi"
 )
 
 // TestWriteBootFrameShape verifies the boot frame that lands in a
@@ -165,6 +166,82 @@ func readEnvelopes(t *testing.T, dir string) []map[string]any {
 	return out
 }
 
-// Compile-time guard: ctx and time imports must remain used by other
-// tests added to this file (rediscovery shutdown bound, Fix 4).
-var _ = context.Background
+// TestRunRediscoveryHonorsCtxCancel asserts the bounded-shutdown
+// contract: when the parent context is cancelled, runRediscovery
+// returns nil within 5 seconds. The 5s bound is the same one the
+// errgroup pattern in run() relies on — without it, a stale
+// rediscovery goroutine could keep firing API calls after the rest
+// of the process has stopped.
+func TestRunRediscoveryHonorsCtxCancel(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	// Real rest + sub objects. We never reach the t.C branch (interval
+	// is hours, ctx is cancelled immediately), so the nil-ish signer
+	// inside these never gets dereferenced.
+	rest := kalshiNewClientForTest()
+	sub := kalshiNewSubscriberForTest(logger)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- runRediscovery(ctx, logger, rest, sub, []string{"KXHIGHNY"}, 1*time.Hour)
+	}()
+
+	cancel()
+	select {
+	case err := <-done:
+		require.NoError(t, err, "runRediscovery must return nil on graceful cancel")
+	case <-time.After(5 * time.Second):
+		t.Fatal("runRediscovery did not return within 5s of ctx cancel")
+	}
+}
+
+// TestRunRediscoveryRecoversPanic exercises the defer/recover path
+// by injecting a panic at the very first statement of the function.
+// runRediscovery's first line is `logger.Info(...)`; passing a nil
+// *slog.Logger guarantees a nil-deref panic before the loop starts.
+// The recover block must catch it and return a non-nil error so the
+// parent errgroup terminates rather than orphans the goroutine.
+//
+// Note: this is the only realistic injection point without mocking
+// the kalshi client. The recover catches any panic regardless of
+// origin, so the test still validates the production-relevant case.
+func TestRunRediscoveryRecoversPanic(t *testing.T) {
+	rest := kalshiNewClientForTest()
+	sub := kalshiNewSubscriberForTest(slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		// nil logger → logger.Info panics on first call.
+		done <- runRediscovery(ctx, nil, rest, sub, []string{"KXHIGHNY"}, 1*time.Hour)
+	}()
+
+	select {
+	case err := <-done:
+		require.Error(t, err, "panic must convert to error")
+		require.Contains(t, err.Error(), "panic")
+	case <-time.After(5 * time.Second):
+		t.Fatal("runRediscovery did not return within 5s of panic")
+	}
+}
+
+// kalshiNewClientForTest builds a kalshi.Client with a nil signer.
+// runRediscovery only dereferences the signer inside DiscoverOpenTickers,
+// which we never reach in the bounded-shutdown test (ctx cancels first).
+func kalshiNewClientForTest() *kalshi.Client {
+	return kalshi.NewClient("http://example.invalid", nil)
+}
+
+// kalshiNewSubscriberForTest mirrors the above: a subscriber whose
+// Run is never called, used only to satisfy runRediscovery's typed
+// parameter list.
+func kalshiNewSubscriberForTest(logger *slog.Logger) *kalshi.Subscriber {
+	return kalshi.NewSubscriber(kalshi.SubscriberOptions{
+		WSURL:    "wss://example.invalid",
+		Channels: []string{"orderbook_delta"},
+		Logger:   logger,
+	})
+}
