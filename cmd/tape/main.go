@@ -54,7 +54,14 @@ func main() {
 	}
 
 	if _, err := env.LoadNearest(""); err != nil {
-		fmt.Fprintln(os.Stderr, "warn: load .env:", err)
+		// Insecure-mode errors are fatal: refusing to boot with a
+		// world/group-readable .env is the whole point of the check.
+		// Other read errors (corrupt file, EISDIR) are also fatal here
+		// since the operator opted in to a .env by placing one in the
+		// walk path. The earlier behaviour of warning-and-continuing
+		// silently masked credential-loading failures.
+		fmt.Fprintln(os.Stderr, "fatal: load .env:", err)
+		os.Exit(1)
 	}
 
 	logger := obs.Init(os.Getenv("ISOBAR_LOG_LEVEL"))
