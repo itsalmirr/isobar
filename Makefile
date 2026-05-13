@@ -40,8 +40,34 @@ run-analyze:
 	$(GO) run ./cmd/analyze
 
 .PHONY: run-edge-scan
+# edge-scan needs --start / --end; printing help is more useful than
+# the default "missing required flag" exit-2 a bare `go run` produces.
+# Pass real arguments when invoking the binary directly.
 run-edge-scan:
-	$(GO) run ./cmd/edge-scan
+	$(GO) run ./cmd/edge-scan --help || true
+
+# backtest: end-to-end realized-PnL backtest wrapper around
+# scripts/run-backtest.sh. Required env vars:
+#   TAPE   path to the recorded tape (must contain kalshi/ + openmeteo/)
+#   START  first civil date to score (YYYY-MM-DD, inclusive)
+#   END    last civil date to score  (YYYY-MM-DD, inclusive)
+# Optional:
+#   EDGE_THRESHOLD  min post-fee edge in cents to enter (default: 5)
+#   SKIP_FETCH      set to 1 to reuse already-downloaded CLI bulletins
+#
+# Example:
+#   make backtest TAPE=./data START=2026-04-29 END=2026-05-06
+.PHONY: backtest
+backtest:
+	@test -n "$(TAPE)"  || { echo "ERROR: TAPE=<dir> required" >&2; exit 2; }
+	@test -n "$(START)" || { echo "ERROR: START=YYYY-MM-DD required" >&2; exit 2; }
+	@test -n "$(END)"   || { echo "ERROR: END=YYYY-MM-DD required" >&2; exit 2; }
+	./scripts/run-backtest.sh \
+	    --tape  "$(TAPE)" \
+	    --start "$(START)" \
+	    --end   "$(END)" \
+	    $(if $(EDGE_THRESHOLD),--edge-threshold $(EDGE_THRESHOLD),) \
+	    $(if $(SKIP_FETCH),--skip-fetch,)
 
 .PHONY: test
 test:
