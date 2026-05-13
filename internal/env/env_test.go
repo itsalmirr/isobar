@@ -153,3 +153,81 @@ func TestLoadNearestSkipsDirectoryNamedDotEnv(t *testing.T) {
 	require.Equal(t, filepath.Join(top, ".env"), found)
 	require.Equal(t, "topfile", os.Getenv("ISOBAR_TEST_SKIPDIR"))
 }
+
+// TestCheckModeAcceptsOwnerOnly is the happy path: 0o600 (owner rw,
+// nothing for group/other) passes. This is the mode writeEnv uses
+// everywhere else in the suite, so the assertion is that the mode
+// check does not regress the rest of the package's behavior.
+func TestCheckModeAcceptsOwnerOnly(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".env")
+	require.NoError(t, os.WriteFile(path, []byte("K=v\n"), 0o600))
+	require.NoError(t, CheckMode(path))
+}
+
+// TestCheckModeRejectsGroupReadable covers the canonical bad case:
+// 0o640 (owner rw, group r, world none). Standard umask on many
+// shared boxes produces this when an operator forgets chmod 600.
+func TestCheckModeRejectsGroupReadable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".env")
+	require.NoError(t, os.WriteFile(path, []byte("K=v\n"), 0o640)) //nolint:gosec // intentional bad mode — this is what CheckMode must reject
+	err := CheckMode(path)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "insecure mode")
+	require.Contains(t, err.Error(), "0o640")
+	require.Contains(t, err.Error(), "chmod 600")
+	require.Contains(t, err.Error(), path)
+}
+
+// TestCheckModeRejectsWorldReadable covers the worst case: 0o644
+// (anyone on the host can cat the .env). Same predicate, different
+// permission octet — both must be rejected.
+func TestCheckModeRejectsWorldReadable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".env")
+	require.NoError(t, os.WriteFile(path, []byte("K=v\n"), 0o644)) //nolint:gosec // intentional bad mode — this is what CheckMode must reject
+	err := CheckMode(path)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "0o644")
+}
+
+// TestCheckModeMissingFileNoOp keeps the existing "missing .env is
+// fine" contract intact. A bot-friendly default — operators may run
+// without a .env at all when ISOBAR_* is supplied by systemd.
+func TestCheckModeMissingFileNoOp(t *testing.T) {
+	require.NoError(t, CheckMode(filepath.Join(t.TempDir(), "no-such-file")))
+}
+
+// TestLoadNearestRefusesGroupReadable is the end-to-end guard: a
+// world-readable .env discovered by the upward walk must cause
+// LoadNearest to return an error rather than silently load
+// credentials from an exposed file.
+func TestLoadNearestRefusesGroupReadable(t *testing.T) {
+	t.Setenv("ISOBAR_TEST_INSECURE_ENV", "")
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".env")
+	require.NoError(t, os.WriteFile(path, []byte("ISOBAR_TEST_INSECURE_ENV=should-not-load\n"), 0o644)) //nolint:gosec // intentional bad mode — this is what LoadNearest must reject
+
+	found, err := LoadNearest(dir)
+	require.Error(t, err)
+	require.Equal(t, path, found, "path is still reported so the operator can find the offender")
+	require.Empty(t, os.Getenv("ISOBAR_TEST_INSECURE_ENV"),
+		"insecure mode must prevent the variables from being loaded")
+}
+
+// TestLoadNearestAcceptsTight verifies the happy path: a 0o600 .env
+// discovered via walk-up loads exactly as before the mode check
+// landed. This is the most important regression bound for existing
+// deployments.
+func TestLoadNearestAcceptsTight(t *testing.T) {
+	t.Setenv("ISOBAR_TEST_TIGHT_ENV", "")
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".env")
+	require.NoError(t, os.WriteFile(path, []byte("ISOBAR_TEST_TIGHT_ENV=loaded\n"), 0o600))
+
+	found, err := LoadNearest(dir)
+	require.NoError(t, err)
+	require.Equal(t, path, found)
+	require.Equal(t, "loaded", os.Getenv("ISOBAR_TEST_TIGHT_ENV"))
+}
