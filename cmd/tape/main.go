@@ -10,6 +10,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -29,6 +31,7 @@ import (
 	"github.com/wh0o0pz/isobar/internal/env"
 	"github.com/wh0o0pz/isobar/internal/journal"
 	"github.com/wh0o0pz/isobar/internal/kalshi"
+	"github.com/wh0o0pz/isobar/internal/market"
 	"github.com/wh0o0pz/isobar/internal/obs"
 	"github.com/wh0o0pz/isobar/internal/openmeteo"
 )
@@ -64,29 +67,99 @@ func main() {
 		os.Exit(1)
 	}
 
+	// SHA-256 the raw config bytes so the boot frame can stamp a stable
+	// fingerprint of the operator's deployed configuration. We re-read
+	// the file rather than threading it through config.Load to keep the
+	// config package's API unchanged. Empty path (test runs) → "".
+	configSHA := computeConfigSHA(*cfgPath, logger)
+
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	if err := run(ctx, logger, cfg); err != nil {
+	if err := run(ctx, logger, cfg, configSHA); err != nil {
 		logger.Error("tape exited with error", "err", err)
 		os.Exit(1)
 	}
 	logger.Info("tape exited cleanly")
 }
 
-func run(ctx context.Context, logger *slog.Logger, cfg config.Config) error {
+// computeConfigSHA returns the lowercase hex SHA-256 of the bytes at
+// path. If path is empty or the read fails, returns "" and logs at
+// warn — the boot frame still ships but with an empty fingerprint, so
+// downstream cutover detection just becomes "different from previous
+// boot frame" (which still works as a segmentation signal).
+func computeConfigSHA(path string, logger *slog.Logger) string {
+	if path == "" {
+		return ""
+	}
+	b, err := os.ReadFile(path) //nolint:gosec // operator-supplied config flag, not user input; already read by config.Load
+	if err != nil {
+		logger.Warn("boot frame: could not re-read config for SHA-256", "path", path, "err", err)
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+func run(ctx context.Context, logger *slog.Logger, cfg config.Config, configSHA string) error {
 	g, ctx := errgroup.WithContext(ctx)
 
 	if cfg.Kalshi.Enabled {
-		g.Go(func() error { return startKalshi(ctx, logger, cfg) })
+		g.Go(func() error { return startKalshi(ctx, logger, cfg, configSHA) })
 	}
 	if cfg.OpenMeteo.Enabled {
-		g.Go(func() error { return startOpenMeteo(ctx, logger, cfg) })
+		g.Go(func() error { return startOpenMeteo(ctx, logger, cfg, configSHA) })
 	}
 	return g.Wait()
 }
 
-func startKalshi(ctx context.Context, logger *slog.Logger, cfg config.Config) error {
+// bootSchemaVersion identifies the on-disk shape of the boot frame's
+// payload. Bump when fields are renamed/removed (additions are
+// backward-compatible). Downstream tools (edge-scan, analyze) match
+// on this string before trusting field names.
+const bootSchemaVersion = "isobar-tape.boot/v1"
+
+// bootPayload is the JSON shape carried in the boot frame's Payload
+// field. Field order/names are part of the public tape format.
+type bootPayload struct {
+	ConfigSHA256  string           `json:"config_sha256"`
+	BuildCommit   string           `json:"build_commit"`
+	BuildVersion  string           `json:"build_version,omitempty"`
+	BuildTime     string           `json:"build_time,omitempty"`
+	Stations      []market.Station `json:"stations"`
+	SchemaVersion string           `json:"schema_version"`
+}
+
+// writeBootFrame emits a single cutover-marker frame at journal open.
+// The frame's src is "isobar-tape" (not the per-source journal name)
+// so downstream readers can identify it across both kalshi/ and
+// openmeteo/ streams with one predicate. Kind is "boot".
+func writeBootFrame(jrn *journal.Journal, configSHA string) {
+	payload := bootPayload{
+		ConfigSHA256:  configSHA,
+		BuildCommit:   commit,
+		BuildVersion:  version,
+		BuildTime:     buildTime,
+		Stations:      market.AllStationsCanonical(),
+		SchemaVersion: bootSchemaVersion,
+	}
+	b, err := json.Marshal(&payload)
+	if err != nil {
+		// json.Marshal on a flat struct of strings + market.Station
+		// (no pointers, no channels) will not fail in practice. Log
+		// at warn rather than swallow silently.
+		slog.Warn("boot frame: marshal failed; skipping", "err", err)
+		return
+	}
+	jrn.Write(journal.Frame{
+		Stamp:   clock.Now(),
+		Source:  "isobar-tape",
+		Kind:    "boot",
+		Payload: b,
+	})
+}
+
+func startKalshi(ctx context.Context, logger *slog.Logger, cfg config.Config, configSHA string) error {
 	pemBytes, source, err := loadKalshiPEM(cfg.Kalshi)
 	if err != nil {
 		return err
@@ -102,6 +175,7 @@ func startKalshi(ctx context.Context, logger *slog.Logger, cfg config.Config) er
 		return err
 	}
 	defer func() { _ = jrn.Close() }()
+	writeBootFrame(jrn, configSHA)
 
 	rest := kalshi.NewClient(cfg.Kalshi.APIBase, signer)
 	tickers, err := rest.DiscoverOpenTickers(ctx, cfg.Kalshi.Series, logger)
@@ -211,12 +285,13 @@ func sample(s []string, n int) []string {
 	return s[:n]
 }
 
-func startOpenMeteo(ctx context.Context, logger *slog.Logger, cfg config.Config) error {
+func startOpenMeteo(ctx context.Context, logger *slog.Logger, cfg config.Config, configSHA string) error {
 	jrn, err := openJournal(cfg, "openmeteo", logger)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = jrn.Close() }()
+	writeBootFrame(jrn, configSHA)
 
 	locs := make([]openmeteo.Location, 0, len(cfg.OpenMeteo.Locations))
 	for _, l := range cfg.OpenMeteo.Locations {
