@@ -55,6 +55,12 @@ func main() {
 		"(optional) named entry-decision filter beyond the edge threshold. "+
 			"Currently 'h4' (Phase 0.5 v4 finding: exclude KXHIGHNY; require "+
 			"low-temp bracket OR extreme-OTM price band). Empty = no filter.")
+	makerFees := flag.Bool("maker-fees", false,
+		"if set, score every trade with the Kalshi MAKER fee schedule "+
+			"(1/4 of taker, per the published rate) instead of the default "+
+			"taker schedule. This is a fee-elimination upper-bound diagnostic; "+
+			"the backtest does not simulate maker fill probability. See "+
+			"docs/BACKTEST.md \"Pitfalls\" for the model limits.")
 	flag.Parse()
 
 	if *startStr == "" || *endStr == "" {
@@ -86,6 +92,10 @@ func main() {
 		os.Exit(1)
 	}
 
+	feeMode := edge.FeeTaker
+	if *makerFees {
+		feeMode = edge.FeeMaker
+	}
 	scanOpts := edge.ScanOptions{
 		DataDir:            *dataDir,
 		StartDate:          start,
@@ -93,6 +103,7 @@ func main() {
 		MaxPollAge:         maxAge,
 		EdgeThresholdCents: *edgeThresh,
 		EntryFilter:        *entryFilter,
+		FeeMode:            feeMode,
 	}
 	if *truthDir != "" {
 		truth, loadErr := edge.LoadTruth(*truthDir)
@@ -166,6 +177,10 @@ func main() {
 	}
 
 	fmt.Printf("# edge-scan %s..%s\n", *startStr, *endStr)
+	fmt.Printf("fee mode:           %s\n", res.FeeMode)
+	if res.EntryFilterName != "" {
+		fmt.Printf("entry filter:       %s\n", res.EntryFilterName)
+	}
 	fmt.Printf("frames seen:        %d\n", res.TotalFrames)
 	fmt.Printf("trade frames:       %d\n", res.TradeFrames)
 	fmt.Printf("weather trades:     %d\n", res.WeatherTrades)
@@ -285,7 +300,14 @@ func writeSummary(path, startStr, endStr string, res *edge.Result) error {
 
 	w := &summaryWriter{w: f}
 	w.printf("# edge-scan summary — %s..%s\n\n", startStr, endStr)
-	w.printf("## Counts\n\n")
+	w.printf("## Run configuration\n\n")
+	w.printf("- fee mode:           **%s** (`KalshiTakerFeeBPS=0.07` / `KalshiMakerFeeBPS=0.0175`)\n", res.FeeMode)
+	if res.EntryFilterName != "" {
+		w.printf("- entry filter:       **%s**\n", res.EntryFilterName)
+	} else {
+		w.printf("- entry filter:       _none_ (no further restriction beyond edge threshold)\n")
+	}
+	w.printf("\n## Counts\n\n")
 	w.printf("- frames seen:        %d\n", res.TotalFrames)
 	w.printf("- trade frames:       %d\n", res.TradeFrames)
 	w.printf("- weather trades:     %d\n", res.WeatherTrades)
