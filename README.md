@@ -2,14 +2,23 @@
 
 Probabilistic-forecaster vs prediction-market research project: calibrated
 weather-bracket pricing on Kalshi, with rigorous OOS verification and a
-documented failure-to-gate. The codebase ships an end-to-end pipeline
-(recorder → calibration → edge-scan) and a series of decision-gate
-reports built around it.
+disciplined evidence-gated path to deployment. The codebase ships an
+end-to-end pipeline (recorder → calibration → Bayesian update →
+selective-entry edge-scan) and a series of decision-gate reports built
+around it.
 
 The name `isobar` refers to lines of constant atmospheric pressure on
 weather maps — the project's edge would come from pricing weather better
-than the market does. The current evidence (see Phase 0.5 v2 below) says
-we don't.
+than the market does. After four iterations of evidence:
+
+- **v1 (retracted)** — naive ensemble fraction loses badly
+- **v2** — MOS calibration is real but loses to market mid (−10 pp Brier)
+- **v3** — MOS + T−3h Bayesian update closes 46% of the gap, still loses
+  ($-4,964 over 6 days at notional)
+- **v4** — Selective-entry filter (`--entry-filter h4`: exclude KXHIGHNY,
+  require low-temp brackets OR extreme-OTM price band) flips the same
+  6-day backtest to **$+794 with daily Sharpe 0.68** (5-day LOO CV).
+  **First positive-EV finding**, not yet validated on truly OOS data.
 
 ## Pipeline
 
@@ -34,34 +43,62 @@ we don't.
                                          outside NWS CLI truth window
 ```
 
-Next-alpha foundation (not yet integrated):
-`internal/calibration/bayesian` ships the T−3h precision-weighted
-posterior update (ADR-0010). `cmd/calibrate-bayesian` defines the
-kernel-fitting CLI; the fit body lands once a held-out evaluation
-harness (ADR-0010 follow-up, not yet an accepted ADR — the original
-0011 slot was reassigned to journal backpressure during the audit)
-clears its gate.
+Bayesian update (ADR-0010) is now **shipped and integrated**.
+`cmd/calibrate-bayesian` fits a per-(station, variable, h_remain)
+residual kernel from 21 months of NWS CLI truth + IEM ASOS hourly
+obs (184 bins, all bins ≥ 5 paired observations). The scanner reads
+the kernel via `--bayesian-kernel` and applies a precision-weighted
+posterior update at trade time, using the running extremum from the
+station's UTC-stamped hourly feed. Held-out evaluation is built into
+the design: the fit window ends 2026-01-31 and the backtest starts
+2026-04-29 (89-day gap → no leakage).
 
-## Results — Phase 0.5 v2
+## Results — Phase 0.5, four iterations
 
-n=79 tradeable [35,65)¢ rows; bootstrap 95% CIs on Brier deltas
-(positive Δ = lower Brier = better):
+### Dollar-quantified, held-out backtest (v3 / v4)
+
+134,689 paired Kalshi trades on a 6-day held-out window
+(2026-04-29 → 2026-05-04), realized PnL after Kalshi taker fees,
+with NWS CLI truth grounding under the *no imaginary bets* rule:
+
+| Strategy | Trades entered | Win rate | Realized PnL | Per-trade |
+|---|---:|---:|---:|---:|
+| Naive | 106,840 | 35.6% | $-9,198.02 | -8.61¢ |
+| + MOS calibration | 105,417 | 34.2% | $-6,113.05 | -5.80¢ |
+| + T−3h Bayesian update | 101,600 | 37.2% | $-4,963.86 | -4.89¢ |
+| **+ H4 selective entry** | **23,832** | **34.7%** | **$+793.74** | **+3.33¢** |
+
+The progression is real and ordered by evidence:
+
+- MOS over naive: **+$3,085** (calibration matters — v2 Brier delta confirms)
+- Bayesian over MOS: **+$1,149** (intraday observation matters — kernel ObsWeight rises 0.09 → 0.72 as h_remain shrinks 23 → 1, exactly as ADR-0010 predicted)
+- H4 over no-filter: **+$5,758** (excluding KXHIGHNY + restricting to low-temp brackets / extreme-OTM bands)
+
+Source: [`reports/phase0.5/2026-05-19-v4-h4-filter.md`](./reports/phase0.5/2026-05-19-v4-h4-filter.md)
+(supersedes [v3](./reports/phase0.5/2026-05-19-v3-bayesian-verdict.md),
+which supersedes [v2](./reports/phase0.5/2026-05-05-floor-estimate-v2.md)).
+
+**H4 is a candidate strategy, not yet proven.** Leave-one-day-out CV on
+5 days gives daily Sharpe 0.68 with 3 of 5 days positive — promising but
+not statistically distinguishable from chance at n=5 (95% CI on Sharpe ≈
+[−1.2, +2.6]). The repo deliberately gates further deployment on
+≥10 forward trading days of truly out-of-sample data.
+
+### v2 verdict (Brier units; preserved for continuity)
+
+n=79 tradeable [35,65)¢ rows; bootstrap 95% CIs on Brier deltas:
 
 | Calibrator | Brier vs naive (Δ) | vs market mid (Δ) | Verdict |
 |---|---:|---:|---|
 | MOS | +0.060 [+0.008, +0.113] | −0.100 [−0.188, −0.013] | calibration is real; loses to market |
 | Climate-shrunk-naive | +0.070 [+0.047, +0.094] | −0.090 [−0.173, −0.009] | ties MOS; same loss to market |
 | MOS vs climate-shrunk | −0.011 [−0.056, +0.035] | — | statistically **tied** |
-| **Canary verdict** | — | — | **[ADR-0009 fired](./docs/decisions/0009-mos-canary-fired-escalate-calibration.md)** |
 
-Source numbers and methodology:
-[`reports/phase0.5/2026-05-05-floor-estimate-v2.md`](./reports/phase0.5/2026-05-05-floor-estimate-v2.md).
-The honest one-paragraph reading: any calibration of the ensemble beats
-the naive estimator significantly, but MOS doesn't earn its complexity
-over a 5-line shrinkage estimator, and both calibrators lose to Kalshi
-market mid in the tradeable zone. The market is genuinely better-informed
-than our static daily forecast, mostly because it absorbs intraday
-observation that our prior doesn't see.
+Source: [`reports/phase0.5/2026-05-05-floor-estimate-v2.md`](./reports/phase0.5/2026-05-05-floor-estimate-v2.md).
+The market is genuinely better-informed than our static daily forecast,
+mostly because it absorbs intraday observation that our prior doesn't
+see. The T−3h Bayesian update (v3) addressed this directly; the H4 filter
+(v4) addressed *which markets* the calibration is best on.
 
 ## What I built and why
 
@@ -101,42 +138,66 @@ Five engineering bets driving the current state of the code:
    first such report; the project is currently a forecasting-research
    artifact with a documented failed-trading-gate, not a deployed bot.
    This pattern is the most important thing in the repo.
-6. **(Next-alpha foundation) T−3h Bayesian update.**
+6. **T−3h Bayesian update — math + fit + integration.**
    `internal/calibration/bayesian` ships the precision-weighted Gaussian
-   update math + a schema-versioned kernel loader; `cmd/calibrate-bayesian`
-   scaffolds the fit CLI. Integration into Scan is gated on a held-out
-   evaluation harness named as an ADR-0010 follow-up — math first,
-   integration once it demonstrably clears the gate. ([ADR-0010](./docs/decisions/0010-t-minus-3h-bayesian-update.md))
+   update math, a schema-versioned kernel loader, and a station-keyed
+   hourly-obs index that computes R(t) and h_remain at scan time.
+   `cmd/calibrate-bayesian` is the fitter end-to-end (Welford online
+   stats, civil-day reconstruction in station-local TZ with proper DST
+   handling, 22 unit tests). `cmd/edge-scan --bayesian-kernel ...
+   --hourly-obs ...` performs the posterior update inside the entry
+   decision and writes `p_fair_bayes`, `bayes_obs_weight`, and
+   `bayes_h_remain` as auditable columns. Held-out evaluation is built
+   into the design (89-day gap between fit-end and backtest-start →
+   zero leakage). ([ADR-0010](./docs/decisions/0010-t-minus-3h-bayesian-update.md),
+   [v3 report](./reports/phase0.5/2026-05-19-v3-bayesian-verdict.md))
 
-## Status — Phase 0.5 first verdict: gate NOT met by current MOS calibration
+7. **H4 selective-entry filter — first positive-EV finding.**
+   `--entry-filter h4` on `edge-scan` restricts entries to the trades
+   where the calibration has measurable edge: not KXHIGHNY, AND either
+   a low-temp bracket OR a deep-OTM price band. Discovered via
+   subset-mining (`scripts/mine_subsets.py`), validated via
+   leave-one-day-out CV (`scripts/loo_cv.py`), each condition has a
+   physical hypothesis (NYC weather variability + GFS bias, easier
+   TMIN prediction physics, favorites-longshot bias in extreme bands).
+   First +EV result on real Kalshi tape with NWS CLI truth.
+   ([v4 report](./reports/phase0.5/2026-05-19-v4-h4-filter.md))
 
-The latest decision-gate report
-([`reports/phase0.5/2026-05-05-floor-estimate-v2.md`](./reports/phase0.5/2026-05-05-floor-estimate-v2.md))
-is the current source of truth on whether the project produces tradeable
-edge.
+## Status — Phase 0.5 v4: positive-EV candidate, forward-validation gated
 
-Headline (n=299 verifiable bracket outcomes, bootstrap 95% CIs in the
-tradeable [35,65)¢ midrange):
+The latest decision-gate report is
+[`reports/phase0.5/2026-05-19-v4-h4-filter.md`](./reports/phase0.5/2026-05-19-v4-h4-filter.md).
+It supersedes v3 (which superseded v2, which superseded the retracted
+v1). The chain of evidence:
 
-- **MOS calibration helps over naive ensemble fractions** (+5.96 pp Brier,
-  CI excludes zero) — calibration is real
-- **MOS does NOT earn its complexity over a 5-line climate-shrunk-naive
-  baseline** (statistically tied) — `0.2·climate + 0.8·naive` does the
-  same job for free
-- **Both calibrators LOSE to Kalshi market mid in the tradeable zone**
-  (-9 to -10 pp Brier, CI excludes zero) — market mid is genuinely better
-  informed than our model, most likely because it incorporates intraday
-  observed-temperature trajectory the daily forecast does not
+| Iter | Strategy | 6-day PnL | Verdict |
+|---|---|---:|---|
+| v1 | Naive | $-9,198 | retracted |
+| v2 | MOS calibration | $-6,113 | gate not met (Brier units) |
+| v3 | MOS + Bayesian | $-4,964 | gate not met (dollars) |
+| **v4** | **MOS + Bayesian + H4 filter** | **$+794** | **+EV candidate** |
 
-The Phase 0.5 gate criterion ("calibrated Brier-skill > market-implied")
-is **not met**. The first iteration of the calibration thesis fails. The
-report enumerates next steps (T−3h Bayesian update, ECMWF IFS blend,
-ensemble NGR via NOAA GEFS backfill — see ADR-0009) before any further
-gate evaluation.
+The v4 strategy `--entry-filter h4` shows positive expected value on
+the only held-out window we have (5 days, daily Sharpe 0.68, 3/5 positive
+days). The verdict is **not** yet "deploy money":
 
-The project is currently positioned as a **forecasting-research artifact
-with a documented failed-trading-gate**, not as a deployed bot. No
-capital has been committed.
+- 5 days of leave-one-day-out CV is a hypothesis test, not a proof.
+- The H4 conditions were partly discovered by inspecting the same
+  window's profitable subsets (data-mining risk).
+- The recorder is running fresh tape since 2026-05-19 to produce
+  truly out-of-sample data. Re-evaluation requires ≥10 forward days
+  of tape + NWS CLI truth (24h truth latency).
+
+**v5 gate criteria** (proposed): ≥10 forward days, n ≥ 25,000 H4
+entries, aggregate PnL > 0, daily Sharpe ≥ 0.5, positive_days ≥ 60%,
+max-single-day drawdown < positive-day PnL. If v5 passes, Phase 1
+paper bot unblocks. If v5 fails, ADR-0014 documents the H4 finding
+as a 6-day artifact and the project reverts to forecasting-research
+framing.
+
+**No capital has been committed.** `KalshiExec` (live order
+placement) does not exist in the repo by design — see
+[`audit/live-allow-trace.md`](./audit/live-allow-trace.md).
 
 ## What's shipped
 
@@ -151,13 +212,19 @@ cmd/analyze                 Phase-0.5 sanity report over recorded journals.
 cmd/calibrate-parse-cli     NWS CLI bulletin zip → daily TMAX/TMIN CSV.
 cmd/calibrate-fit           OLS-fit MOS coefficients per (station,
                             season, variable) bin; outputs JSON.
-cmd/calibrate-bayesian      T−3h Bayesian-kernel fitter (ADR-0010
-                            foundation; flags wired, fit body pending).
+cmd/calibrate-bayesian      T−3h Bayesian-kernel fitter (ADR-0010,
+                            v3-shipped). Fits per-(station,variable,
+                            h_remain) residual moments via Welford
+                            online stats over 21 months of NWS CLI
+                            truth + IEM ASOS hourly. Emits a
+                            schema-versioned Kernel JSON.
 cmd/edge-scan               Joins recorded book state to ensemble polls,
                             applies all probability models (naive, MOS,
-                            climate-shrunk, market-mid), emits per-bracket
-                            edge with full provenance columns. Also runs
-                            the realized-PnL backtest when --truth is set.
+                            climate-shrunk, Bayesian-updated). Supports
+                            --bayesian-kernel + --hourly-obs for the
+                            posterior update path, --entry-filter h4
+                            for the v4 selective-entry strategy, and
+                            --truth for realized-PnL backtest mode.
 
 internal/calibration/cliparse   NWS CLI bulletin parser (90.1% coverage).
 internal/calibration/mos        OLS bias correction + ProbBelow/Above,
@@ -165,7 +232,12 @@ internal/calibration/mos        OLS bias correction + ProbBelow/Above,
 internal/calibration/climate    Historical-frequency lookup with seasonal window
                                 + p_shrunk = w·climate + (1-w)·naive.
 internal/calibration/bayesian   T−3h precision-weighted Gaussian posterior
-                                update (foundation only; not yet wired into Scan).
+                                update + station-keyed HourlyIndex with
+                                R(t) lookup and DST-aware civil-day
+                                reconstruction. Schema-versioned kernel
+                                loader (isobar.bayesian/v1). Integrated
+                                into internal/edge.Scan via ScanOptions.
+                                {BayesianKernel,HourlyObs}.
 internal/edge                   Offline scan engine: ensemble decoder, fee model,
                                 ticker parser, bracket resolution (with
                                 sibling-aware T-direction), truth index, Scan.
@@ -208,13 +280,21 @@ internal/kalshi                 RSA-signed REST + authenticated WS subscriber
   column (`--climate <obs-dir>` on `edge-scan`) to test whether MOS
   earns its complexity. The v2 floor report says it doesn't — see
   ADR-0009.
-- **T−3h Bayesian update — foundation.** `internal/calibration/bayesian`
-  ships the math (`Update`, `LoadKernel`) and schema (`isobar.bayesian/v1`).
-  `cmd/calibrate-bayesian` defines the fit-pipeline CLI; the fit body
-  is deferred to a follow-up commit. Integration into Scan is gated on
-  a held-out evaluation harness named as an ADR-0010 follow-up (the
-  original 0011 slot was reassigned to journal backpressure during the
-  audit). See ADR-0010 for the math and design rationale.
+- **T−3h Bayesian update — shipped end-to-end.** Math layer in
+  `internal/calibration/bayesian` (`Update`, `LoadKernel`,
+  `LoadHourlyIndex`, schema `isobar.bayesian/v1`); fitter body in
+  `cmd/calibrate-bayesian` (Welford online stats, civil-day reconstruction
+  with proper DST, 22 unit tests covering tmax/tmin trajectories,
+  cold-start, DST fall-back); scanner integration via `ScanOptions.
+  BayesianKernel` + `ScanOptions.HourlyObs` with 6 new `bayes_*`
+  CSV columns. Held-out evaluation built into the design: kernel
+  fit window ends 2026-01-31, backtest window starts 2026-04-29
+  (89-day gap, zero leakage). See ADR-0010 + v3 report.
+- **Selective-entry filter (H4) — first positive-EV finding.**
+  `--entry-filter h4` on `edge-scan` (predicate in
+  `internal/edge.entryFilterAdmits`). Excludes KXHIGHNY, requires
+  KXLOWT* or extreme-OTM price band. v4 report has the subset-mining
+  + LOO CV evidence.
 
 **Hot-path principle.** The recorder does not decode WS frames. Bytes
 from the socket are wrapped in a thin envelope (timestamps + source tag)
@@ -223,15 +303,18 @@ and written to disk. All decoding happens offline in `cmd/analyze` and
 
 ## Reports (current → archived)
 
-The Phase 0.5 evaluation has gone through three reports as methodology
-matured. The current one supersedes both predecessors:
+Four iterations of the Phase 0.5 evaluation, each superseding the prior:
 
-- **Current**: [`2026-05-05-floor-estimate-v2.md`](./reports/phase0.5/2026-05-05-floor-estimate-v2.md)
-  — Phase 0.5 v2 with stratified Brier, climate baseline, bootstrap CIs.
-  **Gate: not met.**
-- *Superseded*: [`2026-05-02-pipeline-validation.md`](./reports/phase0.5/2026-05-02-pipeline-validation.md)
-  — interim status doc after the original was retracted
-- *Retracted*: [`2026-05-02-floor-estimate_RETRACTED.md`](./reports/phase0.5/2026-05-02-floor-estimate_RETRACTED.md)
+- **Current — v4**: [`2026-05-19-v4-h4-filter.md`](./reports/phase0.5/2026-05-19-v4-h4-filter.md)
+  — H4 selective-entry filter shows +$794 on the 6-day backtest, daily
+  Sharpe 0.68. **First positive-EV result; forward-validation gated.**
+- *Superseded — v3*: [`2026-05-19-v3-bayesian-verdict.md`](./reports/phase0.5/2026-05-19-v3-bayesian-verdict.md)
+  — MOS + Bayesian closes 46% of the loss gap, still −$4,964 over 6 days
+- *Superseded — v2*: [`2026-05-05-floor-estimate-v2.md`](./reports/phase0.5/2026-05-05-floor-estimate-v2.md)
+  — MOS Brier-skill measurement; gate not met
+- *Superseded — interim*: [`2026-05-02-pipeline-validation.md`](./reports/phase0.5/2026-05-02-pipeline-validation.md)
+  — interim status after v1 retraction
+- *Retracted — v1*: [`2026-05-02-floor-estimate_RETRACTED.md`](./reports/phase0.5/2026-05-02-floor-estimate_RETRACTED.md)
   — original first-pass report with overstated headline; preserved with
   retraction header for audit trail
 
@@ -287,13 +370,23 @@ set -a && source .env && set +a
 ./bin/calibrate-parse-cli --zip data/calibration/cli/KNYC.zip \
                          --start 2024-04-29 --end 2026-05-04
 ./bin/calibrate-fit --out data/calibration/mos-coefficients.json --holdout-days 90
-./bin/edge-scan --data ./data --start 2026-04-29 --end 2026-05-06 \
-                --mos data/calibration/mos-coefficients.json \
-                --climate data/calibration/obs
 
-# 7. Realized-PnL backtest (after CLI bulletins have been parsed
-#    into data/calibration/obs/KSTATION.csv)
-./scripts/run-backtest.sh --tape ./data --start 2026-04-29 --end 2026-05-06
+# 7. Bayesian kernel fit (T−3h residual moments per station/variable/h_remain)
+./bin/calibrate-bayesian \
+    --obs data/calibration/obs \
+    --truth data/calibration/obs \
+    --out data/calibration/bayesian-kernel.json \
+    --fit-start 2024-04-29 --fit-end 2026-01-31
+
+# 8. Full backtest with all four calibration layers + H4 selective entry
+./bin/edge-scan --data ./data --start 2026-04-29 --end 2026-05-04 \
+                --mos data/calibration/mos-coefficients.json \
+                --climate data/calibration/obs \
+                --truth data/calibration/obs \
+                --bayesian-kernel data/calibration/bayesian-kernel.json \
+                --hourly-obs data/calibration/obs \
+                --entry-filter h4
+# → reports/.../summary-*.md ; current best PnL: +$793.74 on 6 days
 ```
 
 Recorded data lands under `./data/<source>/<YYYY-MM-DD>/<source>-<hour>.jsonl[.gz]`.
