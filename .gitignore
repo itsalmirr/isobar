@@ -11,6 +11,11 @@
 *.jsonl
 *.jsonl.gz
 
+# Backtest CSV outputs are large (~20MB each) and fully regenerable
+# from the bin/edge-scan one-liner in the corresponding report. Keep
+# the summary .md alongside them committed (small audit trail).
+reports/backtest-realized*/edges-*.csv
+
 # Secrets — never commit
 .env
 .env.*
