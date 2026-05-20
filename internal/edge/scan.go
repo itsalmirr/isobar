@@ -81,7 +81,20 @@ type ScanOptions struct {
 	//          3/5 positive days). See reports/phase0.5/2026-05-19-v4.
 	//
 	// Unset (or unrecognised string) = no filter beyond the edge threshold.
+	// An unrecognised filter name logs a one-shot warning to slog at
+	// scan start so a typo doesn't silently disable filtering.
 	EntryFilter string
+
+	// FeeMode selects which Kalshi fee schedule the scanner uses when
+	// computing per-trade fees and edges. Default (zero value) is
+	// FeeTaker, which matches the legacy taker-only backtest behaviour.
+	// FeeMaker is the maker-rebate-equivalent schedule (1/4 of taker),
+	// useful as an upper-bound diagnostic on "what if we executed
+	// maker-only?". The backtest does not currently simulate maker fill
+	// probability; FeeMaker treats every taker print in the tape as if
+	// our resting order had been filled at that price. See
+	// docs/BACKTEST.md "Pitfalls" for the model limits.
+	FeeMode FeeMode
 }
 
 // EdgeRow is one trade-event record in the output CSV.
@@ -175,6 +188,15 @@ type Result struct {
 	// the bayes-gauss branch rather than prior-only).
 	BayesEnabled bool
 	BayesApplied int
+
+	// FeeMode records which Kalshi fee schedule produced the FeeCents
+	// + EdgeCents columns on every row. Echoed so downstream reports
+	// don't have to guess.
+	FeeMode FeeMode
+
+	// EntryFilterName echoes opts.EntryFilter so the markdown summary
+	// can report which filter ran. Empty string means no filter.
+	EntryFilterName string
 }
 
 // Scan walks the data tree, pairs each Kalshi trade event with the
@@ -202,12 +224,23 @@ func Scan(opts ScanOptions) (*Result, error) {
 		return nil, fmt.Errorf("load openmeteo: %w", err)
 	}
 
+	// Surface an unknown EntryFilter loudly via stdlib log. We
+	// deliberately don't error out — the entryFilterAdmits fallback is
+	// "admit everything", which keeps the scan running. The warning
+	// makes a typo'd flag impossible to miss in operator logs.
+	if !isKnownEntryFilter(opts.EntryFilter) {
+		log.Printf("edge: WARNING — unknown EntryFilter %q; falling through to no-op admit (no filtering applied). Known names: \"\", \"none\", \"h4\".",
+			opts.EntryFilter)
+	}
+
 	res := &Result{
 		SkippedReason:   map[string]int{},
 		BacktestEnabled: opts.Truth != nil,
 		MOSEnabled:      opts.MOS != nil,
 		ClimateEnabled:  opts.Climate != nil,
 		BayesEnabled:    opts.BayesianKernel != nil && opts.HourlyObs != nil,
+		FeeMode:         opts.FeeMode,
+		EntryFilterName: opts.EntryFilter,
 	}
 
 	kalshiFiles, err := dailyFiles(filepath.Join(opts.DataDir, "kalshi"), opts.StartDate, opts.EndDate)
@@ -468,7 +501,7 @@ func Scan(opts ScanOptions) (*Result, error) {
 			climateP = opts.Climate.RangeProb(station, variable, spec.ValidDate, resolution.Lo, resolution.Hi)
 			if !math.IsNaN(climateP) {
 				pFairClimate = climate.ShrinkP(pFairNaive, climateP, climate.DefaultShrinkage)
-				edgeClimateCents = EdgeAfterFeeCents(pFairClimate, priceDollars)
+				edgeClimateCents = EdgeAfterFeeCentsMode(pFairClimate, priceDollars, opts.FeeMode)
 				climateApplied = true
 			}
 		}
@@ -500,8 +533,8 @@ func Scan(opts ScanOptions) (*Result, error) {
 			NMembers:          nMembers,
 			NMembersInBkt:     nIn,
 			PollAgeS:          int(age.Seconds()),
-			FeeCents:          FeePerContractCents(priceDollars),
-			EdgeCents:         EdgeAfterFeeCents(pFair, priceDollars),
+			FeeCents:          FeePerContractCentsMode(priceDollars, opts.FeeMode),
+			EdgeCents:         EdgeAfterFeeCentsMode(pFair, priceDollars, opts.FeeMode),
 		}
 
 		// Realized-PnL backtest path. If no truth available we skip with a
@@ -525,7 +558,7 @@ func Scan(opts ScanOptions) (*Result, error) {
 			// post-fee edge, if it clears the threshold AND the named
 			// entry filter (if any) admits this trade.
 			noPriceDollars := 1 - priceDollars
-			fee := FeePerContractCents(priceDollars)
+			fee := FeePerContractCentsMode(priceDollars, opts.FeeMode)
 			edgeYesCents := int(pFair*100+0.5) - row.TradePriceCents - fee
 			edgeNoCents := int((1-pFair)*100+0.5) - int(noPriceDollars*100+0.5) - fee
 
@@ -741,8 +774,21 @@ func entryFilterAdmits(filter, series string, tradePriceCents int) bool {
 	default:
 		// Unknown filter name — silently fall back to "no filter" so
 		// future flag additions never accidentally skip every trade.
-		// Operators are expected to typo-check before running 4-hour
-		// scans.
+		// Scan() logs a one-shot warning at boot when this branch will
+		// be taken; operators are still expected to typo-check before
+		// running 4-hour scans.
 		return true
+	}
+}
+
+// isKnownEntryFilter is the predicate Scan() uses to decide whether to
+// warn about an unknown filter name. Kept next to entryFilterAdmits so
+// the two stay in sync if a new filter ships.
+func isKnownEntryFilter(filter string) bool {
+	switch filter {
+	case "", "none", "h4":
+		return true
+	default:
+		return false
 	}
 }
