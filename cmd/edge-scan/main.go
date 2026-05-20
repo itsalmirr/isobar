@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/wh0o0pz/isobar/internal/calibration/bayesian"
 	"github.com/wh0o0pz/isobar/internal/calibration/climate"
 	"github.com/wh0o0pz/isobar/internal/calibration/mos"
 	"github.com/wh0o0pz/isobar/internal/edge"
@@ -43,6 +44,17 @@ func main() {
 			"calibrated estimator instead of naive ensemble-fraction")
 	climateDir := flag.String("climate", "",
 		"(optional) dir with KSTATION.csv observation history; emits climate-shrunk baseline columns")
+	bayesKernelPath := flag.String("bayesian-kernel", "",
+		"(optional) path to a Bayesian kernel JSON produced by cmd/calibrate-bayesian. "+
+			"When set together with -hourly-obs, p_fair switches from the MOS prior to "+
+			"a precision-weighted posterior that folds in the running extremum at trade time (ADR-0010).")
+	hourlyObsDir := flag.String("hourly-obs", "",
+		"(optional) dir with K<STA>-hourly.csv ASOS observations (UTC timestamps); "+
+			"required when -bayesian-kernel is set")
+	entryFilter := flag.String("entry-filter", "",
+		"(optional) named entry-decision filter beyond the edge threshold. "+
+			"Currently 'h4' (Phase 0.5 v4 finding: exclude KXHIGHNY; require "+
+			"low-temp bracket OR extreme-OTM price band). Empty = no filter.")
 	flag.Parse()
 
 	if *startStr == "" || *endStr == "" {
@@ -80,6 +92,7 @@ func main() {
 		EndDate:            end.AddDate(0, 0, 1), // make end inclusive on the CLI
 		MaxPollAge:         maxAge,
 		EdgeThresholdCents: *edgeThresh,
+		EntryFilter:        *entryFilter,
 	}
 	if *truthDir != "" {
 		truth, loadErr := edge.LoadTruth(*truthDir)
@@ -108,6 +121,31 @@ func main() {
 		}
 		fmt.Fprintf(os.Stderr, "loaded climate observations from %s\n", *climateDir)
 		scanOpts.Climate = clim
+	}
+	if *bayesKernelPath != "" {
+		if *hourlyObsDir == "" {
+			fmt.Fprintln(os.Stderr, "edge-scan: -bayesian-kernel requires -hourly-obs")
+			os.Exit(2)
+		}
+		kernel, loadErr := bayesian.LoadKernel(*bayesKernelPath)
+		if loadErr != nil {
+			fmt.Fprintln(os.Stderr, "edge-scan: load bayesian kernel:", loadErr)
+			os.Exit(1)
+		}
+		idx, loadErr := bayesian.LoadHourlyIndex(*hourlyObsDir)
+		if loadErr != nil {
+			fmt.Fprintln(os.Stderr, "edge-scan: load hourly obs:", loadErr)
+			os.Exit(1)
+		}
+		nBins := 0
+		for _, bin := range kernel.Entries {
+			nBins += len(bin)
+		}
+		fmt.Fprintf(os.Stderr, "loaded Bayesian kernel: %d bins (window=%s) from %s\n",
+			nBins, kernel.FitWindow, *bayesKernelPath)
+		fmt.Fprintf(os.Stderr, "loaded hourly obs index from %s\n", *hourlyObsDir)
+		scanOpts.BayesianKernel = kernel
+		scanOpts.HourlyObs = idx
 	}
 
 	res, err := edge.Scan(scanOpts)
@@ -141,6 +179,10 @@ func main() {
 		fmt.Printf("climate-shrunk:     %d  (%.1f%% of paired)\n",
 			res.ClimateApplied, pct(res.ClimateApplied, res.PairedTrades))
 	}
+	if res.BayesEnabled {
+		fmt.Printf("Bayesian-updated:   %d  (%.1f%% of paired; rest fell back to MOS/naive)\n",
+			res.BayesApplied, pct(res.BayesApplied, res.PairedTrades))
+	}
 	if res.BacktestEnabled {
 		fmt.Printf("\n# realized-PnL backtest (entry threshold = %d¢ post-fee)\n", *edgeThresh)
 		fmt.Printf("trades entered:     %d  (%.1f%% of paired)\n",
@@ -165,6 +207,8 @@ func writeCSV(path string, rows []edge.EdgeRow) error {
 		"side", "trade_price_cents",
 		"p_fair_naive", "p_fair_mos", "p_fair", "mos_applied",
 		"climate_p", "p_fair_climate_shrunk", "climate_applied", "edge_climate_shrunk_cents",
+		"p_fair_bayes", "bayes_applied", "bayes_skip_reason",
+		"bayes_running_temp_f", "bayes_h_remain", "bayes_obs_weight",
 		"n_members", "n_members_in_bkt",
 		"poll_age_s", "fee_cents", "edge_cents",
 		"has_truth", "actual_temp_f", "yes_resolved", "our_side", "our_pnl_cents",
@@ -179,6 +223,14 @@ func writeCSV(path string, rows []edge.EdgeRow) error {
 		edgeClimate := ""
 		if r.ClimateApplied {
 			edgeClimate = strconv.Itoa(r.EdgeClimateCents)
+		}
+		bayesRunning := ""
+		bayesObsW := ""
+		bayesHRem := ""
+		if r.BayesApplied {
+			bayesRunning = strconv.FormatFloat(r.BayesRunningTempF, 'f', 2, 64)
+			bayesObsW = strconv.FormatFloat(r.BayesObsWeight, 'f', 4, 64)
+			bayesHRem = strconv.Itoa(r.BayesHRemain)
 		}
 		if err := w.Write([]string{
 			strconv.FormatInt(r.TsMs, 10),
@@ -197,6 +249,12 @@ func writeCSV(path string, rows []edge.EdgeRow) error {
 			formatFloatOrBlank(r.PFairClimate, 4),
 			boolStr(r.ClimateApplied),
 			edgeClimate,
+			strconv.FormatFloat(r.PFairBayes, 'f', 4, 64),
+			boolStr(r.BayesApplied),
+			r.BayesSkipReason,
+			bayesRunning,
+			bayesHRem,
+			bayesObsW,
 			strconv.Itoa(r.NMembers),
 			strconv.Itoa(r.NMembersInBkt),
 			strconv.Itoa(r.PollAgeS),
@@ -240,6 +298,10 @@ func writeSummary(path, startStr, endStr string, res *edge.Result) error {
 	if res.ClimateEnabled {
 		w.printf("- climate-shrunk:     %d  (%.1f%% of paired)\n",
 			res.ClimateApplied, pct(res.ClimateApplied, res.PairedTrades))
+	}
+	if res.BayesEnabled {
+		w.printf("- Bayesian-updated:   %d  (%.1f%% of paired; rest fell back to MOS/naive)\n",
+			res.BayesApplied, pct(res.BayesApplied, res.PairedTrades))
 	}
 
 	// Realized PnL section — only present when truth was loaded.

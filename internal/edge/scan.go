@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/wh0o0pz/isobar/internal/calibration/bayesian"
 	"github.com/wh0o0pz/isobar/internal/calibration/climate"
 	"github.com/wh0o0pz/isobar/internal/calibration/mos"
 	"github.com/wh0o0pz/isobar/internal/replay"
@@ -54,6 +55,33 @@ type ScanOptions struct {
 	// p_climate_shrunk = w*climate + (1-w)*p_naive. This is reported
 	// alongside p_fair, not used as the trading model.
 	Climate *climate.Lookup
+
+	// BayesianKernel, if non-nil together with HourlyObs, switches
+	// p_fair from the MOS prior to a precision-weighted Gaussian
+	// posterior that folds in the running extremum at trade time
+	// (per ADR-0010). The update applies only on trades where MOS
+	// itself applied (we need a Gaussian prior to update). When
+	// either field is nil, the Bayesian path is silently skipped.
+	BayesianKernel *bayesian.Kernel
+
+	// HourlyObs is the station-keyed index of historical hourly ASOS
+	// observations. Built once at scan startup via
+	// bayesian.LoadHourlyIndex(dir). Required for BayesianKernel to
+	// produce an Observation.
+	HourlyObs *bayesian.HourlyIndex
+
+	// EntryFilter, if non-empty, names a built-in entry predicate that
+	// further restricts hypothetical-trade entry beyond the edge-cents
+	// threshold. Currently supported:
+	//
+	//   "h4" — exclude KXHIGHNY; require either (a) bracket series is
+	//          KXLOWT* (low-temp bracket) or (b) trade price ≤ 9¢ or
+	//          ≥ 91¢ (extreme-OTM band). Derived from the v3 backtest
+	//          subset-mining + leave-one-day-out CV (Sharpe 0.68,
+	//          3/5 positive days). See reports/phase0.5/2026-05-19-v4.
+	//
+	// Unset (or unrecognised string) = no filter beyond the edge threshold.
+	EntryFilter string
 }
 
 // EdgeRow is one trade-event record in the output CSV.
@@ -83,6 +111,16 @@ type EdgeRow struct {
 	PFairClimate     float64 // climate-shrunk-naive p_fair; NaN if ClimateP is NaN
 	ClimateApplied   bool
 	EdgeClimateCents int
+
+	// Bayesian posterior update of the MOS prior (ADR-0010). Populated
+	// only when ScanOptions.BayesianKernel + HourlyObs are set AND
+	// the MOS prior itself was valid for this trade.
+	PFairBayes        float64 // 0 when not applied
+	BayesApplied      bool
+	BayesSkipReason   string // "no_kernel" | "no_obs_for_station" | "cold_start" | "h_remain_zero" | "prior_only" | ""
+	BayesRunningTempF float64 // R(t) at trade time; 0 when not applied
+	BayesHRemain      int     // integer hours_remaining at trade time; 0 when not applied
+	BayesObsWeight    float64 // posterior's ObsWeight (1 = observation dominated, 0 = prior dominated)
 
 	NMembers      int
 	NMembersInBkt int
@@ -130,6 +168,13 @@ type Result struct {
 	// counts rows where a historical climate probability was available.
 	ClimateEnabled bool
 	ClimateApplied int
+
+	// BayesEnabled is true iff opts.BayesianKernel + HourlyObs were set.
+	// BayesApplied counts rows where the posterior update actually fired
+	// (MOS was applied, hourly obs were available, and Update produced
+	// the bayes-gauss branch rather than prior-only).
+	BayesEnabled bool
+	BayesApplied int
 }
 
 // Scan walks the data tree, pairs each Kalshi trade event with the
@@ -162,6 +207,7 @@ func Scan(opts ScanOptions) (*Result, error) {
 		BacktestEnabled: opts.Truth != nil,
 		MOSEnabled:      opts.MOS != nil,
 		ClimateEnabled:  opts.Climate != nil,
+		BayesEnabled:    opts.BayesianKernel != nil && opts.HourlyObs != nil,
 	}
 
 	kalshiFiles, err := dailyFiles(filepath.Join(opts.DataDir, "kalshi"), opts.StartDate, opts.EndDate)
@@ -301,6 +347,10 @@ func Scan(opts ScanOptions) (*Result, error) {
 			pFairMOS      float64
 			mosApplied    bool
 			mosSkipReason string
+			// MOS prior (μ, σ); preserved across the switch so the
+			// Bayesian path below can fold in the running extremum
+			// without re-running Predict.
+			mosMu, mosSigma float64
 		)
 		switch {
 		case opts.MOS == nil:
@@ -337,8 +387,67 @@ func Scan(opts ScanOptions) (*Result, error) {
 					}
 					pFair = pFairMOS
 					mosApplied = true
+					mosMu, mosSigma = mu, sigma
 				} else {
 					mosSkipReason = "no_bin"
+				}
+			}
+		}
+
+		// Bayesian posterior update (ADR-0010): fold the running
+		// extremum at trade time into the MOS prior. Only applies
+		// when MOS itself was applied; otherwise we have no Gaussian
+		// prior to update.
+		var (
+			pFairBayes        float64
+			bayesApplied      bool
+			bayesSkipReason   string
+			bayesRunningTempF float64
+			bayesHRemain      int
+			bayesObsWeight    float64
+		)
+		if opts.BayesianKernel != nil && opts.HourlyObs != nil {
+			switch {
+			case !mosApplied:
+				bayesSkipReason = "no_prior"
+			default:
+				tradeTimeUTC := time.UnixMilli(msg.TsMs).UTC()
+				r, hRemain, ok := opts.HourlyObs.RunningExtremum(station, variable, tradeTimeUTC)
+				switch {
+				case !ok:
+					bayesSkipReason = "cold_start"
+				case hRemain == 0:
+					// At settlement boundary the kernel's update path
+					// returns obs-only; for the backtest we treat it as
+					// "settled, no useful posterior update beyond R(t)".
+					bayesSkipReason = "h_remain_zero"
+				default:
+					prior := bayesian.Prior{Mu: mosMu, Sigma: mosSigma}
+					obsRec := bayesian.Observation{
+						Station:         station,
+						Variable:        variable,
+						RunningExtremum: r,
+						HoursRemaining:  hRemain,
+					}
+					post := bayesian.Update(prior, obsRec, opts.BayesianKernel)
+					if post.Method != "bayes-gauss" {
+						bayesSkipReason = post.Method // "prior-only" if bin missing
+					} else {
+						pBayes := mos.ProbBelow(resolution.Hi, post.Mu, post.Sigma) -
+							mos.ProbBelow(resolution.Lo, post.Mu, post.Sigma)
+						if pBayes < 0 {
+							pBayes = 0
+						}
+						if pBayes > 1 {
+							pBayes = 1
+						}
+						pFairBayes = pBayes
+						pFair = pBayes
+						bayesApplied = true
+						bayesRunningTempF = r
+						bayesHRemain = hRemain
+						bayesObsWeight = post.ObsWeight
+					}
 				}
 			}
 		}
@@ -365,28 +474,34 @@ func Scan(opts ScanOptions) (*Result, error) {
 		}
 
 		row := EdgeRow{
-			TsMs:             msg.TsMs,
-			Ticker:           spec.Ticker,
-			Series:           spec.Series,
-			ValidDate:        spec.ValidDate,
-			BracketKind:      spec.Kind.String(),
-			BracketKey:       spec.Key,
-			Side:             msg.side(),
-			TradePriceCents:  int(priceDollars*100 + 0.5),
-			PFairNaive:       pFairNaive,
-			PFairMOS:         pFairMOS,
-			PFair:            pFair,
-			MOSApplied:       mosApplied,
-			SkippedReason:    mosSkipReason,
-			ClimateP:         climateP,
-			PFairClimate:     pFairClimate,
-			ClimateApplied:   climateApplied,
-			EdgeClimateCents: edgeClimateCents,
-			NMembers:         nMembers,
-			NMembersInBkt:    nIn,
-			PollAgeS:         int(age.Seconds()),
-			FeeCents:         FeePerContractCents(priceDollars),
-			EdgeCents:        EdgeAfterFeeCents(pFair, priceDollars),
+			TsMs:              msg.TsMs,
+			Ticker:            spec.Ticker,
+			Series:            spec.Series,
+			ValidDate:         spec.ValidDate,
+			BracketKind:       spec.Kind.String(),
+			BracketKey:        spec.Key,
+			Side:              msg.side(),
+			TradePriceCents:   int(priceDollars*100 + 0.5),
+			PFairNaive:        pFairNaive,
+			PFairMOS:          pFairMOS,
+			PFair:             pFair,
+			MOSApplied:        mosApplied,
+			SkippedReason:     mosSkipReason,
+			ClimateP:          climateP,
+			PFairClimate:      pFairClimate,
+			ClimateApplied:    climateApplied,
+			EdgeClimateCents:  edgeClimateCents,
+			PFairBayes:        pFairBayes,
+			BayesApplied:      bayesApplied,
+			BayesSkipReason:   bayesSkipReason,
+			BayesRunningTempF: bayesRunningTempF,
+			BayesHRemain:      bayesHRemain,
+			BayesObsWeight:    bayesObsWeight,
+			NMembers:          nMembers,
+			NMembersInBkt:     nIn,
+			PollAgeS:          int(age.Seconds()),
+			FeeCents:          FeePerContractCents(priceDollars),
+			EdgeCents:         EdgeAfterFeeCents(pFair, priceDollars),
 		}
 
 		// Realized-PnL backtest path. If no truth available we skip with a
@@ -407,21 +522,24 @@ func Scan(opts ScanOptions) (*Result, error) {
 			row.YesResolved = resolution.Contains(float64(actual))
 
 			// Decide hypothetical action: take the side with the larger
-			// post-fee edge, if it clears the threshold.
+			// post-fee edge, if it clears the threshold AND the named
+			// entry filter (if any) admits this trade.
 			noPriceDollars := 1 - priceDollars
 			fee := FeePerContractCents(priceDollars)
 			edgeYesCents := int(pFair*100+0.5) - row.TradePriceCents - fee
 			edgeNoCents := int((1-pFair)*100+0.5) - int(noPriceDollars*100+0.5) - fee
 
+			filterAdmits := entryFilterAdmits(opts.EntryFilter, spec.Series, row.TradePriceCents)
+
 			switch {
-			case edgeYesCents >= opts.EdgeThresholdCents && edgeYesCents >= edgeNoCents:
+			case filterAdmits && edgeYesCents >= opts.EdgeThresholdCents && edgeYesCents >= edgeNoCents:
 				row.OurSide = "yes"
 				if row.YesResolved {
 					row.OurPnLCents = 100 - row.TradePriceCents - fee
 				} else {
 					row.OurPnLCents = -row.TradePriceCents - fee
 				}
-			case edgeNoCents >= opts.EdgeThresholdCents:
+			case filterAdmits && edgeNoCents >= opts.EdgeThresholdCents:
 				row.OurSide = "no"
 				noPriceCents := 100 - row.TradePriceCents
 				if !row.YesResolved {
@@ -430,7 +548,7 @@ func Scan(opts ScanOptions) (*Result, error) {
 					row.OurPnLCents = -noPriceCents - fee
 				}
 			default:
-				// no edge — skip the trade (PnL = 0, OurSide = "")
+				// no edge OR filter excluded — skip the trade (PnL = 0, OurSide = "")
 			}
 
 			if row.OurSide != "" {
@@ -449,6 +567,9 @@ func Scan(opts ScanOptions) (*Result, error) {
 		}
 		if row.ClimateApplied {
 			res.ClimateApplied++
+		}
+		if row.BayesApplied {
+			res.BayesApplied++
 		}
 		return nil
 	})
@@ -591,4 +712,37 @@ func stationLocation(station string) (*time.Location, error) {
 		return time.LoadLocation("America/Los_Angeles")
 	}
 	return nil, fmt.Errorf("unknown station %q", station)
+}
+
+// entryFilterAdmits returns true iff the named filter admits an entry
+// on (series, tradePriceCents). The empty filter ("") and unknown
+// filter names admit everything (no-op), matching the v0-1 behaviour
+// of "enter on any clearing edge".
+//
+// Filter "h4" (Phase 0.5 v4): exclude KXHIGHNY entirely; require
+// either a low-temp series (KXLOWT*) OR an extreme-OTM price band
+// (≤ 9¢ or ≥ 91¢). See reports/phase0.5/2026-05-19-v4 for the
+// subset-mining + LOO-CV evidence behind these conditions.
+func entryFilterAdmits(filter, series string, tradePriceCents int) bool {
+	switch filter {
+	case "", "none":
+		return true
+	case "h4":
+		if series == "KXHIGHNY" {
+			return false
+		}
+		if strings.HasPrefix(series, "KXLOWT") {
+			return true
+		}
+		if tradePriceCents <= 9 || tradePriceCents >= 91 {
+			return true
+		}
+		return false
+	default:
+		// Unknown filter name — silently fall back to "no filter" so
+		// future flag additions never accidentally skip every trade.
+		// Operators are expected to typo-check before running 4-hour
+		// scans.
+		return true
+	}
 }
