@@ -99,7 +99,7 @@ type ScanOptions struct {
 
 // EdgeRow is one trade-event record in the output CSV.
 type EdgeRow struct {
-	TsMs            int64
+	TSMs            int64
 	Ticker          string
 	Series          string
 	ValidDate       time.Time
@@ -301,7 +301,7 @@ func Scan(opts ScanOptions) (*Result, error) {
 
 		// Find most-recent poll for this station.
 		station := spec.Station()
-		tradeTime := time.Unix(0, msg.TsMs*int64(time.Millisecond)).UTC()
+		tradeTime := time.Unix(0, msg.TSMs*int64(time.Millisecond)).UTC()
 		poll, pollTime, ok := idx.latest(station, tradeTime)
 		if !ok {
 			res.SkippedReason["no_poll_for_station"]++
@@ -336,8 +336,8 @@ func Scan(opts ScanOptions) (*Result, error) {
 		// scan over Kalshi files (above) groups every observed Spec by
 		// (series, valid_date) so ResolveWithSiblings can flip a T-bracket
 		// to low-side when its key sits below the lowest sibling B-bracket
-		// midpoint. Bracket convention itself is still tagged FIXME in
-		// resolution.go.
+		// midpoint. The bracket convention was previously marked FIXME
+		// and is now closed (see resolution.go and its tests).
 		sibKey := siblingKey(spec.Series, spec.ValidDate)
 		resolution := ResolveWithSiblings(spec, siblings[sibKey])
 
@@ -444,7 +444,7 @@ func Scan(opts ScanOptions) (*Result, error) {
 			case !mosApplied:
 				bayesSkipReason = "no_prior"
 			default:
-				tradeTimeUTC := time.UnixMilli(msg.TsMs).UTC()
+				tradeTimeUTC := time.UnixMilli(msg.TSMs).UTC()
 				r, hRemain, ok := opts.HourlyObs.RunningExtremum(station, variable, tradeTimeUTC)
 				switch {
 				case !ok:
@@ -507,7 +507,7 @@ func Scan(opts ScanOptions) (*Result, error) {
 		}
 
 		row := EdgeRow{
-			TsMs:              msg.TsMs,
+			TSMs:              msg.TSMs,
 			Ticker:            spec.Ticker,
 			Series:            spec.Series,
 			ValidDate:         spec.ValidDate,
@@ -610,7 +610,7 @@ func Scan(opts ScanOptions) (*Result, error) {
 		return nil, err
 	}
 	// Stable sort by ts for deterministic CSV output.
-	sort.Slice(res.Rows, func(i, j int) bool { return res.Rows[i].TsMs < res.Rows[j].TsMs })
+	sort.Slice(res.Rows, func(i, j int) bool { return res.Rows[i].TSMs < res.Rows[j].TSMs })
 	return res, nil
 }
 

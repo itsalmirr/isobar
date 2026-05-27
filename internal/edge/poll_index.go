@@ -158,7 +158,7 @@ type tradeMsg struct {
 	Side            string          `json:"side"`
 	TakerSide       string          `json:"taker_side,omitempty"`
 	Count           int             `json:"count"`
-	TsMs            int64           `json:"ts_ms"`
+	TSMs            int64           `json:"ts_ms"`
 }
 
 // side returns the trade's taker side, preferring `taker_side` (recorded

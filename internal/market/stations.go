@@ -1,3 +1,10 @@
+// Package market is the canonical registry of weather observing
+// sites the recorder, calibrator, and scanner all agree on. It owns
+// the mapping from short location tags ("NY"/"MIA"/"LAX"/"CHI") to
+// the four-letter NWS station code, lat/lon, UTC offset, Kalshi
+// series prefixes, and NWS CLI bulletin PIL. Adding a new station
+// is a one-place edit; see the Station type comment for the
+// invariants every entry must satisfy.
 package market
 
 // Station is the canonical record for one weather observing site we
