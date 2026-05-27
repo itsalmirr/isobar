@@ -30,10 +30,10 @@ func TestLoadHourlyCSV_RoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, hr, 3)
 	for i := 1; i < len(hr); i++ {
-		assert.True(t, hr[i-1].Ts.Before(hr[i].Ts), "sorted ascending")
+		assert.True(t, hr[i-1].TS.Before(hr[i].TS), "sorted ascending")
 	}
 	assert.Equal(t, 54.0, hr[0].TmpF)
-	assert.Equal(t, time.UTC, hr[0].Ts.Location())
+	assert.Equal(t, time.UTC, hr[0].TS.Location())
 }
 
 // TestLoadHourlyIndex_MissingFile asserts the dir-scan tolerates a

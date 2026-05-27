@@ -103,12 +103,12 @@ func TestLoadHourly(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, hr, 3)
 	for i := 1; i < len(hr); i++ {
-		assert.True(t, hr[i-1].Ts.Before(hr[i].Ts), "rows must be sorted ascending")
+		assert.True(t, hr[i-1].TS.Before(hr[i].TS), "rows must be sorted ascending")
 	}
 	assert.Equal(t, 54.0, hr[0].TmpF)
 	assert.Equal(t, 52.0, hr[1].TmpF)
 	assert.Equal(t, 52.0, hr[2].TmpF)
-	assert.Equal(t, time.UTC, hr[0].Ts.Location())
+	assert.Equal(t, time.UTC, hr[0].TS.Location())
 }
 
 // TestKernelAccumulator_Finalize verifies the MinKernelN drop and the
@@ -182,7 +182,7 @@ func TestFitStationVariable_TmaxTrajectory(t *testing.T) {
 	var hourly []hourlyObs
 	for i, v := range temps {
 		hourly = append(hourly, hourlyObs{
-			Ts:   dayOpenUTC.Add(time.Duration(i) * time.Hour),
+			TS:   dayOpenUTC.Add(time.Duration(i) * time.Hour),
 			TmpF: v,
 		})
 	}
@@ -232,7 +232,7 @@ func TestFitStationVariable_TminTrajectory(t *testing.T) {
 	var hourly []hourlyObs
 	for i, v := range temps {
 		hourly = append(hourly, hourlyObs{
-			Ts:   dayOpenUTC.Add(time.Duration(i) * time.Hour),
+			TS:   dayOpenUTC.Add(time.Duration(i) * time.Hour),
 			TmpF: v,
 		})
 	}
@@ -265,7 +265,7 @@ func TestFitStationVariable_NoTruth_Skips(t *testing.T) {
 	require.NoError(t, err)
 
 	hourly := []hourlyObs{{
-		Ts:   time.Date(2024, 5, 1, 12, 0, 0, 0, time.UTC),
+		TS:   time.Date(2024, 5, 1, 12, 0, 0, 0, time.UTC),
 		TmpF: 65,
 	}}
 	accum := newKernelAccumulator()
@@ -295,7 +295,7 @@ func TestFitStationVariable_DST_FallBack(t *testing.T) {
 	var hourly []hourlyObs
 	for i := 0; i < 25; i++ {
 		hourly = append(hourly, hourlyObs{
-			Ts:   dayOpenUTC.Add(time.Duration(i) * time.Hour),
+			TS:   dayOpenUTC.Add(time.Duration(i) * time.Hour),
 			TmpF: 50 + float64(i), // monotonically rising for predictability
 		})
 	}
@@ -344,7 +344,7 @@ func TestFitStationVariable_ColdStart_SkipsEmptyHours(t *testing.T) {
 	// Only one obs at 14:00 local (18:00Z). Bins h_remain=24..11 should be empty;
 	// h_remain=10..1 should record running max = 70.
 	hourly := []hourlyObs{{
-		Ts:   time.Date(2024, 5, 1, 18, 0, 0, 0, time.UTC),
+		TS:   time.Date(2024, 5, 1, 18, 0, 0, 0, time.UTC),
 		TmpF: 70,
 	}}
 	truth := map[string]truthRow{"2024-05-01": {Tmax: 75, Tmin: 50}}

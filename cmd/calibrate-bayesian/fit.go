@@ -168,7 +168,7 @@ func fitStationVariable(
 
 		// Subset hourly to this civil day (binary-search the entry).
 		startIdx := sort.Search(len(hourly), func(i int) bool {
-			return !hourly[i].Ts.Before(dayOpenUTC)
+			return !hourly[i].TS.Before(dayOpenUTC)
 		})
 		obsIdx := startIdx
 
@@ -183,7 +183,7 @@ func fitStationVariable(
 			tBoundary := dayCloseUTC.Add(-time.Duration(hRemain) * time.Hour)
 
 			// Pull in any obs whose timestamp is ≤ tBoundary.
-			for obsIdx < len(hourly) && !hourly[obsIdx].Ts.After(tBoundary) && hourly[obsIdx].Ts.Before(dayCloseUTC) {
+			for obsIdx < len(hourly) && !hourly[obsIdx].TS.After(tBoundary) && hourly[obsIdx].TS.Before(dayCloseUTC) {
 				v := hourly[obsIdx].TmpF
 				if !math.IsNaN(v) {
 					if variable == "tmax" {

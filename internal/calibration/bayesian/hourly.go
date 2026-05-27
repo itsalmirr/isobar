@@ -12,11 +12,11 @@ import (
 	"time"
 )
 
-// HourlyObs is one IEM ASOS surface-temperature observation. Ts is in
+// HourlyObs is one IEM ASOS surface-temperature observation. TS is in
 // UTC (the fetcher in scripts/calibration-fetch-obs.sh passes
 // tz=Etc/UTC); TmpF is the air temperature in °F.
 type HourlyObs struct {
-	Ts   time.Time
+	TS   time.Time
 	TmpF float64
 }
 
@@ -62,9 +62,9 @@ func LoadHourlyCSV(path string) ([]HourlyObs, error) {
 		if err != nil {
 			continue
 		}
-		out = append(out, HourlyObs{Ts: ts.UTC(), TmpF: tmpf})
+		out = append(out, HourlyObs{TS: ts.UTC(), TmpF: tmpf})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Ts.Before(out[j].Ts) })
+	sort.Slice(out, func(i, j int) bool { return out[i].TS.Before(out[j].TS) })
 	return out, nil
 }
 
@@ -120,7 +120,7 @@ func LoadHourlyIndex(dir string) (*HourlyIndex, error) {
 // The civil day window is [day_open(station_local), day_close), where
 // day_open is asOf converted to station-local TZ, truncated to
 // midnight. R(t) is the max (for tmax) or min (for tmin) over all
-// HourlyObs.Ts ∈ [day_open_utc, asOf]. h_remain is clamped to [0,
+// HourlyObs.TS ∈ [day_open_utc, asOf]. h_remain is clamped to [0,
 // 24] — the maximum bin we fit during kernel construction.
 func (h *HourlyIndex) RunningExtremum(station, variable string, asOf time.Time) (float64, int, bool) {
 	if h == nil {
@@ -149,7 +149,7 @@ func (h *HourlyIndex) RunningExtremum(station, variable string, asOf time.Time) 
 
 	// Binary-search to find the first obs ≥ dayOpenUTC.
 	startIdx := sort.Search(len(st.Obs), func(i int) bool {
-		return !st.Obs[i].Ts.Before(dayOpenUTC)
+		return !st.Obs[i].TS.Before(dayOpenUTC)
 	})
 
 	var running float64
@@ -161,7 +161,7 @@ func (h *HourlyIndex) RunningExtremum(station, variable string, asOf time.Time) 
 	seen := false
 	for i := startIdx; i < len(st.Obs); i++ {
 		o := st.Obs[i]
-		if o.Ts.After(asOf) {
+		if o.TS.After(asOf) {
 			break
 		}
 		if variable == "tmax" {
