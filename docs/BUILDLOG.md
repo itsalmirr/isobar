@@ -8,6 +8,38 @@ parallel session marks IN FLIGHT.
 
 ---
 
+## 2026-06-09 ~20:55 ET — manual run #2 (interactive session)
+
+**Done:**
+- `23edc77` feat(universe): catalog discovery + structural classification +
+  fail-closed eligibility gate. Public `/events`+`/series` (fee params from the
+  exchange), MECNET-authoritative mutex detection, conservative exhaustive-tiling
+  check, ladders/complements, Unknown groups kept for no-silent-truncation
+  reporting. 14 tests green on real-payload fixtures. No internal/kalshi import —
+  builds independently of the WS repair.
+- **Queue reorder:** took (c) discovery layer before (b)(ii) hand-audit — universe
+  gates the G-A calendar (the long pole); the hand-audit only gates *trust* in
+  G-B numbers later. (b)(ii) is now the top queue item.
+
+**Recorder status:** parallel session now editing cmd/tape/main.go, ws.go(+tests),
+retry.go(+tests), OPERATIONS.md, CLIENT.md — fix + postmortem in progress; tape
+at 14.8MB today and climbing. Still theirs; do not touch.
+
+**Next (in order):**
+1. (b)(ii) hand-audit script: independently re-derive ~20 random realized-PnL
+   rows vs edge-scan CSV (see kick-off entry below for spec).
+2. (d) detectors in `internal/structscan` — CAN START NOW on existing weather
+   tape: KXHIGH/KXLOWT events are MECNET mutex sets, so bracket-sum and
+   complement detectors have real input via internal/replay. Detector order and
+   Opportunity record schema: kick-off entry below.
+3. Wire universe → cmd (discovery CLI subcommand or tape integration) + widen
+   config — **BLOCKED until the recorder session's commits land** (cmd/tape and
+   internal/kalshi are theirs right now).
+4. Operator action queued: confirm NY eligibility for candidate expansion series,
+   then add them to the gate allowlist (gate fails closed until then).
+
+---
+
 ## 2026-06-09 ~20:35 ET — manual kick-off (interactive session)
 
 **Done:**
