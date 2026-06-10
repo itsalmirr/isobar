@@ -248,7 +248,7 @@ func writeCSV(path string, rows []edge.EdgeRow) error {
 			bayesHRem = strconv.Itoa(r.BayesHRemain)
 		}
 		if err := w.Write([]string{
-			strconv.FormatInt(r.TsMs, 10),
+			strconv.FormatInt(r.TSMs, 10),
 			r.Ticker,
 			r.Series,
 			r.ValidDate.Format("2006-01-02"),
