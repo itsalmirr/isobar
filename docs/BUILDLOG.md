@@ -27,6 +27,16 @@ parallel session marks IN FLIGHT.
   ~7 weeks / 123 commits, Unreleased reset); stale local branches pruned
   (`claude/loving-tesla-c0615a`, `audit/2026-05-13` — both fully merged).
 - govulncheck: **no vulnerabilities**. `go mod verify`: ok.
+- **CI discovery (post-push):** GitHub Actions has **never run** on this
+  repo — every run since the 2026-04-18 scaffold push ends in
+  `startup_failure` with zero jobs planned. Actions is enabled, the YAML
+  parses, all action versions valid → the failure is org-level (billing /
+  spending limit on the private nolmelabs repo; hosted runners refuse to
+  start). The ci.yml fixes above are correct but moot until that's fixed.
+  **OPERATOR ACTION:** nolmelabs org → Settings → Billing & plans →
+  verify payment method / Actions spending limit, then re-run any
+  workflow. Until then `make all` + the pre-commit hook are the only
+  enforcement; treat green CI as non-existent, not passing.
 
 **Recorder status:** fix is committed on main; **prod redeploy still
 pending** — operator action per OPERATIONS §15 open items (journalctl
