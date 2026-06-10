@@ -424,10 +424,9 @@ func TestRunFit_Integration(t *testing.T) {
 	}
 
 	// Marshal-back round-trip via stdlib for shape sanity.
-	raw, err := os.ReadFile(out)
+	raw, err := os.ReadFile(out) //nolint:gosec // test reads its own temp output
 	require.NoError(t, err)
 	var back bayesian.Kernel
 	require.NoError(t, json.Unmarshal(raw, &back))
 	assert.Equal(t, bayesian.KernelSchemaVersion, back.SchemaVersion)
 }
-
