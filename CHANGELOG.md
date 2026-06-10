@@ -164,7 +164,7 @@ file" rule is back in force from here.*
 - `docs/BUILDLOG.md` — coordination journal between autonomous build
   runs and interactive sessions; the freshest state in the repo.
 - `docs/OPERATIONS.md` §15 — WS frame-starvation postmortem + triage
-  runbook; §2.1 smoke-test guide moved with it.
+  runbook.
 - `docs/TESTING.md` coverage table: added `internal/replay` (floor
   90%, at 92.4%); `journal` 85.9% vs 90% floor tracked.
 - `README.md`, `docs/ARCHITECTURE.md`, `docs/GLOSSARY.md`: `cmd/peek` +
