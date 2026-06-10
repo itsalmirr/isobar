@@ -130,7 +130,7 @@ type EdgeRow struct {
 	// the MOS prior itself was valid for this trade.
 	PFairBayes        float64 // 0 when not applied
 	BayesApplied      bool
-	BayesSkipReason   string // "no_kernel" | "no_obs_for_station" | "cold_start" | "h_remain_zero" | "prior_only" | ""
+	BayesSkipReason   string  // "no_kernel" | "no_obs_for_station" | "cold_start" | "h_remain_zero" | "prior_only" | ""
 	BayesRunningTempF float64 // R(t) at trade time; 0 when not applied
 	BayesHRemain      int     // integer hours_remaining at trade time; 0 when not applied
 	BayesObsWeight    float64 // posterior's ObsWeight (1 = observation dominated, 0 = prior dominated)

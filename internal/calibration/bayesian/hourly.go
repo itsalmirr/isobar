@@ -2,6 +2,7 @@ package bayesian
 
 import (
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -37,7 +38,7 @@ func LoadHourlyCSV(path string) ([]HourlyObs, error) {
 	first := true
 	for {
 		rec, err := r.Read()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {

@@ -195,7 +195,7 @@ func TestEntryFilterAdmits_None_AndEmpty(t *testing.T) {
 // TestEntryFilterAdmits_H4 locks in the v4 filter contract per
 // reports/phase0.5/2026-05-19-v4-h4-filter.md §"The H4 filter":
 //
-//   admit IFF series ≠ KXHIGHNY AND (KXLOWT* OR price ≤ 9 OR price ≥ 91)
+//	admit IFF series ≠ KXHIGHNY AND (KXLOWT* OR price ≤ 9 OR price ≥ 91)
 func TestEntryFilterAdmits_H4(t *testing.T) {
 	tests := []struct {
 		name   string
