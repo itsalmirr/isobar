@@ -219,6 +219,14 @@ func startKalshi(ctx context.Context, logger *slog.Logger, cfg config.Config, co
 		},
 		Logger:  logger,
 		OnFrame: makeWSFrameHandler(jrn, "kalshi"),
+		// Self-heal on every reconnect: re-resolve the open-market set so
+		// a watchdog-forced reconnect can never resubscribe a fully
+		// settled list (2026-05 outage — docs/OPERATIONS.md postmortem).
+		// The 4h rediscovery loop below still handles adding next-day
+		// markets to connections that stay healthy for hours.
+		RefreshTickers: func(ctx context.Context) ([]string, error) {
+			return rest.DiscoverOpenTickers(ctx, cfg.Kalshi.Series, logger)
+		},
 	})
 
 	if cfg.Kalshi.RediscoverInterval > 0 {

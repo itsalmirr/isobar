@@ -118,13 +118,47 @@ The `Subscriber.runOnce` goroutine pool (errgroup) has three workers:
 | `MaxIdleBetweenFrames`        | 60s     | Kalshi weather brackets see at least one orderbook frame per minute during market hours; 60s is the floor below which we treat the feed as dead, not just quiet. |
 
 On each tick (`PingInterval`):
-  - If `time.Since(lastFrameTime) > MaxIdleBetweenFrames`: log warn with `last_frame_age_ms`, return error → reconnect via `retry.Do`.
+  - If `time.Since(lastFrameTime) > MaxIdleBetweenFrames`: log warn with `last_frame_age_ms` plus `tickers`/`tickers_sample` (Kalshi tickers embed bracket dates, so a subscription to settled markets is readable off the warn line), return error → reconnect via `retry.Do`.
   - Else: `conn.Ping(ctx)` with a `PingInterval`-bounded deadline. Ping failure also returns error → reconnect.
+
+The 60s default was validated empirically against the 2026-05-20 tape
+(394k frames): the maximum intra-connection inter-frame gap across the
+whole day was 40s, with zero gaps above 45s. Quiet books do not trip
+it; a silent subscription does.
 
 The watchdog catches two failure modes the underlying coder/websocket
 library doesn't:
   - Half-open TCP connections where the peer's TCP stack is gone but the local kernel hasn't noticed (no TCP RST, no FIN).
   - Live TCP, dead application — the upstream feed is silent due to a market data gateway hang.
+
+### Ticker refresh on reconnect
+
+A watchdog kill is only a useful recovery action if the next connect
+can actually succeed. The 2026-05 outage (docs/OPERATIONS.md §15)
+showed the failure mode where it can't: the in-memory ticker list had
+gone fully stale, Kalshi answered every resubscribe with stub
+snapshots (`market_id:""`, no book fields) and no deltas, and the
+kill→reconnect loop spun at ~122s/cycle for days.
+
+`SubscriberOptions.RefreshTickers` closes the loop: when set, it is
+called at the start of **every** connection attempt (bounded by
+`RefreshTimeout`, default 30s) and its result replaces the ticker
+list before subscribing. Errors and empty results fall back to the
+last-known list with a warn — a flaky discovery source degrades to
+the old behavior, never worse. `cmd/tape` wires this to
+`DiscoverOpenTickers`; the 4h rediscovery loop remains for adding
+next-day markets to connections that stay healthy for hours.
+
+### Reconnect backoff reset
+
+`retry.Config.ResetAfter` (the subscriber passes
+`2×MaxIdleBetweenFrames`): an attempt that ran at least that long
+before failing resets the backoff ladder and attempt counter, so a
+connection that streamed for hours reconnects at `InitialBackoff`
+instead of whatever cap earlier flapping ratcheted up to. Before
+this, backoff was monotonic over the process lifetime — by
+2026-05-26 the recorder had logged 6,090 attempts, every one paying
+the full 30s cap.
 
 ## Test access
 
