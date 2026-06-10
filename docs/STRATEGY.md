@@ -13,6 +13,22 @@
 > [audit/02-architecture.md](../audit/02-architecture.md), pending
 > per-decision sign-off** — none are authoritative yet.
 
+## Current direction — structure-first (2026-06-09)
+
+**The authoritative plan is now
+[research/09-structure-first-pivot.md](./research/09-structure-first-pivot.md),
+accepted by [ADR-0014](./decisions/0014-structure-first-pivot.md).**
+Directional weather failed its gates (floor v2: −10pp Brier vs market mid,
+significant; forward week 1: −$30.24 realized) and is demoted to a time-boxed
+side track (one MOS refit + one fair forward test against the v5 gate). The
+flagship is a market-agnostic structural scanner — deterministic-settlement
+capture, internal-consistency arbitrage (bracket sums, ladder monotonicity,
+complement pairs), stale-book lag — across all NY-eligible Kalshi markets,
+gated G-A → G-B → G-C with numbers frozen in the ADR. No real-money order
+without G-B passing **and** explicit operator sign-off. Everything below this
+section documents the directional-weather program: retained as the side
+track's scope and as the historical record of why the pivot happened.
+
 ## In one paragraph
 
 `isobar` is a solo-operator weather-bracket trading bot targeting
