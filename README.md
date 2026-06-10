@@ -1,15 +1,15 @@
 # isobar
 
-Probabilistic-forecaster vs prediction-market research project: calibrated
-weather-bracket pricing on Kalshi, with rigorous OOS verification and a
-disciplined evidence-gated path to deployment. The codebase ships an
-end-to-end pipeline (recorder → calibration → Bayesian update →
-selective-entry edge-scan) and a series of decision-gate reports built
-around it.
+Evidence-gated trading-research project on Kalshi: an end-to-end data
+plane (recorder → journal → replay), a calibration/backtest pipeline,
+and a series of decision-gate reports. Every strategy iteration is
+pre-registered, measured on held-out data, and killed in writing when
+it fails its gate.
 
 The name `isobar` refers to lines of constant atmospheric pressure on
-weather maps — the project's edge would come from pricing weather better
-than the market does. After four iterations of evidence:
+weather maps — campaign #1 bet that calibrated weather forecasting could
+out-price the market. Four backtest iterations and one forward week
+said no:
 
 - **v1 (retracted)** — naive ensemble fraction loses badly
 - **v2** — MOS calibration is real but loses to market mid (−10 pp Brier)
@@ -17,8 +17,21 @@ than the market does. After four iterations of evidence:
   ($-4,964 over 6 days at notional)
 - **v4** — Selective-entry filter (`--entry-filter h4`: exclude KXHIGHNY,
   require low-temp brackets OR extreme-OTM price band) flips the same
-  6-day backtest to **$+794 with daily Sharpe 0.68** (5-day LOO CV).
-  **First positive-EV finding**, not yet validated on truly OOS data.
+  6-day backtest to **$+794 with daily Sharpe 0.68** (5-day LOO CV) —
+  first positive-EV candidate, but mined in-window, never proven
+- **forward week 1 (the real test)** — **−$30.24 at a 22.3% win rate**
+  (confounded by a model-set mismatch and a degraded recorder, but
+  negative is negative)
+
+**Current flagship
+([ADR-0014](./docs/decisions/0014-structure-first-pivot.md), 2026-06-09):
+a structure-first scanner** — capture mispricings provable from the price
+sheet itself (exhaustive bracket sums, complement pairs, threshold-ladder
+monotonicity, deterministic-settlement capture, stale-book repricing lag),
+domain-agnostic across every Kalshi vertical, gated **G-A → G-B → G-C**
+with pre-registered numbers. Directional weather is demoted to a
+time-boxed side track. Live build state:
+[docs/BUILDLOG.md](./docs/BUILDLOG.md).
 
 ## Pipeline
 
@@ -163,41 +176,49 @@ Five engineering bets driving the current state of the code:
    First +EV result on real Kalshi tape with NWS CLI truth.
    ([v4 report](./reports/phase0.5/2026-05-19-v4-h4-filter.md))
 
-## Status — Phase 0.5 v4: positive-EV candidate, forward-validation gated
+## Status — structure-first pivot accepted (ADR-0014)
 
-The latest decision-gate report is
-[`reports/phase0.5/2026-05-19-v4-h4-filter.md`](./reports/phase0.5/2026-05-19-v4-h4-filter.md).
-It supersedes v3 (which superseded v2, which superseded the retracted
-v1). The chain of evidence:
+The chain of evidence that got here:
 
-| Iter | Strategy | 6-day PnL | Verdict |
-|---|---|---:|---|
-| v1 | Naive | $-9,198 | retracted |
-| v2 | MOS calibration | $-6,113 | gate not met (Brier units) |
-| v3 | MOS + Bayesian | $-4,964 | gate not met (dollars) |
-| **v4** | **MOS + Bayesian + H4 filter** | **$+794** | **+EV candidate** |
+| Iter | Strategy | Window | PnL | Verdict |
+|---|---|---|---:|---|
+| v1 | Naive | 6-day held-out | $-9,198 | retracted |
+| v2 | MOS calibration | 6-day held-out | $-6,113 | gate not met (Brier) |
+| v3 | MOS + Bayesian | 6-day held-out | $-4,964 | gate not met (dollars) |
+| v4 | MOS + Bayesian + H4 filter | 6-day held-out | $+794 | +EV candidate, mined in-window |
+| **fwd wk1** | **v4, out-of-sample** | **5 forward days** | **$-30.24** | **negative → pivot** |
 
-The v4 strategy `--entry-filter h4` shows positive expected value on
-the only held-out window we have (5 days, daily Sharpe 0.68, 3/5 positive
-days). The verdict is **not** yet "deploy money":
+[ADR-0014](./docs/decisions/0014-structure-first-pivot.md) (2026-06-09)
+accepts the structure-first pivot per
+[research/09](./docs/research/09-structure-first-pivot.md): build
+detectors for mispricings provable from the price sheet (bracket sums,
+complement pairs, ladder monotonicity, deterministic settlement,
+stale-book lag) on the existing data plane, and stop building
+directional fair-value models for new domains. Frozen gates:
 
-- 5 days of leave-one-day-out CV is a hypothesis test, not a proof.
-- The H4 conditions were partly discovered by inspecting the same
-  window's profitable subsets (data-mining risk).
-- The recorder is running fresh tape since 2026-05-19 to produce
-  truly out-of-sample data. Re-evaluation requires ≥10 forward days
-  of tape + NWS CLI truth (24h truth latency).
+- **G-A (data plane)** — 14 consecutive days, ≥95% recorder uptime,
+  ≥80% of expected frames/day, ≥300 markets recorded, eligibility
+  checker green.
+- **G-B (opportunity existence)** — on ≥14 days of healthy wide tape:
+  ≥25 executable structural instances/week · net ≥2¢ after fees at
+  displayed size · median persistence ≥3 s · capturable EV ≥$10/week
+  at the RISK.md cap ladder. Unmet → no execution build; publish the
+  negative measurement.
+- **G-C (live canary)** — $50 sub-bankroll, taker/IOC only, 14 days,
+  realized capture ≥50% of predicted, zero cap violations, zero
+  unhandled rejects.
 
-**v5 gate criteria** (proposed): ≥10 forward days, n ≥ 25,000 H4
-entries, aggregate PnL > 0, daily Sharpe ≥ 0.5, positive_days ≥ 60%,
-max-single-day drawdown < positive-day PnL. If v5 passes, Phase 1
-paper bot unblocks. If v5 fails, ADR-0014 documents the H4 finding
-as a 6-day artifact and the project reverts to forecasting-research
-framing.
+Directional weather continues only as a time-boxed side track (one MOS
+refit on `gfs_seamless,ecmwf_ifs025`, one fair forward test against the
+v5 gate, then close per the off-ramp if it fails). Between releases the
+build moves fast — trust [docs/BUILDLOG.md](./docs/BUILDLOG.md) over
+this section.
 
 **No capital has been committed.** `KalshiExec` (live order
 placement) does not exist in the repo by design — see
-[`audit/live-allow-trace.md`](./audit/live-allow-trace.md).
+[`audit/live-allow-trace.md`](./audit/live-allow-trace.md). ADR-0014
+adds a hard rail: any code path that can place a real order requires
+explicit operator sign-off in a live session.
 
 ## What's shipped
 
@@ -205,8 +226,9 @@ Seven binaries plus calibration / verification / scanner packages:
 
 ```
 cmd/tape                    Recorder (Kalshi WS + Open-Meteo REST → JSONL).
-                            Live on Vultr HF Chicago with rolling
-                            ticker re-discovery (4h cycle).
+                            Reconnect-time ticker refresh + rolling 4h
+                            re-discovery; prod redeploy of the 2026-06
+                            starvation fix pending (OPERATIONS.md §15).
 cmd/peek                    Kalshi REST probe for series/market discovery.
 cmd/analyze                 Phase-0.5 sanity report over recorded journals.
 cmd/calibrate-parse-cli     NWS CLI bulletin zip → daily TMAX/TMIN CSV.
@@ -386,7 +408,8 @@ set -a && source .env && set +a
                 --bayesian-kernel data/calibration/bayesian-kernel.json \
                 --hourly-obs data/calibration/obs \
                 --entry-filter h4
-# → reports/.../summary-*.md ; current best PnL: +$793.74 on 6 days
+# → reports/.../summary-*.md ; best held-out backtest: +$793.74 on 6 days
+#   (forward week 1 was negative — see ADR-0014; backtest ≠ edge)
 ```
 
 Recorded data lands under `./data/<source>/<YYYY-MM-DD>/<source>-<hour>.jsonl[.gz]`.
@@ -406,7 +429,8 @@ Recorded data lands under `./data/<source>/<YYYY-MM-DD>/<source>-<hour>.jsonl[.g
 
 ## Documentation map
 
-- [Strategy](./docs/STRATEGY.md) — edge thesis and execution doctrine (note: needs v3 update post-Phase 0.5 v2)
+- [Strategy](./docs/STRATEGY.md) — edge thesis and execution doctrine (banner points at the ADR-0014 pivot)
+- [Buildlog](./docs/BUILDLOG.md) — live coordination journal between build runs; the freshest state in the repo
 - [Architecture](./docs/ARCHITECTURE.md) — package layout and invariants
 - [Calibration](./docs/CALIBRATION.md) — MOS math, climate baseline, shrinkage, σ-source honesty
 - [Backtest](./docs/BACKTEST.md) — realized-PnL backtest pipeline + CSV column reference
@@ -415,8 +439,8 @@ Recorded data lands under `./data/<source>/<YYYY-MM-DD>/<source>-<hour>.jsonl[.g
 - [Risk](./docs/RISK.md) — the L0–L4 control hierarchy
 - [Testing](./docs/TESTING.md) — rules, coverage floors, CI expectations
 - [Glossary](./docs/GLOSSARY.md) — terms, defined once
-- [Research](./docs/research/) — 8 agent reports + [SYNTHESIS.md](./docs/research/SYNTHESIS.md)
-- [Decisions](./docs/decisions/) — 10 ADRs documenting major design choices
+- [Research](./docs/research/) — 9 reports + [SYNTHESIS.md](./docs/research/SYNTHESIS.md)
+- [Decisions](./docs/decisions/) — 14 ADRs documenting major design choices
 - [Reports](./reports/) — Phase 0.5 evaluation reports (see INDEX)
 
 Running log: [CHANGELOG.md](./CHANGELOG.md).
