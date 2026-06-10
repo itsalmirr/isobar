@@ -8,6 +8,41 @@ parallel session marks IN FLIGHT.
 
 ---
 
+## 2026-06-10 ~13:30 ET — cleanup run (interactive session)
+
+**Done:**
+- `92eaeb4` fix(kalshi): **recorder starvation fix LANDED** — reviewed and
+  committed the parallel session's working-tree edits (reconnect-time
+  `RefreshTickers`, `retry.ResetAfter`, OPERATIONS §15 postmortem).
+  Queue item "universe → cmd wiring" is now **UNBLOCKED**.
+- `ec07cfb` chore(lint): errorlint + gofumpt + gosec — `make lint` green.
+- CI/build hygiene (this commit): `go mod tidy` (CI tidy-check was red —
+  x/tools is a direct dep via tools/clockcheck); CI now pins
+  golangci-lint **v2.12.2** (was v2.1 — 11-minor drift vs local) via
+  action v9; Go version sourced from go.mod; **clockcheck now runs in CI**
+  (was local-only — ADR-0012 was unenforced on push).
+- Docs accuracy pass (this commit): README intro/status rewritten to the
+  post-pivot record (fwd wk1 row added, G-A/B/C gates listed); ROADMAP
+  pivot banner + Phase 0.5 closed; CHANGELOG **0.5.0 cut** (backfilled
+  ~7 weeks / 123 commits, Unreleased reset); stale local branches pruned
+  (`claude/loving-tesla-c0615a`, `audit/2026-05-13` — both fully merged).
+- govulncheck: **no vulnerabilities**. `go mod verify`: ok.
+
+**Recorder status:** fix is committed on main; **prod redeploy still
+pending** — operator action per OPERATIONS §15 open items (journalctl
+forensics on the 05-20→24 window, discovery-freshness check at boot,
+cross-compile + redeploy + restart unit). G-A clock does not start until
+wide recording runs healthy in prod.
+
+**Next (queue order unchanged from run #2):**
+1. (b)(ii) hand-audit script (top item).
+2. (d) detectors in `internal/structscan` on existing weather tape.
+3. universe → cmd wiring + config widening — unblocked as of `92eaeb4`.
+4. Operator: NY-eligibility confirmations for expansion series; prod
+   redeploy (the calendar long pole).
+
+---
+
 ## 2026-06-09 ~20:55 ET — manual run #2 (interactive session)
 
 **Done:**
