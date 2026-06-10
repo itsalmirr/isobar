@@ -33,6 +33,7 @@ the old one rather than editing history.
 | [0011](./0011-journal-backpressure.md) | 2026-05-13 | Journal backpressure: drop with counter, sampled debug log, alarm hook | Accepted |
 | [0012](./0012-time-source-discipline.md) | 2026-05-13 | Time-source discipline: Clock interface, now-func fields, custom lint analyzer | Accepted |
 | [0013](./0013-retire-pr9-paper-trader-lineage.md) | 2026-05-13 | Retire PR#9 paper-trader/scoring lineage from `main`; defer until cmd/bot unblock | Accepted |
+| [0014](./0014-structure-first-pivot.md) | 2026-06-09 | Accept structure-first pivot; demote directional weather to side track | Accepted |
 
 ## Template
 
