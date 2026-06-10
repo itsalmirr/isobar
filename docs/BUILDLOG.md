@@ -27,6 +27,10 @@ local `./bin/tape` capturing since 18:22 ET (15k+ frames, healthy sustained rate
 debug log at /tmp/tape-debug-*.log); no fix committed yet (branch
 `claude/loving-tesla-c0615a` empty). Check `git log` + worktrees before touching.
 Prod box (isobar-prod) presumably still down — redeploy only after the fix lands.
+**As of 20:40 ET their session is editing `internal/kalshi/ws.go` + `internal/retry/retry.go`
+directly in the MAIN working tree.** New-package work (queue items 1–3 below) does NOT
+conflict: proceed, but scope builds/tests to your own packages (`go test ./internal/universe/...`
+etc., not `./...`) while their edits are in flight, and never stage files you didn't author.
 
 **Next (in order):**
 1. (b)(ii) hand-audit script: independently re-derive ~20 random realized-PnL
