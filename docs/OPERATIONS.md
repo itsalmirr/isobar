@@ -368,6 +368,37 @@ Normal on overnight maintenance windows. Persistent (every few seconds
 for > 10 min) reconnects indicate the WS URL is wrong, auth is failing,
 or the network is unstable. Check with `curl -I https://api.elections.kalshi.com`.
 
+### `ws frame starvation — forcing reconnect` repeating every ~90–120s
+
+The watchdog sees no inbound frames for `MaxIdleBetweenFrames` (60s),
+kills the connection, and the reconnect also produces no frames. The
+warn line carries `tickers` (count) and `tickers_sample` — **read the
+dates embedded in the sampled tickers first** (`KXHIGHCHI-26MAY27-…`
+means the subscription is for May 27 brackets). If those dates are in
+the past, the recorder is subscribed to settled markets: Kalshi acks
+the subscribe and sends one stub `orderbook_snapshot` per market
+(`market_id: ""`, no book fields), then nothing, ever.
+
+Since the 2026-06-09 fix the subscriber re-resolves the open-market
+set via `RefreshTickers` on **every** reconnect, so a stale in-memory
+list self-heals on the next watchdog kill. If starvation still repeats
+after reconnects, REST discovery itself is returning settled markets.
+Verify from the affected host what the subscription actually contains
+— dates and stub-ness are both visible in the journaled snapshots:
+
+```bash
+# What did the last connection subscribe to? (settled markets answer
+# with market_id:"" stubs and no book fields)
+jq -r 'select(.k=="ws" and .p.type=="orderbook_snapshot")
+       | .p.msg.market_ticker + " " + (if (.p.msg.market_id // "") == "" then "STUB" else "ok" end)' \
+  data/kalshi/$(date -u +%F)/*.jsonl | tail -20
+```
+
+Beware: `make run-peek` prints per-status market **counts** — a
+plausible-looking count (e.g. 96) of zombie markets is exactly how the
+2026-05 outage hid. Counts don't establish freshness; ticker dates do.
+See §15 for the postmortem.
+
 ### `journal: drop-alarm fired` (slog.Error)
 
 The journal drop-rate alarm crossed its threshold. See §3.2 for the
@@ -569,3 +600,103 @@ The known-out-of-repo deploy facts (memory only):
 
 Once the unit file paste lands, the install/scp/restart sequence
 moves here verbatim.
+
+## 15. Postmortem: WS frame starvation outage (2026-05-21 → 2026-06-01)
+
+**Status**: root-caused and fixed locally 2026-06-09; prod redeploy +
+prod-side log forensics still open (see "Open items").
+
+### Impact
+
+- Kalshi tape collapsed from ~22 MB/day to <200 KB/day on 05-21..23,
+  missing entirely on 05-24/25, stub-only through 06-01.
+- 3 of 5 forward-validation days unusable (`n=15` windows instead of
+  ~194); week-1 verdict (`reports/phase0.5/2026-05-26-forward-week1-verdict.md`)
+  had to caveat its own n-counts.
+- ~6,090 reconnect attempts logged by 05-26; every one paid the full
+  30s backoff cap.
+
+### Root cause
+
+The subscriber's in-memory ticker list went fully stale — every
+subscribed market had settled. Kalshi **acks** a subscribe for settled
+markets and sends one stub `orderbook_snapshot` per ticker
+(`market_id: ""`, no book fields), then nothing further: no deltas, no
+trades, no error. The liveness watchdog (added 2026-05-13, c0c59f5)
+correctly detected the silence at 60s and forced a reconnect — but the
+reconnect path reused the same stale list, so the loop could never
+converge. Observed cycle: connect → ack + N stubs in <2s → silence →
+starvation kill at ~90s → ~30s capped backoff → repeat (~122s/cycle,
+measured from the 05-26 tape).
+
+Three compounding defects:
+
+1. **Reconnects never re-resolved tickers.** Only the 4h rediscovery
+   loop could refresh the list; if it stalled or its host slept
+   through ticks (local Mac) — or discovery returned zombies (prod
+   hypothesis, unconfirmed) — the WS layer had no second chance.
+2. **`retry.Do` backoff never reset.** The attempt counter and backoff
+   were monotonic over the process lifetime, so even a connection that
+   had streamed healthily for hours reconnected at the 30s cap.
+3. **The starvation warn was blind.** It logged frame age only; the
+   subscribed tickers (whose names embed bracket dates) were not
+   logged anywhere, so "subscribed to May 27 markets on May 29" was
+   invisible without tape archaeology.
+
+### What the data showed (how to re-derive)
+
+All from the local `./data` archive (mix of scp'd prod days and local
+runs), with `jq`/`awk` over the journal frames:
+
+- Sick connections: `subscribed` acks + exactly one stub snapshot per
+  ticker, **zero** `orderbook_delta`/`trade`, life <2s of frames.
+  06-01 dead connections held 60 tickers dated 26MAY26/26MAY27 (all
+  STUB); the first healthy connection at ~14:50Z held 48 tickers dated
+  26JUN01 (all real) and streamed 45k+ deltas.
+- Healthy-day gap analysis (05-20, 394k frames): max intra-connection
+  inter-frame gap was **40s**; zero gaps >45s. The 60s
+  `MaxIdleBetweenFrames` was correctly sized — "watchdog too
+  aggressive on quiet evenings" is **refuted**.
+- 05-21..23 prod days are hourly-rotated 23-byte gzips: zero frames
+  per connection — not even acks. Signature differs from 05-26+
+  (stubs); cause unconfirmed without prod logs (see Open items).
+- Suspects ruled out: WS auth (acks arrived; fresh local boot on
+  06-09 worked immediately), Kalshi subscribe-protocol change (same
+  code captured 1.2 MB in 90s on 06-09 with a fresh list).
+
+### Fix (2026-06-09)
+
+- `internal/kalshi/ws.go`: `SubscriberOptions.RefreshTickers` — called
+  at the start of **every** connection attempt with a bounded context
+  (`RefreshTimeout`, default 30s); error/empty falls back to the
+  last-known list. `cmd/tape` wires it to `DiscoverOpenTickers`, so a
+  watchdog kill now self-heals on the very next connect. The 4h
+  rediscovery loop is kept for adding next-day markets to long-lived
+  healthy connections.
+- `internal/retry`: `Config.ResetAfter` — an attempt that ran ≥
+  ResetAfter before failing resets backoff and the attempt counter.
+  The subscriber sets it to `2×MaxIdleBetweenFrames`, so post-outage
+  reconnects start at `InitialBackoff` (500ms), not the 30s cap.
+- Starvation warn now logs `tickers` + `tickers_sample` — stale
+  bracket dates are visible in a single log line.
+- Tests: `TestSubscriber_RefreshTickersOnReconnect`,
+  `TestSubscriber_RefreshTickersFailureKeepsLastKnownList`,
+  `TestDoResetAfterLongAttempt`,
+  `TestDoResetAfterShortAttemptsStillBounded`.
+
+### Open items (prod)
+
+1. `journalctl -u isobar-tape --since 2026-05-20 --until 2026-05-24`
+   on `isobar-prod`: the zero-frame days should name the actual error
+   (dial failure vs silent server vs no-ack). This distinguishes a
+   Kalshi-side blip from host-side (DNS pitfall — see deploy notes).
+2. On the prod host, confirm discovery freshness at boot: ticker
+   *dates* in the first post-restart subscription (§7 starvation
+   entry has the one-liner). If prod's REST view returns settled
+   markets as `open`, refresh-on-reconnect cannot help and the DNS
+   path needs the fix.
+3. Cross-compile + redeploy the fixed binary
+   (`GOOS=linux GOARCH=amd64 make build`), restart the unit, then run
+   the §2.1 1-hour smoke gate and confirm ≥80% expected daily frames
+   for 3 consecutive days (the week-1 verdict's tape-health
+   prerequisite) before resuming forward validation.

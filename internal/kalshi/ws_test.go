@@ -3,6 +3,8 @@ package kalshi
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -379,6 +381,133 @@ func TestSubscriber_ReconnectsOnFrameStarvation(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("expected watchdog to trigger reconnect, got %d subscribes", subscribes.Load())
+}
+
+// newSilentCapturingServer accepts WS upgrades, captures each connection's
+// subscribe payload, and then sends nothing — so the starvation watchdog
+// drives reconnect after reconnect. This is the shape of the 2026-05
+// outage: connections that subscribe successfully but never receive data.
+func newSilentCapturingServer(t *testing.T) (*httptest.Server, chan string) {
+	t.Helper()
+	subscribes := make(chan string, 8)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/trade-api/ws/v2", func(rw http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(rw, r, &websocket.AcceptOptions{
+			InsecureSkipVerify: true,
+		})
+		if err != nil {
+			return
+		}
+		ctx := r.Context()
+		if _, data, err := conn.Read(ctx); err == nil {
+			select {
+			case subscribes <- string(data):
+			default:
+			}
+		}
+		<-ctx.Done()
+		_ = conn.Close(websocket.StatusNormalClosure, "test done")
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, subscribes
+}
+
+// TestSubscriber_RefreshTickersOnReconnect verifies that every connection
+// attempt — the initial connect and each watchdog-forced reconnect —
+// subscribes with the list returned by RefreshTickers at that moment,
+// never the constructor's (potentially stale) list. This is the self-heal
+// path for the 2026-05 outage: a starvation reconnect must re-resolve the
+// market set, or a fully settled list loops forever.
+func TestSubscriber_RefreshTickersOnReconnect(t *testing.T) {
+	srv, subscribes := newSilentCapturingServer(t)
+
+	_, pem := testKeyPair(t)
+	signer, err := NewSigner("keyid", pem)
+	require.NoError(t, err)
+
+	var refreshCalls atomic.Int32
+	sub := NewSubscriber(SubscriberOptions{
+		WSURL:    "ws" + strings.TrimPrefix(srv.URL, "http") + "/trade-api/ws/v2",
+		Signer:   signer,
+		Channels: []string{"orderbook_delta"},
+		Tickers:  []string{"STALE-SETTLED"},
+		Logger:   discardLogger(),
+		RefreshTickers: func(context.Context) ([]string, error) {
+			return []string{fmt.Sprintf("FRESH-%d", refreshCalls.Add(1))}, nil
+		},
+		PingInterval:         100 * time.Millisecond,
+		MaxIdleBetweenFrames: 200 * time.Millisecond,
+		Reconnect: ReconnectOptions{
+			InitialBackoff: 10 * time.Millisecond,
+			MaxBackoff:     20 * time.Millisecond,
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go func() { _ = sub.Run(ctx) }()
+
+	for i := 1; i <= 2; i++ {
+		select {
+		case s := <-subscribes:
+			var msg subscribeMessage
+			require.NoError(t, json.Unmarshal([]byte(s), &msg))
+			require.Equal(t, []string{fmt.Sprintf("FRESH-%d", i)}, msg.Params.MarketTickers,
+				"connection %d must carry that attempt's refreshed list", i)
+		case <-time.After(3 * time.Second):
+			t.Fatalf("subscribe %d never observed", i)
+		}
+	}
+}
+
+// TestSubscriber_RefreshTickersFailureKeepsLastKnownList verifies both
+// non-fatal refresh outcomes: an error and an empty list each leave the
+// last-known tickers in place, so a flaky discovery source degrades to
+// pre-hook behavior instead of wiping the subscription.
+func TestSubscriber_RefreshTickersFailureKeepsLastKnownList(t *testing.T) {
+	srv, subscribes := newSilentCapturingServer(t)
+
+	_, pem := testKeyPair(t)
+	signer, err := NewSigner("keyid", pem)
+	require.NoError(t, err)
+
+	var refreshCalls atomic.Int32
+	sub := NewSubscriber(SubscriberOptions{
+		WSURL:    "ws" + strings.TrimPrefix(srv.URL, "http") + "/trade-api/ws/v2",
+		Signer:   signer,
+		Channels: []string{"orderbook_delta"},
+		Tickers:  []string{"LAST-KNOWN"},
+		Logger:   discardLogger(),
+		RefreshTickers: func(context.Context) ([]string, error) {
+			if refreshCalls.Add(1)%2 == 1 {
+				return nil, errors.New("discovery down")
+			}
+			return nil, nil // empty list — must not wipe the subscription
+		},
+		PingInterval:         100 * time.Millisecond,
+		MaxIdleBetweenFrames: 200 * time.Millisecond,
+		Reconnect: ReconnectOptions{
+			InitialBackoff: 10 * time.Millisecond,
+			MaxBackoff:     20 * time.Millisecond,
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go func() { _ = sub.Run(ctx) }()
+
+	for i := 1; i <= 2; i++ {
+		select {
+		case s := <-subscribes:
+			var msg subscribeMessage
+			require.NoError(t, json.Unmarshal([]byte(s), &msg))
+			require.Equal(t, []string{"LAST-KNOWN"}, msg.Params.MarketTickers,
+				"connection %d must fall back to the last-known list", i)
+		case <-time.After(3 * time.Second):
+			t.Fatalf("subscribe %d never observed", i)
+		}
+	}
 }
 
 // TestSubscriber_PingFailureTriggersReconnect verifies that a peer that
