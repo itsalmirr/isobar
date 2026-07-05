@@ -24,18 +24,18 @@ func TestFeePerContractCents(t *testing.T) {
 		{0.40, 2}, // ceil(0.07·0.24·100) = ceil(1.68) = 2
 	}
 	for _, tt := range tests {
-		got := FeePerContractCents(tt.price)
+		got := FeePerContractCentsMode(tt.price, FeeTaker)
 		if got != tt.wantFee {
-			t.Errorf("FeePerContractCents(%.2f) = %d, want %d", tt.price, got, tt.wantFee)
+			t.Errorf("FeePerContractCentsMode(%.2f, FeeTaker) = %d, want %d", tt.price, got, tt.wantFee)
 		}
 	}
 }
 
 func TestFeePerContractCents_ClampsOutOfRange(t *testing.T) {
-	if got := FeePerContractCents(-0.5); got != 0 {
+	if got := FeePerContractCentsMode(-0.5, FeeTaker); got != 0 {
 		t.Errorf("negative price clamp = %d, want 0", got)
 	}
-	if got := FeePerContractCents(1.5); got != 0 {
+	if got := FeePerContractCentsMode(1.5, FeeTaker); got != 0 {
 		t.Errorf("price>1 clamp = %d, want 0 (P=1, P(1-P)=0)", got)
 	}
 }
@@ -74,9 +74,9 @@ func TestEdgeAfterFeeCents(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := EdgeAfterFeeCents(tt.pFair, tt.price)
+			got := EdgeAfterFeeCentsMode(tt.pFair, tt.price, FeeTaker)
 			if got != tt.wantEdge {
-				t.Errorf("EdgeAfterFeeCents(%.2f, %.2f) = %d, want %d",
+				t.Errorf("EdgeAfterFeeCentsMode(%.2f, %.2f, FeeTaker) = %d, want %d",
 					tt.pFair, tt.price, got, tt.wantEdge)
 			}
 		})
@@ -101,20 +101,6 @@ func TestFeeMode_BPSAndString(t *testing.T) {
 	if got, want := KalshiMakerFeeBPS, KalshiTakerFeeBPS/4; math.Abs(got-want) > 1e-12 {
 		t.Errorf("maker/taker ratio = %v / %v = %v, want exactly 1/4",
 			KalshiMakerFeeBPS, KalshiTakerFeeBPS, got/KalshiTakerFeeBPS)
-	}
-}
-
-// TestFeePerContractCents_TakerParity ensures the default no-mode
-// callers see exactly the same behaviour as the mode-aware caller
-// invoked with FeeTaker — i.e., adding the mode-aware variant did
-// not regress any existing taker calculation.
-func TestFeePerContractCents_TakerParity(t *testing.T) {
-	for p := 0.0; p <= 1.0+1e-9; p += 0.01 {
-		legacy := FeePerContractCents(p)
-		modal := FeePerContractCentsMode(p, FeeTaker)
-		if legacy != modal {
-			t.Errorf("at p=%.2f: legacy=%d vs FeeTaker=%d", p, legacy, modal)
-		}
 	}
 }
 

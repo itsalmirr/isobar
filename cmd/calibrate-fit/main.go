@@ -14,21 +14,18 @@ package main
 
 import (
 	"context"
-	"encoding/csv"
-	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"syscall"
 	"time"
 
 	"github.com/wh0o0pz/isobar/internal/calibration/mos"
+	"github.com/wh0o0pz/isobar/internal/calibration/obscsv"
 	"github.com/wh0o0pz/isobar/internal/clock"
+	"github.com/wh0o0pz/isobar/internal/jsonatomic"
 	"github.com/wh0o0pz/isobar/internal/market"
 	"github.com/wh0o0pz/isobar/internal/obs"
 )
@@ -106,92 +103,59 @@ type obsRow struct {
 	TmaxF, TminF *float64 // nil iff source CSV had empty cell
 }
 
+// forecastAliases projects the forecast CSV's gfs_* columns onto the
+// canonical obscsv Row: Row.Tmax/Tmin carry the GFS deterministic
+// forecast high/low rather than observations.
+var forecastAliases = obscsv.Aliases{
+	obscsv.ColDate: {"valid_date"},
+	obscsv.ColTmax: {"gfs_tmax_f"},
+	obscsv.ColTmin: {"gfs_tmin_f"},
+}
+
 func readForecastCSV(path string) ([]forecastRow, error) {
-	f, err := os.Open(path) //nolint:gosec // path is operator-supplied calibration dir
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	r := csv.NewReader(f)
-	header, err := r.Read()
-	if err != nil {
-		return nil, fmt.Errorf("header: %w", err)
-	}
-	col, err := requireColumns(header, "valid_date", "gfs_tmax_f", "gfs_tmin_f")
+	rows, err := obscsv.ReadFile(path, obscsv.Options{
+		Alias:      forecastAliases,
+		Require:    []string{obscsv.ColDate, obscsv.ColTmax, obscsv.ColTmin},
+		StrictRows: true,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("forecast %s: %w", path, err)
 	}
-	minCols := maxIndex(col) + 1
-	out := []forecastRow{}
-	for {
-		rec, err := r.Read()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-		if len(rec) < minCols {
-			return nil, fmt.Errorf("forecast %s: short record (%d cols, need %d)", path, len(rec), minCols)
-		}
-		d, err := time.Parse("2006-01-02", rec[col["valid_date"]])
-		if err != nil {
+	out := make([]forecastRow, 0, len(rows))
+	for _, row := range rows {
+		// A row missing either forecast temp carries no usable pair; skip it
+		// (same policy as the previous both-or-nothing ParseFloat parse).
+		if !row.TmaxPresent || !row.TminPresent {
 			continue
 		}
-		hi, err1 := strconv.ParseFloat(rec[col["gfs_tmax_f"]], 64)
-		lo, err2 := strconv.ParseFloat(rec[col["gfs_tmin_f"]], 64)
-		if err1 != nil || err2 != nil {
-			continue
-		}
-		out = append(out, forecastRow{Date: d, TmaxF: hi, TminF: lo})
+		out = append(out, forecastRow{Date: row.Date, TmaxF: row.Tmax, TminF: row.Tmin})
 	}
 	return out, nil
 }
 
 func readObsCSV(path string) ([]obsRow, error) {
-	f, err := os.Open(path) //nolint:gosec // path is operator-supplied calibration dir
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	r := csv.NewReader(f)
-	header, err := r.Read()
-	if err != nil {
-		return nil, fmt.Errorf("header: %w", err)
-	}
-	col, err := requireColumns(header, "valid_date", "tmax_f", "tmin_f")
+	rows, err := obscsv.ReadFile(path, obscsv.Options{
+		Alias:      obscsv.StrictAliases,
+		Require:    []string{obscsv.ColDate, obscsv.ColTmax, obscsv.ColTmin},
+		StrictRows: true,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("obs %s: %w", path, err)
 	}
-	minCols := maxIndex(col) + 1
-	out := []obsRow{}
-	for {
-		rec, err := r.Read()
-		if errors.Is(err, io.EOF) {
-			break
+	out := make([]obsRow, 0, len(rows))
+	for _, row := range rows {
+		// nil iff the source cell was empty/unparseable — pairByDate treats a
+		// nil temperature as "no observation" and drops that (date, variable).
+		o := obsRow{Date: row.Date}
+		if row.TmaxPresent {
+			v := row.Tmax
+			o.TmaxF = &v
 		}
-		if err != nil {
-			return nil, err
+		if row.TminPresent {
+			v := row.Tmin
+			o.TminF = &v
 		}
-		if len(rec) < minCols {
-			return nil, fmt.Errorf("obs %s: short record (%d cols, need %d)", path, len(rec), minCols)
-		}
-		d, err := time.Parse("2006-01-02", rec[col["valid_date"]])
-		if err != nil {
-			continue
-		}
-		row := obsRow{Date: d}
-		if s := rec[col["tmax_f"]]; s != "" {
-			if v, e := strconv.ParseFloat(s, 64); e == nil {
-				row.TmaxF = &v
-			}
-		}
-		if s := rec[col["tmin_f"]]; s != "" {
-			if v, e := strconv.ParseFloat(s, 64); e == nil {
-				row.TminF = &v
-			}
-		}
-		out = append(out, row)
+		out = append(out, o)
 	}
 	return out, nil
 }
@@ -226,63 +190,8 @@ func pairByDate(station string, fc []forecastRow, ob []obsRow) []mos.Pair {
 	return out
 }
 
-// requireColumns returns a header→index map containing exactly the
-// requested columns, or an error naming any that are missing. This
-// closes the latent bug where map[string]int returned 0 (zero value)
-// for absent keys, silently reading column 0 instead of failing loudly.
-func requireColumns(header []string, names ...string) (map[string]int, error) {
-	idx := make(map[string]int, len(header))
-	for i, h := range header {
-		idx[h] = i
-	}
-	out := make(map[string]int, len(names))
-	var missing []string
-	for _, n := range names {
-		i, ok := idx[n]
-		if !ok {
-			missing = append(missing, n)
-			continue
-		}
-		out[n] = i
-	}
-	if len(missing) > 0 {
-		return nil, fmt.Errorf("missing required columns: %v (got header %v)", missing, header)
-	}
-	return out, nil
-}
-
-// maxIndex returns the largest column index in the map. Used to validate
-// that records have at least that many fields.
-func maxIndex(col map[string]int) int {
-	m := -1
-	for _, i := range col {
-		if i > m {
-			m = i
-		}
-	}
-	return m
-}
-
 func writeJSON(path string, c mos.Coefficients) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	f, err := os.Create(tmp) //nolint:gosec // path is operator-supplied output flag
-	if err != nil {
-		return err
-	}
-	enc := json.NewEncoder(f)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(c); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return jsonatomic.WriteIndent(path, c)
 }
 
 func printSummary(c mos.Coefficients) {

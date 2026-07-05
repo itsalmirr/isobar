@@ -1,7 +1,6 @@
 package kalshi
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -9,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -148,29 +146,6 @@ func (c *Client) throttle(ctx context.Context) error {
 
 // --- Market Data ---
 
-// GetMarket fetches a single market by ticker.
-func (c *Client) GetMarket(ctx context.Context, ticker string) (Market, error) {
-	var resp getMarketResponse
-	if err := c.get(ctx, "/markets/"+ticker, nil, &resp); err != nil {
-		return Market{}, err
-	}
-	return resp.Market, nil
-}
-
-// GetMarketRaw fetches a single market and returns the raw JSON for debugging.
-func (c *Client) GetMarketRaw(ctx context.Context, ticker string) (string, error) {
-	return c.getRaw(ctx, "/markets/"+ticker, nil)
-}
-
-// GetMarkets lists markets with optional filters.
-func (c *Client) GetMarkets(ctx context.Context, params map[string]string) ([]Market, error) {
-	var resp getMarketsResponse
-	if err := c.get(ctx, "/markets", params, &resp); err != nil {
-		return nil, err
-	}
-	return resp.Markets, nil
-}
-
 // GetMarketsPage lists markets and returns the next pagination cursor when present.
 func (c *Client) GetMarketsPage(ctx context.Context, params map[string]string) ([]Market, string, error) {
 	var resp getMarketsResponse
@@ -240,162 +215,6 @@ func (c *Client) DiscoverOpenTickers(ctx context.Context, series []string, logge
 	return out, nil
 }
 
-// GetEvents lists events with optional filters.
-func (c *Client) GetEvents(ctx context.Context, params map[string]string) ([]Event, error) {
-	var resp getEventsResponse
-	if err := c.get(ctx, "/events", params, &resp); err != nil {
-		return nil, err
-	}
-	return resp.Events, nil
-}
-
-// GetOrderbookRaw fetches the raw JSON orderbook response for debugging.
-func (c *Client) GetOrderbookRaw(ctx context.Context, ticker string) (string, error) {
-	return c.getRaw(ctx, "/markets/"+ticker+"/orderbook", nil)
-}
-
-// GetOrdersRaw fetches raw JSON for debugging order response format.
-func (c *Client) GetOrdersRaw(ctx context.Context, params map[string]string) (string, error) {
-	return c.getRaw(ctx, "/portfolio/orders", params)
-}
-
-// GetFillsRaw fetches raw JSON for debugging fill response format.
-func (c *Client) GetFillsRaw(ctx context.Context, params map[string]string) (string, error) {
-	return c.getRaw(ctx, "/portfolio/fills", params)
-}
-
-// GetOrderbook fetches the orderbook for a market ticker.
-// depth limits the number of levels returned (0 = default).
-func (c *Client) GetOrderbook(ctx context.Context, ticker string, depth int) (Orderbook, error) {
-	params := map[string]string{}
-	if depth > 0 {
-		params["depth"] = strconv.Itoa(depth)
-	}
-	var resp getOrderbookResponse
-	if err := c.get(ctx, "/markets/"+ticker+"/orderbook", params, &resp); err != nil {
-		return Orderbook{}, err
-	}
-
-	// Prefer new "fp" format if present; convert to legacy integer-cents format.
-	if len(resp.OrderbookFP.YesDollars) > 0 || len(resp.OrderbookFP.NoDollars) > 0 {
-		ob := Orderbook{
-			Yes: fpLevelsToInt(resp.OrderbookFP.YesDollars),
-			No:  fpLevelsToInt(resp.OrderbookFP.NoDollars),
-		}
-		return ob, nil
-	}
-	return resp.Orderbook, nil
-}
-
-// fpLevelsToInt converts dollar-string levels to integer-cent levels.
-func fpLevelsToInt(levels []OrderbookLevelFP) []OrderbookLevel {
-	result := make([]OrderbookLevel, 0, len(levels))
-	for _, l := range levels {
-		price, err := strconv.ParseFloat(l[0], 64)
-		if err != nil {
-			continue
-		}
-		qty, err := strconv.ParseFloat(l[1], 64)
-		if err != nil {
-			continue
-		}
-		cents := int(math.Round(price * 100))
-		if cents <= 0 || cents >= 100 {
-			continue
-		}
-		result = append(result, OrderbookLevel{cents, int(qty)})
-	}
-	return result
-}
-
-// --- Orders ---
-
-// CreateOrder places a new order.
-func (c *Client) CreateOrder(ctx context.Context, req CreateOrderRequest) (Order, error) {
-	if req.Type == "" {
-		req.Type = "limit"
-	}
-	var resp createOrderResponse
-	if err := c.post(ctx, "/portfolio/orders", req, &resp); err != nil {
-		return Order{}, err
-	}
-	return resp.Order, nil
-}
-
-// CancelOrder cancels an order by its order ID.
-func (c *Client) CancelOrder(ctx context.Context, orderID string) (Order, error) {
-	var resp cancelOrderResponse
-	if err := c.delete(ctx, "/portfolio/orders/"+orderID, &resp); err != nil {
-		return Order{}, err
-	}
-	return resp.Order, nil
-}
-
-// GetOrder fetches a single order by ID.
-func (c *Client) GetOrder(ctx context.Context, orderID string) (Order, error) {
-	var resp getOrderResponse
-	if err := c.get(ctx, "/portfolio/orders/"+orderID, nil, &resp); err != nil {
-		return Order{}, err
-	}
-	return resp.Order, nil
-}
-
-// GetOrders lists orders with optional filters.
-func (c *Client) GetOrders(ctx context.Context, params map[string]string) ([]Order, error) {
-	var resp getOrdersResponse
-	if err := c.get(ctx, "/portfolio/orders", params, &resp); err != nil {
-		return nil, err
-	}
-	return resp.Orders, nil
-}
-
-// --- Portfolio ---
-
-// GetFills lists fills with optional filters.
-func (c *Client) GetFills(ctx context.Context, params map[string]string) ([]Fill, error) {
-	var resp getFillsResponse
-	if err := c.get(ctx, "/portfolio/fills", params, &resp); err != nil {
-		return nil, err
-	}
-	return resp.Fills, nil
-}
-
-// GetPositions lists portfolio positions.
-func (c *Client) GetPositions(ctx context.Context, params map[string]string) ([]Position, error) {
-	var resp getPositionsResponse
-	if err := c.get(ctx, "/portfolio/positions", params, &resp); err != nil {
-		return nil, err
-	}
-	return resp.MarketPositions, nil
-}
-
-// GetPositionsRaw returns the raw JSON response for positions.
-func (c *Client) GetPositionsRaw(ctx context.Context, params map[string]string) ([]byte, error) {
-	s, err := c.getRaw(ctx, "/portfolio/positions", params)
-	return []byte(s), err
-}
-
-// GetBalance fetches the portfolio balance.
-func (c *Client) GetBalance(ctx context.Context) (Balance, error) {
-	var bal Balance
-	if err := c.get(ctx, "/portfolio/balance", nil, &bal); err != nil {
-		return Balance{}, err
-	}
-	return bal, nil
-}
-
-// GetBalanceRaw fetches the portfolio balance as raw JSON for debugging.
-func (c *Client) GetBalanceRaw(ctx context.Context) (string, error) {
-	return c.getRaw(ctx, "/portfolio/balance", nil)
-}
-
-// GetRaw performs an authenticated GET against an arbitrary path and
-// returns the raw response body. For debugging and one-off probes only;
-// production callers should add typed wrappers.
-func (c *Client) GetRaw(ctx context.Context, path string, params map[string]string) (string, error) {
-	return c.getRaw(ctx, path, params)
-}
-
 // --- HTTP helpers ---
 
 // perRequestTimeout is the outer per-call deadline applied to every HTTP
@@ -414,35 +233,6 @@ func withCallDeadline(ctx context.Context) (context.Context, context.CancelFunc)
 		return ctx, func() {}
 	}
 	return context.WithTimeout(ctx, perRequestTimeout)
-}
-
-func (c *Client) getRaw(ctx context.Context, path string, params map[string]string) (string, error) {
-	ctx, cancel := withCallDeadline(ctx)
-	defer cancel()
-
-	fullPath := path
-	if len(params) > 0 {
-		q := url.Values{}
-		for k, v := range params {
-			q.Set(k, v)
-		}
-		fullPath = path + "?" + q.Encode()
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+fullPath, nil)
-	if err != nil {
-		return "", fmt.Errorf("kalshi: build GET request: %w", err)
-	}
-
-	if signErr := c.sign(req, path); signErr != nil {
-		return "", signErr
-	}
-
-	bodyBytes, err := c.doRaw(ctx, req)
-	if err != nil {
-		return "", err
-	}
-	return string(bodyBytes), nil
 }
 
 func (c *Client) get(ctx context.Context, path string, params map[string]string, out interface{}) error {
@@ -464,44 +254,6 @@ func (c *Client) get(ctx context.Context, path string, params map[string]string,
 	}
 
 	// Signature covers path without base URL or query string.
-	if err := c.sign(req, path); err != nil {
-		return err
-	}
-
-	return c.do(ctx, req, out)
-}
-
-func (c *Client) post(ctx context.Context, path string, body interface{}, out interface{}) error {
-	ctx, cancel := withCallDeadline(ctx)
-	defer cancel()
-
-	data, err := json.Marshal(body)
-	if err != nil {
-		return fmt.Errorf("kalshi: marshal request body: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(data))
-	if err != nil {
-		return fmt.Errorf("kalshi: build POST request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	if err := c.sign(req, path); err != nil {
-		return err
-	}
-
-	return c.do(ctx, req, out)
-}
-
-func (c *Client) delete(ctx context.Context, path string, out interface{}) error {
-	ctx, cancel := withCallDeadline(ctx)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.baseURL+path, nil)
-	if err != nil {
-		return fmt.Errorf("kalshi: build DELETE request: %w", err)
-	}
-
 	if err := c.sign(req, path); err != nil {
 		return err
 	}

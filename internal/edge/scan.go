@@ -1,7 +1,6 @@
 package edge
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -10,12 +9,14 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"time"
+
+	"github.com/bytedance/sonic"
 
 	"github.com/wh0o0pz/isobar/internal/calibration/bayesian"
 	"github.com/wh0o0pz/isobar/internal/calibration/climate"
 	"github.com/wh0o0pz/isobar/internal/calibration/mos"
+	"github.com/wh0o0pz/isobar/internal/market"
 	"github.com/wh0o0pz/isobar/internal/replay"
 )
 
@@ -197,6 +198,11 @@ type Result struct {
 	// EntryFilterName echoes opts.EntryFilter so the markdown summary
 	// can report which filter ran. Empty string means no filter.
 	EntryFilterName string
+
+	// EdgeThresholdCents echoes the (defaulted) entry threshold that
+	// gated backtest entries, so reports can label edge-band sections
+	// with the value that actually ran instead of assuming the default.
+	EdgeThresholdCents int
 }
 
 // Scan walks the data tree, pairs each Kalshi trade event with the
@@ -229,18 +235,19 @@ func Scan(opts ScanOptions) (*Result, error) {
 	// "admit everything", which keeps the scan running. The warning
 	// makes a typo'd flag impossible to miss in operator logs.
 	if !isKnownEntryFilter(opts.EntryFilter) {
-		log.Printf("edge: WARNING — unknown EntryFilter %q; falling through to no-op admit (no filtering applied). Known names: \"\", \"none\", \"h4\".",
-			opts.EntryFilter)
+		log.Printf("edge: WARNING — unknown EntryFilter %q; falling through to no-op admit (no filtering applied). Known names: %s.",
+			opts.EntryFilter, knownEntryFilterNames())
 	}
 
 	res := &Result{
-		SkippedReason:   map[string]int{},
-		BacktestEnabled: opts.Truth != nil,
-		MOSEnabled:      opts.MOS != nil,
-		ClimateEnabled:  opts.Climate != nil,
-		BayesEnabled:    opts.BayesianKernel != nil && opts.HourlyObs != nil,
-		FeeMode:         opts.FeeMode,
-		EntryFilterName: opts.EntryFilter,
+		SkippedReason:      map[string]int{},
+		BacktestEnabled:    opts.Truth != nil,
+		MOSEnabled:         opts.MOS != nil,
+		ClimateEnabled:     opts.Climate != nil,
+		BayesEnabled:       opts.BayesianKernel != nil && opts.HourlyObs != nil,
+		FeeMode:            opts.FeeMode,
+		EntryFilterName:    opts.EntryFilter,
+		EdgeThresholdCents: opts.EdgeThresholdCents,
 	}
 
 	kalshiFiles, err := dailyFiles(filepath.Join(opts.DataDir, "kalshi"), opts.StartDate, opts.EndDate)
@@ -259,353 +266,27 @@ func Scan(opts ScanOptions) (*Result, error) {
 		return nil, fmt.Errorf("collect siblings: %w", err)
 	}
 
-	// Once-per-distinct-pair throttle for "observed vs fit" model-set
-	// mismatch warnings, so a single misconfigured run doesn't flood the
-	// logs with one line per trade.
-	var mmLogOnce sync.Map // key = "obs|fit" string → struct{}
 	var fitModelSet []string
 	if opts.MOS != nil {
 		fitModelSet = mos.CanonicalModelSet(opts.MOS.FitModelSet)
 		if len(fitModelSet) == 0 {
 			// Defensive: an in-memory Coefficients{} built without
 			// LoadCoefficients may have no FitModelSet. Log a single
-			// warning and proceed; the per-trade guard below will skip
-			// every MOS apply via the model_set_mismatch branch.
+			// warning and proceed; the per-trade guard will skip every
+			// MOS apply via the model_set_mismatch branch.
 			log.Printf("edge: MOSCoefficients.FitModelSet is empty; MOS will not be applied to any row")
 		}
 	}
 
-	err = replay.ForEachFrame(kalshiFiles, func(env replay.Envelope, _ int, _ bool) error {
-		res.TotalFrames++
-		var kf replay.KalshiFrame
-		if decodeErr := json.Unmarshal(env.Payload, &kf); decodeErr != nil {
-			res.SkippedReason["kalshi_frame_decode_error"]++
-			return nil //nolint:nilerr // malformed frames are counted and skipped, not fatal to a scan
-		}
-		if kf.Type != "trade" {
-			return nil
-		}
-		res.TradeFrames++
-
-		var msg tradeMsg
-		if decodeErr := json.Unmarshal(kf.Msg, &msg); decodeErr != nil {
-			res.SkippedReason["trade_decode_error"]++
-			return nil //nolint:nilerr // malformed trade messages are counted and skipped
-		}
-		spec, parseErr := ParseTicker(msg.MarketTicker)
-		if parseErr != nil {
-			res.SkippedReason["non_weather_ticker"]++
-			return nil //nolint:nilerr // non-weather tickers are expected noise in the tape
-		}
-		res.WeatherTrades++
-
-		// Find most-recent poll for this station.
-		station := spec.Station()
-		tradeTime := time.Unix(0, msg.TSMs*int64(time.Millisecond)).UTC()
-		poll, pollTime, ok := idx.latest(station, tradeTime)
-		if !ok {
-			res.SkippedReason["no_poll_for_station"]++
-			return nil
-		}
-		age := tradeTime.Sub(pollTime)
-		if age > opts.MaxPollAge {
-			res.SkippedReason["poll_too_old"]++
-			return nil
-		}
-
-		tz, tzErr := stationLocation(station)
-		if tzErr != nil {
-			res.SkippedReason["unknown_station_tz"]++
-			return nil //nolint:nilerr // unknown stations are counted and skipped
-		}
-		extremes, skipped, extremesErr := poll.DailyExtremesFWithSkip(spec.ValidDate, tz)
-		if extremesErr != nil {
-			if errors.Is(extremesErr, ErrInsufficientCoverage) {
-				res.SkippedReason["insufficient_poll_coverage"]++
-				return nil //nolint:nilerr // partial polls are counted and skipped
-			}
-			return fmt.Errorf("daily extremes: %w", extremesErr)
-		}
-		// Diagnostic: how many ensemble members were dropped for partial
-		// coverage on this trade-poll pairing. Aggregate counter only —
-		// not a per-row field, since the row's NMembers already reflects
-		// the surviving subset.
-		res.MembersSkipped += skipped
-
-		// Resolution. T-brackets default to high-side (≥ K). The first-pass
-		// scan over Kalshi files (above) groups every observed Spec by
-		// (series, valid_date) so ResolveWithSiblings can flip a T-bracket
-		// to low-side when its key sits below the lowest sibling B-bracket
-		// midpoint. The bracket convention was previously marked FIXME
-		// and is now closed (see resolution.go and its tests).
-		sibKey := siblingKey(spec.Series, spec.ValidDate)
-		resolution := ResolveWithSiblings(spec, siblings[sibKey])
-
-		// Naive p_fair = fraction of members whose daily extreme falls in
-		// the bracket. KXHIGH* uses TMAX, KXLOWT* uses TMIN. We also sum
-		// the per-member extreme to compute the ensemble mean that feeds
-		// the MOS calibrator below.
-		nIn := 0
-		var sumT float64
-		for _, md := range extremes {
-			t := md.TMaxF
-			if !spec.IsHigh() {
-				t = md.TMinF
-			}
-			sumT += t
-			if resolution.Contains(t) {
-				nIn++
-			}
-		}
-		nMembers := len(extremes)
-		pFairNaive := float64(nIn) / float64(nMembers)
-
-		// variable is reused by both the MOS Predict() and the
-		// Climate.RangeProb() paths below.
-		variable := "tmax"
-		if !spec.IsHigh() {
-			variable = "tmin"
-		}
-
-		// MOS-calibrated p_fair, if coefficients were provided. We feed
-		// the ensemble mean into the fitted (μ=a+b·f, σ) and integrate
-		// the normal across the bracket [Lo, Hi). Skip paths:
-		//   - no coefficients loaded                  → "no_coeffs"
-		//   - model-set mismatch (observed vs fit)    → "model_set_mismatch:<obs>vs<fit>"
-		//   - no fitted bin for (station, season, variable) → "no_bin"
-		// All fall back to naive p_fair so the backtest never silently
-		// disappears them.
-		pFair := pFairNaive
-		var (
-			pFairMOS      float64
-			mosApplied    bool
-			mosSkipReason string
-			// MOS prior (μ, σ); preserved across the switch so the
-			// Bayesian path below can fold in the running extremum
-			// without re-running Predict.
-			mosMu, mosSigma float64
-		)
-		switch {
-		case opts.MOS == nil:
-			mosSkipReason = "no_coeffs"
-		case len(fitModelSet) == 0:
-			// Coefficients with empty FitModelSet — treat as a fatal
-			// mismatch for every poll. Logged once at the top of Scan.
-			obsModelSet := poll.ModelSet
-			mosSkipReason = fmt.Sprintf("model_set_mismatch:%svs",
-				strings.Join(obsModelSet, "+"))
-			res.SkippedReason[mosSkipReason]++
-		default:
-			obsModelSet := poll.ModelSet
-			if !mos.ModelSetEqual(obsModelSet, fitModelSet) {
-				key := strings.Join(obsModelSet, "+") + "|" + strings.Join(fitModelSet, "+")
-				if _, loaded := mmLogOnce.LoadOrStore(key, struct{}{}); !loaded {
-					log.Printf("edge: MOS model-set mismatch — observed=%v fit=%v; falling back to naive p_fair",
-						obsModelSet, fitModelSet)
-				}
-				mosSkipReason = fmt.Sprintf("model_set_mismatch:%svs%s",
-					strings.Join(obsModelSet, "+"), strings.Join(fitModelSet, "+"))
-				res.SkippedReason[mosSkipReason]++
-			} else {
-				mean := sumT / float64(nMembers)
-				mu, sigma, ok := opts.MOS.Predict(station, spec.ValidDate, variable, mean)
-				if ok {
-					pFairMOS = mos.ProbBelow(resolution.Hi, mu, sigma) -
-						mos.ProbBelow(resolution.Lo, mu, sigma)
-					if pFairMOS < 0 {
-						pFairMOS = 0
-					}
-					if pFairMOS > 1 {
-						pFairMOS = 1
-					}
-					pFair = pFairMOS
-					mosApplied = true
-					mosMu, mosSigma = mu, sigma
-				} else {
-					mosSkipReason = "no_bin"
-				}
-			}
-		}
-
-		// Bayesian posterior update (ADR-0010): fold the running
-		// extremum at trade time into the MOS prior. Only applies
-		// when MOS itself was applied; otherwise we have no Gaussian
-		// prior to update.
-		var (
-			pFairBayes        float64
-			bayesApplied      bool
-			bayesSkipReason   string
-			bayesRunningTempF float64
-			bayesHRemain      int
-			bayesObsWeight    float64
-		)
-		if opts.BayesianKernel != nil && opts.HourlyObs != nil {
-			switch {
-			case !mosApplied:
-				bayesSkipReason = "no_prior"
-			default:
-				tradeTimeUTC := time.UnixMilli(msg.TSMs).UTC()
-				r, hRemain, ok := opts.HourlyObs.RunningExtremum(station, variable, tradeTimeUTC)
-				switch {
-				case !ok:
-					bayesSkipReason = "cold_start"
-				case hRemain == 0:
-					// At settlement boundary the kernel's update path
-					// returns obs-only; for the backtest we treat it as
-					// "settled, no useful posterior update beyond R(t)".
-					bayesSkipReason = "h_remain_zero"
-				default:
-					prior := bayesian.Prior{Mu: mosMu, Sigma: mosSigma}
-					obsRec := bayesian.Observation{
-						Station:         station,
-						Variable:        variable,
-						RunningExtremum: r,
-						HoursRemaining:  hRemain,
-					}
-					post := bayesian.Update(prior, obsRec, opts.BayesianKernel)
-					if post.Method != "bayes-gauss" {
-						bayesSkipReason = post.Method // "prior-only" if bin missing
-					} else {
-						pBayes := mos.ProbBelow(resolution.Hi, post.Mu, post.Sigma) -
-							mos.ProbBelow(resolution.Lo, post.Mu, post.Sigma)
-						if pBayes < 0 {
-							pBayes = 0
-						}
-						if pBayes > 1 {
-							pBayes = 1
-						}
-						pFairBayes = pBayes
-						pFair = pBayes
-						bayesApplied = true
-						bayesRunningTempF = r
-						bayesHRemain = hRemain
-						bayesObsWeight = post.ObsWeight
-					}
-				}
-			}
-		}
-
-		priceDollars := msg.priceDollars()
-		if priceDollars < 0 {
-			res.SkippedReason["bad_trade_price"]++
-			return nil
-		}
-
-		// Climate-shrunk-naive baseline. Reported alongside p_fair as a
-		// diagnostic column; not used as the trading model.
-		climateP := math.NaN()
-		pFairClimate := math.NaN()
-		edgeClimateCents := 0
-		climateApplied := false
-		if opts.Climate != nil {
-			climateP = opts.Climate.RangeProb(station, variable, spec.ValidDate, resolution.Lo, resolution.Hi)
-			if !math.IsNaN(climateP) {
-				pFairClimate = climate.ShrinkP(pFairNaive, climateP, climate.DefaultShrinkage)
-				edgeClimateCents = EdgeAfterFeeCentsMode(pFairClimate, priceDollars, opts.FeeMode)
-				climateApplied = true
-			}
-		}
-
-		row := EdgeRow{
-			TSMs:              msg.TSMs,
-			Ticker:            spec.Ticker,
-			Series:            spec.Series,
-			ValidDate:         spec.ValidDate,
-			BracketKind:       spec.Kind.String(),
-			BracketKey:        spec.Key,
-			Side:              msg.side(),
-			TradePriceCents:   int(priceDollars*100 + 0.5),
-			PFairNaive:        pFairNaive,
-			PFairMOS:          pFairMOS,
-			PFair:             pFair,
-			MOSApplied:        mosApplied,
-			SkippedReason:     mosSkipReason,
-			ClimateP:          climateP,
-			PFairClimate:      pFairClimate,
-			ClimateApplied:    climateApplied,
-			EdgeClimateCents:  edgeClimateCents,
-			PFairBayes:        pFairBayes,
-			BayesApplied:      bayesApplied,
-			BayesSkipReason:   bayesSkipReason,
-			BayesRunningTempF: bayesRunningTempF,
-			BayesHRemain:      bayesHRemain,
-			BayesObsWeight:    bayesObsWeight,
-			NMembers:          nMembers,
-			NMembersInBkt:     nIn,
-			PollAgeS:          int(age.Seconds()),
-			FeeCents:          FeePerContractCentsMode(priceDollars, opts.FeeMode),
-			EdgeCents:         EdgeAfterFeeCentsMode(pFair, priceDollars, opts.FeeMode),
-		}
-
-		// Realized-PnL backtest path. If no truth available we skip with a
-		// reason — this is the user's "no imaginary bets" rule: never score
-		// a trade whose outcome we can't look up.
-		if opts.Truth != nil {
-			truth, ok := opts.Truth.Get(station, spec.ValidDate)
-			if !ok {
-				res.SkippedReason["no_truth_available"]++
-				return nil
-			}
-			row.HasTruth = true
-			actual := truth.TMaxF
-			if !spec.IsHigh() {
-				actual = truth.TMinF
-			}
-			row.ActualTempF = actual
-			row.YesResolved = resolution.Contains(float64(actual))
-
-			// Decide hypothetical action: take the side with the larger
-			// post-fee edge, if it clears the threshold AND the named
-			// entry filter (if any) admits this trade.
-			noPriceDollars := 1 - priceDollars
-			fee := FeePerContractCentsMode(priceDollars, opts.FeeMode)
-			edgeYesCents := int(pFair*100+0.5) - row.TradePriceCents - fee
-			edgeNoCents := int((1-pFair)*100+0.5) - int(noPriceDollars*100+0.5) - fee
-
-			filterAdmits := entryFilterAdmits(opts.EntryFilter, spec.Series, row.TradePriceCents)
-
-			switch {
-			case filterAdmits && edgeYesCents >= opts.EdgeThresholdCents && edgeYesCents >= edgeNoCents:
-				row.OurSide = "yes"
-				if row.YesResolved {
-					row.OurPnLCents = 100 - row.TradePriceCents - fee
-				} else {
-					row.OurPnLCents = -row.TradePriceCents - fee
-				}
-			case filterAdmits && edgeNoCents >= opts.EdgeThresholdCents:
-				row.OurSide = "no"
-				noPriceCents := 100 - row.TradePriceCents
-				if !row.YesResolved {
-					row.OurPnLCents = 100 - noPriceCents - fee
-				} else {
-					row.OurPnLCents = -noPriceCents - fee
-				}
-			default:
-				// no edge OR filter excluded — skip the trade (PnL = 0, OurSide = "")
-			}
-
-			if row.OurSide != "" {
-				res.TradesEntered++
-				if row.OurPnLCents > 0 {
-					res.TradesWon++
-				}
-				res.TotalPnLCents += row.OurPnLCents
-			}
-		}
-
-		res.Rows = append(res.Rows, row)
-		res.PairedTrades++
-		if row.MOSApplied {
-			res.MOSApplied++
-		}
-		if row.ClimateApplied {
-			res.ClimateApplied++
-		}
-		if row.BayesApplied {
-			res.BayesApplied++
-		}
-		return nil
-	})
+	s := &scanner{
+		opts:        opts,
+		res:         res,
+		idx:         idx,
+		siblings:    siblings,
+		fitModelSet: fitModelSet,
+		mmLogged:    map[string]struct{}{},
+	}
+	err = replay.ForEachFrame(kalshiFiles, s.processFrame)
 	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, err
 	}
@@ -614,38 +295,540 @@ func Scan(opts ScanOptions) (*Result, error) {
 	return res, nil
 }
 
-// pollModelSet returns the canonical sorted model set observed in the
-// poll, derived from member-ID prefixes. Bare numeric IDs ("00".."30")
-// are GFS (single-model default). Prefixed IDs like
+// scanner threads the per-run state through the frame walk. ForEachFrame
+// is strictly sequential, so none of this needs synchronization.
+type scanner struct {
+	opts        ScanOptions
+	res         *Result
+	idx         *pollIndex
+	siblings    map[string][]Spec
+	fitModelSet []string
+	// mmLogged throttles "observed vs fit" model-set mismatch warnings
+	// to once per distinct pair, so a single misconfigured run doesn't
+	// flood the logs with one line per trade.
+	mmLogged map[string]struct{}
+}
+
+// processFrame decodes one journal frame, filters it down to a weather
+// trade, and hands it to processTrade. Malformed frames and non-weather
+// tickers are counted and skipped — expected tape noise, never fatal.
+func (s *scanner) processFrame(env replay.Envelope, _ int, _ bool) error {
+	s.res.TotalFrames++
+	var kf replay.KalshiFrame
+	if decodeErr := sonic.Unmarshal(env.Payload, &kf); decodeErr != nil {
+		s.res.SkippedReason["kalshi_frame_decode_error"]++
+		return nil //nolint:nilerr // malformed frames are counted and skipped, not fatal to a scan
+	}
+	if kf.Type != "trade" {
+		return nil
+	}
+	s.res.TradeFrames++
+
+	var msg tradeMsg
+	if decodeErr := sonic.Unmarshal(kf.Msg, &msg); decodeErr != nil {
+		s.res.SkippedReason["trade_decode_error"]++
+		return nil //nolint:nilerr // malformed trade messages are counted and skipped
+	}
+	spec, parseErr := ParseTicker(msg.MarketTicker)
+	if parseErr != nil {
+		s.res.SkippedReason["non_weather_ticker"]++
+		return nil //nolint:nilerr // non-weather tickers are expected noise in the tape
+	}
+	s.res.WeatherTrades++
+	return s.processTrade(spec, msg)
+}
+
+// processTrade runs the pipeline for one weather trade: pair it to the
+// freshest poll, resolve the bracket, layer the probability models
+// (naive → MOS → Bayes, plus the climate diagnostic), and score + record
+// the row. Unpairable trades increment a SkippedReason counter and drop.
+func (s *scanner) processTrade(spec Spec, msg tradeMsg) error {
+	station := spec.Station()
+	tradeTime := time.Unix(0, msg.TSMs*int64(time.Millisecond)).UTC()
+	poll, pollTime, ok := s.idx.latest(station, tradeTime)
+	if !ok {
+		s.res.SkippedReason["no_poll_for_station"]++
+		return nil
+	}
+	age := tradeTime.Sub(pollTime)
+	if age > s.opts.MaxPollAge {
+		s.res.SkippedReason["poll_too_old"]++
+		return nil
+	}
+
+	tz, tzErr := market.StationTZ(station)
+	if tzErr != nil {
+		s.res.SkippedReason["unknown_station_tz"]++
+		return nil //nolint:nilerr // unknown stations are counted and skipped
+	}
+	extremes, skipped, extremesErr := poll.DailyExtremesFWithSkip(spec.ValidDate, tz)
+	if extremesErr != nil {
+		if errors.Is(extremesErr, ErrInsufficientCoverage) {
+			s.res.SkippedReason["insufficient_poll_coverage"]++
+			return nil //nolint:nilerr // partial polls are counted and skipped
+		}
+		return fmt.Errorf("daily extremes: %w", extremesErr)
+	}
+	// Diagnostic: how many ensemble members were dropped for partial
+	// coverage on this trade-poll pairing. Aggregate counter only —
+	// not a per-row field, since the row's NMembers already reflects
+	// the surviving subset.
+	s.res.MembersSkipped += skipped
+
+	// Resolution. T-brackets default to high-side (≥ K). collectSiblings
+	// grouped every observed Spec by (series, valid_date) so
+	// ResolveWithSiblings can flip a T-bracket to low-side when its key
+	// sits below the lowest sibling B-bracket midpoint.
+	resolution := ResolveWithSiblings(spec, s.siblings[siblingKey(spec.Series, spec.ValidDate)])
+
+	pFairNaive, nIn, sumT := naiveEnsembleStats(spec.IsHigh(), extremes, resolution)
+	nMembers := len(extremes)
+	variable := spec.Variable()
+
+	// MOS-calibrated p_fair, if coefficients were provided. applyMOS
+	// integrates the fitted normal across the bracket and, on any skip
+	// path, leaves p_fair on the naive estimate. It also surfaces the
+	// (μ, σ) prior the Bayesian path below folds the running extremum
+	// into, plus the SkippedReason key to count (empty when none).
+	m := applyMOS(mosInputs{
+		coeffs:      s.opts.MOS,
+		poll:        poll,
+		station:     station,
+		validDate:   spec.ValidDate,
+		variable:    variable,
+		resolution:  resolution,
+		sumT:        sumT,
+		nMembers:    nMembers,
+		fitModelSet: s.fitModelSet,
+		logged:      s.mmLogged,
+	})
+	pFair := pFairNaive
+	if m.applied {
+		pFair = m.pFairMOS
+	}
+	if m.countReason != "" {
+		s.res.SkippedReason[m.countReason]++
+	}
+
+	// Bayesian posterior update (ADR-0010): fold the running extremum
+	// at trade time into the MOS prior. Only applies when MOS itself
+	// applied (we need a Gaussian prior to update); the (μ, σ) come
+	// straight from applyMOS above.
+	b := applyBayes(bayesInputs{
+		kernel:     s.opts.BayesianKernel,
+		obs:        s.opts.HourlyObs,
+		station:    station,
+		variable:   variable,
+		tsMs:       msg.TSMs,
+		resolution: resolution,
+		mosApplied: m.applied,
+		priorMu:    m.mu,
+		priorSigma: m.sigma,
+	})
+	if b.applied {
+		pFair = b.pFairBayes
+	}
+
+	priceDollars := msg.priceDollars()
+	if priceDollars < 0 {
+		s.res.SkippedReason["bad_trade_price"]++
+		return nil
+	}
+
+	// Climate-shrunk-naive baseline. Reported alongside p_fair as a
+	// diagnostic column; not used as the trading model.
+	c := applyClimate(climateInputs{
+		lookup:     s.opts.Climate,
+		station:    station,
+		variable:   variable,
+		validDate:  spec.ValidDate,
+		resolution: resolution,
+		pFairNaive: pFairNaive,
+		price:      priceDollars,
+		feeMode:    s.opts.FeeMode,
+	})
+
+	row := EdgeRow{
+		TSMs:              msg.TSMs,
+		Ticker:            spec.Ticker,
+		Series:            spec.Series,
+		ValidDate:         spec.ValidDate,
+		BracketKind:       spec.Kind.String(),
+		BracketKey:        spec.Key,
+		Side:              msg.side(),
+		TradePriceCents:   int(priceDollars*100 + 0.5),
+		PFairNaive:        pFairNaive,
+		PFairMOS:          m.pFairMOS,
+		PFair:             pFair,
+		MOSApplied:        m.applied,
+		SkippedReason:     m.skipReason,
+		ClimateP:          c.climateP,
+		PFairClimate:      c.pFairClimate,
+		ClimateApplied:    c.applied,
+		EdgeClimateCents:  c.edgeClimateCents,
+		PFairBayes:        b.pFairBayes,
+		BayesApplied:      b.applied,
+		BayesSkipReason:   b.skipReason,
+		BayesRunningTempF: b.runningTempF,
+		BayesHRemain:      b.hRemain,
+		BayesObsWeight:    b.obsWeight,
+		NMembers:          nMembers,
+		NMembersInBkt:     nIn,
+		PollAgeS:          int(age.Seconds()),
+		FeeCents:          FeePerContractCentsMode(priceDollars, s.opts.FeeMode),
+		EdgeCents:         EdgeAfterFeeCentsMode(pFair, priceDollars, s.opts.FeeMode),
+	}
+
+	// Realized-PnL backtest path. If no truth available we skip with a
+	// reason — this is the user's "no imaginary bets" rule: never score
+	// a trade whose outcome we can't look up.
+	if s.opts.Truth != nil {
+		bt, ok := scoreBacktestRow(backtestInputs{
+			truth:         s.opts.Truth,
+			station:       station,
+			validDate:     spec.ValidDate,
+			series:        spec.Series,
+			isHigh:        spec.IsHigh(),
+			resolution:    resolution,
+			pFair:         pFair,
+			price:         priceDollars,
+			tradePrice:    row.TradePriceCents,
+			feeMode:       s.opts.FeeMode,
+			entryFilter:   s.opts.EntryFilter,
+			edgeThreshold: s.opts.EdgeThresholdCents,
+		})
+		if !ok {
+			s.res.SkippedReason["no_truth_available"]++
+			return nil
+		}
+		row.HasTruth = true
+		row.ActualTempF = bt.actualTempF
+		row.YesResolved = bt.yesResolved
+		row.OurSide = bt.ourSide
+		row.OurPnLCents = bt.ourPnLCents
+
+		if row.OurSide != "" {
+			s.res.TradesEntered++
+			if row.OurPnLCents > 0 {
+				s.res.TradesWon++
+			}
+			s.res.TotalPnLCents += row.OurPnLCents
+		}
+	}
+
+	s.res.Rows = append(s.res.Rows, row)
+	s.res.PairedTrades++
+	if row.MOSApplied {
+		s.res.MOSApplied++
+	}
+	if row.ClimateApplied {
+		s.res.ClimateApplied++
+	}
+	if row.BayesApplied {
+		s.res.BayesApplied++
+	}
+	return nil
+}
+
+// naiveEnsembleStats computes the naive p_fair — the fraction of ensemble
+// members whose daily extreme falls in the bracket (TMAX for KXHIGH*,
+// TMIN for KXLOWT*) — plus the member-extreme sum that feeds the MOS
+// ensemble mean. Callers guarantee extremes is non-empty
+// (DailyExtremesFWithSkip errors instead of returning an empty map).
+func naiveEnsembleStats(isHigh bool, extremes map[string]MemberDaily, res Resolution) (pFair float64, nIn int, sumT float64) {
+	for _, md := range extremes {
+		t := md.TMaxF
+		if !isHigh {
+			t = md.TMinF
+		}
+		sumT += t
+		if res.Contains(t) {
+			nIn++
+		}
+	}
+	return float64(nIn) / float64(len(extremes)), nIn, sumT
+}
+
+// bracketProb integrates a fitted normal (μ, σ) across the half-open
+// bracket [lo, hi) and clamps the result into [0, 1]. Both the MOS and
+// Bayesian p_fair paths price a bracket this way.
+func bracketProb(lo, hi, mu, sigma float64) float64 {
+	p := mos.ProbBelow(hi, mu, sigma) - mos.ProbBelow(lo, mu, sigma)
+	if p < 0 {
+		return 0
+	}
+	if p > 1 {
+		return 1
+	}
+	return p
+}
+
+// mosInputs bundles the per-trade inputs applyMOS reads. It is passed by
+// value; every field is a scalar, string, or pointer already live on the
+// scan hot path, so no additional allocation occurs.
+type mosInputs struct {
+	coeffs      *mos.Coefficients
+	poll        *Poll
+	station     string
+	validDate   time.Time
+	variable    string
+	resolution  Resolution
+	sumT        float64
+	nMembers    int
+	fitModelSet []string
+	// logged is the once-per-distinct-pair mismatch-warning throttle,
+	// keyed "obs|fit". Plain map: the scan walk is single-threaded.
+	logged map[string]struct{}
+}
+
+// mosResult is the by-value contribution of the MOS calibration step.
+// pFairMOS is 0 unless applied; mu/sigma carry the fitted prior forward to
+// the Bayesian update. countReason, when non-empty, is the Result
+// SkippedReason key the caller must increment (the aggregate side-effect
+// kept out of this otherwise-pure helper). skipReason is the per-row tag.
+type mosResult struct {
+	pFairMOS    float64
+	applied     bool
+	skipReason  string
+	countReason string
+	mu, sigma   float64
+}
+
+// applyMOS computes the MOS-calibrated p_fair contribution for one trade.
+// On every skip path it leaves applied=false so the caller keeps the naive
+// estimate; the model-set-mismatch paths also emit a once-per-distinct-pair
+// warning via in.logged. See the mos-prior/model-set-guard discussion in
+// docs/CALIBRATION.md.
+func applyMOS(in mosInputs) mosResult {
+	switch {
+	case in.coeffs == nil:
+		return mosResult{skipReason: "no_coeffs"}
+	case len(in.fitModelSet) == 0:
+		// Coefficients with empty FitModelSet — treat as a fatal mismatch
+		// for every poll. Logged once at the top of Scan.
+		obs := in.poll.ModelSet
+		reason := fmt.Sprintf("model_set_mismatch:%svs", strings.Join(obs, "+"))
+		return mosResult{skipReason: reason, countReason: reason}
+	default:
+		obs := in.poll.ModelSet
+		if !mos.ModelSetEqual(obs, in.fitModelSet) {
+			key := strings.Join(obs, "+") + "|" + strings.Join(in.fitModelSet, "+")
+			if _, loaded := in.logged[key]; !loaded {
+				in.logged[key] = struct{}{}
+				log.Printf("edge: MOS model-set mismatch — observed=%v fit=%v; falling back to naive p_fair",
+					obs, in.fitModelSet)
+			}
+			reason := fmt.Sprintf("model_set_mismatch:%svs%s",
+				strings.Join(obs, "+"), strings.Join(in.fitModelSet, "+"))
+			return mosResult{skipReason: reason, countReason: reason}
+		}
+		mean := in.sumT / float64(in.nMembers)
+		mu, sigma, ok := in.coeffs.Predict(in.station, in.validDate, in.variable, mean)
+		if !ok {
+			return mosResult{skipReason: "no_bin"}
+		}
+		return mosResult{
+			pFairMOS: bracketProb(in.resolution.Lo, in.resolution.Hi, mu, sigma),
+			applied:  true,
+			mu:       mu,
+			sigma:    sigma,
+		}
+	}
+}
+
+// bayesInputs bundles the per-trade inputs applyBayes reads. priorMu and
+// priorSigma are the MOS-fitted prior handed off from applyMOS; the update
+// only runs when mosApplied is true.
+type bayesInputs struct {
+	kernel     *bayesian.Kernel
+	obs        *bayesian.HourlyIndex
+	station    string
+	variable   string
+	tsMs       int64
+	resolution Resolution
+	mosApplied bool
+	priorMu    float64
+	priorSigma float64
+}
+
+// bayesResult is the by-value contribution of the Bayesian posterior
+// update. pFairBayes is 0 unless applied; the caller overwrites p_fair with
+// it only when applied is true (last-writer-wins: naive → MOS → Bayes).
+type bayesResult struct {
+	pFairBayes   float64
+	applied      bool
+	skipReason   string
+	runningTempF float64
+	hRemain      int
+	obsWeight    float64
+}
+
+// applyBayes folds the running extremum at trade time into the MOS prior
+// (ADR-0010). It no-ops (returns applied=false, empty skipReason) when no
+// kernel/obs index is configured, mirroring the "silently skipped" contract
+// in ScanOptions.BayesianKernel's doc.
+func applyBayes(in bayesInputs) bayesResult {
+	if in.kernel == nil || in.obs == nil {
+		return bayesResult{}
+	}
+	if !in.mosApplied {
+		return bayesResult{skipReason: "no_prior"}
+	}
+	tradeTimeUTC := time.UnixMilli(in.tsMs).UTC()
+	r, hRemain, ok := in.obs.RunningExtremum(in.station, in.variable, tradeTimeUTC)
+	switch {
+	case !ok:
+		return bayesResult{skipReason: "cold_start"}
+	case hRemain == 0:
+		// At the settlement boundary the kernel's update path returns
+		// obs-only; for the backtest we treat it as "settled, no useful
+		// posterior update beyond R(t)".
+		return bayesResult{skipReason: "h_remain_zero"}
+	}
+	prior := bayesian.Prior{Mu: in.priorMu, Sigma: in.priorSigma}
+	obsRec := bayesian.Observation{
+		Station:         in.station,
+		Variable:        in.variable,
+		RunningExtremum: r,
+		HoursRemaining:  hRemain,
+	}
+	post := bayesian.Update(prior, obsRec, in.kernel)
+	if post.Method != "bayes-gauss" {
+		return bayesResult{skipReason: post.Method} // "prior-only" if bin missing
+	}
+	return bayesResult{
+		pFairBayes:   bracketProb(in.resolution.Lo, in.resolution.Hi, post.Mu, post.Sigma),
+		applied:      true,
+		runningTempF: r,
+		hRemain:      hRemain,
+		obsWeight:    post.ObsWeight,
+	}
+}
+
+// climateInputs bundles the per-trade inputs applyClimate reads.
+type climateInputs struct {
+	lookup     *climate.Lookup
+	station    string
+	variable   string
+	validDate  time.Time
+	resolution Resolution
+	pFairNaive float64
+	price      float64
+	feeMode    FeeMode
+}
+
+// climateResult is the by-value climate-shrunk-naive baseline. climateP and
+// pFairClimate are NaN when no lookup is configured or no historical
+// observations match (applied=false), matching the EdgeRow field contract.
+type climateResult struct {
+	climateP         float64
+	pFairClimate     float64
+	edgeClimateCents int
+	applied          bool
+}
+
+// applyClimate computes the climate-shrunk-naive diagnostic p_fair. It is
+// reported alongside p_fair, never used as the trading model.
+func applyClimate(in climateInputs) climateResult {
+	out := climateResult{climateP: math.NaN(), pFairClimate: math.NaN()}
+	if in.lookup == nil {
+		return out
+	}
+	out.climateP = in.lookup.RangeProb(in.station, in.variable, in.validDate, in.resolution.Lo, in.resolution.Hi)
+	if math.IsNaN(out.climateP) {
+		return out
+	}
+	out.pFairClimate = climate.ShrinkP(in.pFairNaive, out.climateP, climate.DefaultShrinkage)
+	out.edgeClimateCents = EdgeAfterFeeCentsMode(out.pFairClimate, in.price, in.feeMode)
+	out.applied = true
+	return out
+}
+
+// backtestInputs bundles the inputs scoreBacktestRow reads.
+type backtestInputs struct {
+	truth         *TruthIndex
+	station       string
+	validDate     time.Time
+	series        string
+	isHigh        bool
+	resolution    Resolution
+	pFair         float64
+	price         float64
+	tradePrice    int
+	feeMode       FeeMode
+	entryFilter   string
+	edgeThreshold int
+}
+
+// backtestResult is the realized-PnL decision for one trade. actualTempF /
+// yesResolved describe the settled outcome; ourSide is "yes"/"no"/"" and
+// ourPnLCents is the realized PnL after entry fee (0 when ourSide is "").
+type backtestResult struct {
+	actualTempF int
+	yesResolved bool
+	ourSide     string
+	ourPnLCents int
+}
+
+// scoreBacktestRow decides the hypothetical action and its realized PnL,
+// pricing the NO leg off a single canonical NO cost (100 − tradePrice) for
+// both the entry-edge decision and settlement so the two never diverge by
+// the sub-cent 1¢ rounding gap. Returns ok=false when truth is unavailable
+// for (station, valid_date) — the caller counts that as "no_truth_available"
+// and drops the trade (the "no imaginary bets" rule).
+func scoreBacktestRow(in backtestInputs) (backtestResult, bool) {
+	truth, ok := in.truth.Get(in.station, in.validDate)
+	if !ok {
+		return backtestResult{}, false
+	}
+	actual := truth.TMaxF
+	if !in.isHigh {
+		actual = truth.TMinF
+	}
+	out := backtestResult{
+		actualTempF: actual,
+		yesResolved: in.resolution.Contains(float64(actual)),
+	}
+
+	noPriceCents := 100 - in.tradePrice
+	fee := FeePerContractCentsMode(in.price, in.feeMode)
+	edgeYesCents := int(in.pFair*100+0.5) - in.tradePrice - fee
+	edgeNoCents := int((1-in.pFair)*100+0.5) - noPriceCents - fee
+
+	filterAdmits := entryFilterAdmits(in.entryFilter, in.series, in.tradePrice)
+
+	switch {
+	case filterAdmits && edgeYesCents >= in.edgeThreshold && edgeYesCents >= edgeNoCents:
+		out.ourSide = "yes"
+		if out.yesResolved {
+			out.ourPnLCents = 100 - in.tradePrice - fee
+		} else {
+			out.ourPnLCents = -in.tradePrice - fee
+		}
+	case filterAdmits && edgeNoCents >= in.edgeThreshold:
+		out.ourSide = "no"
+		if !out.yesResolved {
+			out.ourPnLCents = 100 - noPriceCents - fee
+		} else {
+			out.ourPnLCents = -noPriceCents - fee
+		}
+	default:
+		// no edge OR filter excluded — skip the trade (PnL = 0, ourSide = "")
+	}
+	return out, true
+}
+
+// pollModelSetFromMembers returns the canonical sorted model set for a
+// poll, derived from its member-ID prefixes. Bare numeric IDs
+// ("00".."30") are GFS (single-model default). Prefixed IDs like
 // "ncep_gefs_seamless:NN" / "ecmwf_ifs025_ensemble:NN" canonicalize to
 // the short tags mos.ModelGFS / mos.ModelECMWF respectively so they can
 // be compared against [mos.Coefficients.FitModelSet] via
 // [mos.ModelSetEqual].
 //
-// This signature takes the post-coverage-filter extremes map because
-// historically the scan hot path passed that view. In the typical case
-// (all members surviving the [MinHourlySamplesPerMember] check) it
-// agrees with [pollModelSetFromMembers] computed from the full member
-// set. The pathological case — every member of an ENTIRE model failing
-// coverage on the same poll — would yield a smaller set here than the
-// precomputed [Poll.ModelSet]; that case is rare enough that A11 caches
-// the full-member view and surfaces such polls as model-set mismatches
-// (which they functionally are). Retained for the cache-consistency
-// regression test and as the canonical derivation reference.
-func pollModelSet(extremes map[string]MemberDaily) []string {
-	if len(extremes) == 0 {
-		return nil
-	}
-	tags := make([]string, 0, 2)
-	for id := range extremes {
-		tags = append(tags, memberModelTag(id))
-	}
-	return mos.CanonicalModelSet(tags)
-}
-
-// pollModelSetFromMembers is the [pollModelSet] equivalent that operates
-// directly on [Poll.Members]. Used by [ParsePoll] to precompute
-// [Poll.ModelSet] once per poll-load instead of per trade.
+// [ParsePoll] calls this once per poll-load to precompute [Poll.ModelSet];
+// the scan hot path then reads that field directly instead of recomputing
+// the set per trade.
 func pollModelSetFromMembers(members map[string][]float64) []string {
 	if len(members) == 0 {
 		return nil
@@ -703,21 +886,25 @@ func collectSiblings(kalshiFiles []string) (map[string][]Spec, error) {
 	out := map[string][]Spec{}
 	err := replay.ForEachFrame(kalshiFiles, func(env replay.Envelope, _ int, _ bool) error {
 		var kf replay.KalshiFrame
-		if decodeErr := json.Unmarshal(env.Payload, &kf); decodeErr != nil {
+		if decodeErr := sonic.Unmarshal(env.Payload, &kf); decodeErr != nil {
 			return nil //nolint:nilerr // malformed frames are silently skipped here; counted by the main scan loop
 		}
 		if kf.Type != "trade" {
 			return nil
 		}
-		var msg tradeMsg
-		if decodeErr := json.Unmarshal(kf.Msg, &msg); decodeErr != nil {
-			return nil //nolint:nilerr // malformed trade messages are silently skipped; counted by the main scan loop
-		}
-		if seenTicker[msg.MarketTicker] {
+		// The sibling map only needs each unique market_ticker's Spec, so
+		// this pass decodes just the ticker (a single-field sub-shape of
+		// Msg) rather than the full tradeMsg the main scan loop parses —
+		// halving the decode cost of this whole-tape pre-pass. Direction
+		// inference still requires the complete sibling set per bucket, so
+		// this stays a separate pass ahead of the main scan (folding it in
+		// would resolve T-brackets against a partially-built sibling map).
+		ticker := kf.MarketTicker()
+		if seenTicker[ticker] {
 			return nil
 		}
-		seenTicker[msg.MarketTicker] = true
-		spec, parseErr := ParseTicker(msg.MarketTicker)
+		seenTicker[ticker] = true
+		spec, parseErr := ParseTicker(ticker)
 		if parseErr != nil {
 			// Non-weather or malformed ticker — skip silently here; the
 			// main scan loop will count these per-trade.
@@ -733,62 +920,55 @@ func collectSiblings(kalshiFiles []string) (map[string][]Spec, error) {
 	return out, nil
 }
 
-// stationLocation returns the IANA timezone for each Kalshi-resolved
-// weather station. NWS CLI civil days are local time at the station.
-func stationLocation(station string) (*time.Location, error) {
-	switch station {
-	case "KNYC", "KMIA":
-		return time.LoadLocation("America/New_York")
-	case "KMDW":
-		return time.LoadLocation("America/Chicago")
-	case "KLAX":
-		return time.LoadLocation("America/Los_Angeles")
-	}
-	return nil, fmt.Errorf("unknown station %q", station)
-}
-
-// entryFilterAdmits returns true iff the named filter admits an entry
-// on (series, tradePriceCents). The empty filter ("") and unknown
-// filter names admit everything (no-op), matching the v0-1 behaviour
-// of "enter on any clearing edge".
+// entryFilters is the registry of named entry predicates. A predicate
+// returns true iff it admits an entry on (series, tradePriceCents).
+// Registering a filter here is the single step to ship a new one —
+// admits logic, the known-name check, and the boot-warning text all
+// read this map.
 //
-// Filter "h4" (Phase 0.5 v4): exclude KXHIGHNY entirely; require
-// either a low-temp series (KXLOWT*) OR an extreme-OTM price band
-// (≤ 9¢ or ≥ 91¢). See reports/phase0.5/2026-05-19-v4 for the
-// subset-mining + LOO-CV evidence behind these conditions.
-func entryFilterAdmits(filter, series string, tradePriceCents int) bool {
-	switch filter {
-	case "", "none":
-		return true
-	case "h4":
+// "h4" (Phase 0.5 v4): exclude KXHIGHNY entirely; require either a
+// low-temp series (KXLOWT*) OR an extreme-OTM price band (≤ 9¢ or
+// ≥ 91¢). See reports/phase0.5/2026-05-19-v4 for the subset-mining +
+// LOO-CV evidence behind these conditions.
+var entryFilters = map[string]func(series string, tradePriceCents int) bool{
+	"":     admitAll,
+	"none": admitAll,
+	"h4": func(series string, tradePriceCents int) bool {
 		if series == "KXHIGHNY" {
 			return false
 		}
-		if strings.HasPrefix(series, "KXLOWT") {
-			return true
-		}
-		if tradePriceCents <= 9 || tradePriceCents >= 91 {
-			return true
-		}
-		return false
-	default:
-		// Unknown filter name — silently fall back to "no filter" so
-		// future flag additions never accidentally skip every trade.
-		// Scan() logs a one-shot warning at boot when this branch will
-		// be taken; operators are still expected to typo-check before
-		// running 4-hour scans.
-		return true
+		return strings.HasPrefix(series, "KXLOWT") ||
+			tradePriceCents <= 9 || tradePriceCents >= 91
+	},
+}
+
+func admitAll(string, int) bool { return true }
+
+// entryFilterAdmits returns true iff the named filter admits an entry.
+// Unknown filter names admit everything (no-op) so future flag additions
+// never accidentally skip every trade — Scan() logs a one-shot warning
+// at boot when that fallback will be taken (see isKnownEntryFilter).
+func entryFilterAdmits(filter, series string, tradePriceCents int) bool {
+	if f, ok := entryFilters[filter]; ok {
+		return f(series, tradePriceCents)
 	}
+	return true
 }
 
 // isKnownEntryFilter is the predicate Scan() uses to decide whether to
-// warn about an unknown filter name. Kept next to entryFilterAdmits so
-// the two stay in sync if a new filter ships.
+// warn about an unknown filter name.
 func isKnownEntryFilter(filter string) bool {
-	switch filter {
-	case "", "none", "h4":
-		return true
-	default:
-		return false
+	_, ok := entryFilters[filter]
+	return ok
+}
+
+// knownEntryFilterNames renders the registry keys for the boot warning,
+// sorted for deterministic log output.
+func knownEntryFilterNames() string {
+	names := make([]string, 0, len(entryFilters))
+	for name := range entryFilters {
+		names = append(names, fmt.Sprintf("%q", name))
 	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
 }

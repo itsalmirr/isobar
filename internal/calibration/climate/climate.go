@@ -11,16 +11,13 @@
 package climate
 
 import (
-	"encoding/csv"
-	"errors"
 	"fmt"
-	"io"
 	"math"
-	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"time"
+
+	"github.com/wh0o0pz/isobar/internal/calibration/obscsv"
 )
 
 // DefaultShrinkage is the climate weight in `p_shrunk = w·climate_p + (1−w)·naive_p`.
@@ -72,55 +69,28 @@ func New() *Lookup {
 func (l *Lookup) Load(obsDir string, stations []string) error {
 	for _, sta := range stations {
 		path := filepath.Join(obsDir, sta+".csv")
-		f, err := os.Open(path) //nolint:gosec // path is operator-supplied calibration dir
+		rows, err := obscsv.ReadFile(path, obscsv.Options{
+			Alias:      obscsv.StrictAliases,
+			Require:    []string{obscsv.ColDate, obscsv.ColTmax, obscsv.ColTmin},
+			StrictRows: true,
+		})
 		if err != nil {
-			return fmt.Errorf("climate: open %s: %w", path, err)
-		}
-		r := csv.NewReader(f)
-		header, err := r.Read()
-		if err != nil {
-			_ = f.Close()
-			return fmt.Errorf("climate: header %s: %w", path, err)
-		}
-		col, err := requireColumns(header, "valid_date", "tmax_f", "tmin_f")
-		if err != nil {
-			_ = f.Close()
 			return fmt.Errorf("climate: %s: %w", path, err)
 		}
-		minCols := maxIndex(col) + 1
 		if l.obs[sta] == nil {
 			l.obs[sta] = map[string][]obsPoint{}
 		}
-		for {
-			rec, err := r.Read()
-			if errors.Is(err, io.EOF) {
-				break
+		for _, row := range rows {
+			md := row.Date.Format("01-02")
+			// An empty/unparseable tmax_f cell drops that variable's sample
+			// but still lets the same row contribute to tmin, and vice versa.
+			if row.TmaxPresent {
+				l.obs[sta]["tmax"] = append(l.obs[sta]["tmax"], obsPoint{md, row.Tmax})
 			}
-			if err != nil {
-				_ = f.Close()
-				return fmt.Errorf("climate: read %s: %w", path, err)
-			}
-			if len(rec) < minCols {
-				_ = f.Close()
-				return fmt.Errorf("climate: %s: short record (%d cols, need %d)", path, len(rec), minCols)
-			}
-			d, err := time.Parse("2006-01-02", rec[col["valid_date"]])
-			if err != nil {
-				continue
-			}
-			md := d.Format("01-02")
-			if s := rec[col["tmax_f"]]; s != "" {
-				if v, e := strconv.ParseFloat(s, 64); e == nil {
-					l.obs[sta]["tmax"] = append(l.obs[sta]["tmax"], obsPoint{md, v})
-				}
-			}
-			if s := rec[col["tmin_f"]]; s != "" {
-				if v, e := strconv.ParseFloat(s, 64); e == nil {
-					l.obs[sta]["tmin"] = append(l.obs[sta]["tmin"], obsPoint{md, v})
-				}
+			if row.TminPresent {
+				l.obs[sta]["tmin"] = append(l.obs[sta]["tmin"], obsPoint{md, row.Tmin})
 			}
 		}
-		_ = f.Close()
 	}
 	l.compile()
 	return nil
@@ -175,23 +145,11 @@ const SeasonWindowDays = 30
 // Implementation: O(log N) via binary search over a pre-sorted per-day
 // window slice, built at Load time. See Lookup.compile.
 func (l *Lookup) BracketProb(station, variable string, target time.Time, threshold float64, bracketAbove bool) float64 {
-	vars, ok := l.byDay[station]
+	window, ok := l.seasonWindow(station, variable, target)
 	if !ok {
 		return math.NaN()
 	}
-	table, ok := vars[variable]
-	if !ok {
-		return math.NaN()
-	}
-	doy := dayOfYear(target)
-	if doy < 1 || doy > 366 {
-		return math.NaN()
-	}
-	window := table[doy-1]
 	n := len(window)
-	if n == 0 {
-		return math.NaN()
-	}
 	// window is sorted ascending. For "above": count of values ≥ threshold
 	// = n - first-index-≥-threshold. For "below": count of values ≤
 	// threshold = last-index-≤-threshold + 1 = first-index-> threshold.
@@ -207,23 +165,11 @@ func (l *Lookup) BracketProb(station, variable string, target time.Time, thresho
 // RangeProb returns the empirical frequency of historical observations inside
 // the half-open bracket [lo, hi). Open-ended ranges are supported with +/-Inf.
 func (l *Lookup) RangeProb(station, variable string, target time.Time, lo, hi float64) float64 {
-	vars, ok := l.byDay[station]
+	window, ok := l.seasonWindow(station, variable, target)
 	if !ok {
 		return math.NaN()
 	}
-	table, ok := vars[variable]
-	if !ok {
-		return math.NaN()
-	}
-	doy := dayOfYear(target)
-	if doy < 1 || doy > 366 {
-		return math.NaN()
-	}
-	window := table[doy-1]
 	n := len(window)
-	if n == 0 {
-		return math.NaN()
-	}
 	if lo >= hi {
 		return math.NaN()
 	}
@@ -242,6 +188,29 @@ func (l *Lookup) RangeProb(station, variable string, target time.Time, lo, hi fl
 	return float64(end-start) / float64(n)
 }
 
+// seasonWindow returns the pre-sorted ±SeasonWindowDays value window for
+// (station, variable) at target's day-of-year, or ok=false when the
+// lookup holds no matching data (probability callers return NaN).
+func (l *Lookup) seasonWindow(station, variable string, target time.Time) ([]float64, bool) {
+	vars, ok := l.byDay[station]
+	if !ok {
+		return nil, false
+	}
+	table, ok := vars[variable]
+	if !ok {
+		return nil, false
+	}
+	doy := dayOfYear(target)
+	if doy < 1 || doy > 366 {
+		return nil, false
+	}
+	window := table[doy-1]
+	if len(window) == 0 {
+		return nil, false
+	}
+	return window, true
+}
+
 // ShrinkP combines naive ensemble probability and climate probability
 // using `w·climate + (1−w)·naive`. NaN climate falls back to naive
 // (i.e. behaves like w=0).
@@ -250,40 +219,6 @@ func ShrinkP(naive, climate, weight float64) float64 {
 		return naive
 	}
 	return weight*climate + (1-weight)*naive
-}
-
-// requireColumns returns a header→index map containing exactly the
-// requested columns, or an error naming any that are missing.
-func requireColumns(header []string, names ...string) (map[string]int, error) {
-	idx := make(map[string]int, len(header))
-	for i, h := range header {
-		idx[h] = i
-	}
-	out := make(map[string]int, len(names))
-	var missing []string
-	for _, n := range names {
-		i, ok := idx[n]
-		if !ok {
-			missing = append(missing, n)
-			continue
-		}
-		out[n] = i
-	}
-	if len(missing) > 0 {
-		return nil, fmt.Errorf("missing required columns: %v (got header %v)", missing, header)
-	}
-	return out, nil
-}
-
-// maxIndex returns the largest column index in the map.
-func maxIndex(col map[string]int) int {
-	m := -1
-	for _, i := range col {
-		if i > m {
-			m = i
-		}
-	}
-	return m
 }
 
 // dayOfYear returns 1..366, leap-year-aware. In leap years, Feb 29 is

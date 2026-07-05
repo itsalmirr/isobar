@@ -116,7 +116,7 @@ coeffs.FitModelSet = []string{mos.ModelGFS}  // "gfs"
 ```
 
 The scanner derives the observed model set from the Open-Meteo poll's
-member-ID prefixes (`pollModelSet` in `internal/edge/scan.go`). If
+member-ID prefixes (`pollModelSetFromMembers` in `internal/edge/scan.go`). If
 they don't match, MOS is *not* applied and the row records
 `SkippedReason = "model_set_mismatch:<obs>vs<fit>"`. This catches
 the latent bug where ECMWF-augmented polls would silently feed a
@@ -219,7 +219,7 @@ For every paired trade `edge-scan` emits all four probabilities:
 | `p_fair_climate_shrunk` | `0.2·climate + 0.8·naive` | best when MOS isn't applicable (model-set mismatch, missing bin), or as critique baseline |
 | `p_fair` | what the scanner used for edge math | MOS when `mos_applied=true`, otherwise naive (climate-shrunk is *reported*, not the trading model) |
 
-`p_fair` is what `EdgeAfterFeeCents` consumes; `p_fair_mos` and
+`p_fair` is what `EdgeAfterFeeCentsMode` consumes; `p_fair_mos` and
 `p_fair_climate_shrunk` are diagnostics. The scanner's reasoning
 behind this asymmetry: MOS is the only calibrator we've intentionally
 validated against a holdout fold, so it gets to drive the EV when

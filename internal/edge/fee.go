@@ -12,12 +12,8 @@ import "math"
 // observation point.
 //
 // Source: Kalshi published fee schedule, 2026.
-//
-// KalshiFeeBPS is the legacy name kept as an alias for back-compat
-// with existing callers (and the v3 reports that cite it).
 const (
 	KalshiTakerFeeBPS = 0.07
-	KalshiFeeBPS      = KalshiTakerFeeBPS
 
 	// KalshiMakerFeeBPS is Kalshi's maker fee multiplier when our
 	// resting limit order gets taken by a counterparty. Strictly 1/4
@@ -59,13 +55,9 @@ func (m FeeMode) String() string {
 	return "taker"
 }
 
-// FeePerContractCents returns the per-side, per-contract fee in cents
-// that Kalshi charges at fill price priceDollars (0..1) under the
-// default taker schedule. Preserved for backward compatibility with
-// callers that don't yet thread a FeeMode through.
-//
-// New code that needs to vary fee mode should call
-// FeePerContractCentsMode.
+// FeePerContractCentsMode returns the per-side, per-contract fee in
+// cents that Kalshi charges at fill price priceDollars (0..1) under the
+// given fee mode. mode=FeeMaker uses KalshiMakerFeeBPS (1/4 of taker).
 //
 // Schedule (per Kalshi's published fee page):
 //
@@ -79,13 +71,6 @@ func (m FeeMode) String() string {
 // We deliberately model this with no rounding internally and ceil at
 // the end so that micro-priced trades (e.g., 1¢ taker fills) match
 // what Kalshi actually billed.
-func FeePerContractCents(priceDollars float64) int {
-	return FeePerContractCentsMode(priceDollars, FeeTaker)
-}
-
-// FeePerContractCentsMode is the fee-mode-aware variant. mode=FeeTaker
-// matches FeePerContractCents exactly (same constant, same rounding).
-// mode=FeeMaker uses KalshiMakerFeeBPS (1/4 of taker).
 func FeePerContractCentsMode(priceDollars float64, mode FeeMode) int {
 	if priceDollars < 0 {
 		priceDollars = 0
@@ -97,25 +82,20 @@ func FeePerContractCentsMode(priceDollars float64, mode FeeMode) int {
 	return int(math.Ceil(raw))
 }
 
-// RoundTripFeeCents returns the open + close fee assuming both legs
-// fill at the same price. Phase 0 strategy is hold-to-expiry; the
-// closing leg is a settlement, which Kalshi *does not* charge a fee
-// for. So the round-trip fee is just the entry fee.
+// RoundTripFeeCentsMode returns the open + close fee assuming both legs
+// fill at the same price, under a chosen fee mode. Phase 0 strategy is
+// hold-to-expiry; the closing leg is a settlement, which Kalshi *does
+// not* charge a fee for. So the round-trip fee is just the entry fee.
 //
 // We expose this as a separate function so the scanner can swap to a
 // genuine round-trip model (e.g. for cancel-and-quote strategies)
 // without changing call sites.
-func RoundTripFeeCents(priceDollars float64) int {
-	return FeePerContractCents(priceDollars)
-}
-
-// RoundTripFeeCentsMode mirrors RoundTripFeeCents under a chosen fee
-// mode. Useful when the scanner threads FeeMode through end-to-end.
 func RoundTripFeeCentsMode(priceDollars float64, mode FeeMode) int {
 	return FeePerContractCentsMode(priceDollars, mode)
 }
 
-// EdgeAfterFeeCents is the naive edge in cents per contract:
+// EdgeAfterFeeCentsMode is the naive edge in cents per contract, under
+// a chosen fee mode:
 //
 //	edge = |p_fair_cents − price_cents| − round_trip_fee_cents
 //
@@ -123,12 +103,6 @@ func RoundTripFeeCentsMode(priceDollars float64, mode FeeMode) int {
 // this trade price under the model. p_fair and price are rounded to
 // integer cents first (Kalshi quotes in 1¢ increments anyway), which
 // also avoids IEEE-float artefacts like |0.60 − 0.50| = 9.9999¢.
-func EdgeAfterFeeCents(pFair, priceDollars float64) int {
-	return EdgeAfterFeeCentsMode(pFair, priceDollars, FeeTaker)
-}
-
-// EdgeAfterFeeCentsMode is the fee-mode-aware variant of
-// EdgeAfterFeeCents. Identical behaviour at mode=FeeTaker.
 func EdgeAfterFeeCentsMode(pFair, priceDollars float64, mode FeeMode) int {
 	pFairCents := int(math.Round(pFair * 100))
 	priceCents := int(math.Round(priceDollars * 100))

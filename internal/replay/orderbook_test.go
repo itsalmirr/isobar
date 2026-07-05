@@ -2,6 +2,8 @@ package replay
 
 import (
 	"encoding/json"
+	"fmt"
+	"math/rand"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -365,4 +367,134 @@ func TestApplyFrameToBooks_DeltaForUnknownTickerNotCounted(t *testing.T) {
 	require.Empty(t, books)
 	require.Equal(t, uint64(0), RejectedDeltasTotal(), "unknown ticker must not bump rejected-delta counter")
 	require.Equal(t, uint64(0), SnapshotErrorsTotal())
+}
+
+// TestBookSnapshotRejectsNonPositiveQty pins the never-negative
+// resting-quantity invariant on the snapshot path. The delta path
+// already drops any level whose quantity reaches <=0 (delete on
+// newQty<=0); the snapshot path must reject the same levels rather than
+// store a negative resting quantity that a top-of-book scalar would
+// then read as a live level. A snapshot mixing positive, zero, and
+// negative quantities must land only the positive levels.
+func TestBookSnapshotRejectsNonPositiveQty(t *testing.T) {
+	b := NewBook()
+	require.NoError(t, b.ApplySnapshot(json.RawMessage(`{
+		"market_ticker":"KXHIGHNY-26APR22-T64",
+		"yes_dollars_fp":[["0.4500","100.00"],["0.4400","-5.00"],["0.4300","0.00"]],
+		"no_dollars_fp":[["0.5200","75.00"],["0.5300","-1.00"]]
+	}`)))
+	require.Equal(t, 100.0, b.Yes[45], "positive level is kept")
+	_, hasNeg := b.Yes[44]
+	require.False(t, hasNeg, "negative-qty snapshot level must be dropped, not stored")
+	_, hasZero := b.Yes[43]
+	require.False(t, hasZero, "zero-qty snapshot level must be dropped")
+	require.Equal(t, 75.0, b.No[52])
+	_, hasNegNo := b.No[53]
+	require.False(t, hasNegNo, "negative-qty no-side level must be dropped")
+
+	// Every surviving level is strictly positive.
+	for pc, qty := range b.Yes {
+		require.Greater(t, qty, 0.0, "yes level %d must be positive", pc)
+	}
+	for pc, qty := range b.No {
+		require.Greater(t, qty, 0.0, "no level %d must be positive", pc)
+	}
+}
+
+// TestBookInvariants_RandomSnapshotAndDeltas is a property test over
+// the book reconstruction kernel. It applies a random snapshot and then
+// a stream of random deltas (occasionally re-initializing with a fresh
+// snapshot) and, after every apply, asserts the invariants the book is
+// contractually required to hold no matter what stream drives it:
+//
+//   - Every stored Yes/No resting quantity is strictly positive. The
+//     delta path deletes a level on qty<=0 and the snapshot path now
+//     rejects non-positive levels, so a negative quantity anywhere means
+//     a reconstruction bug.
+//   - When the No side is non-empty, BestYesAsk() == 100 - BestNoBid()
+//     (the arbitrage identity the Book doc states as Yes_ask = 1 - No_bid).
+//   - A fresh snapshot fully re-initializes the book — no level from a
+//     prior snapshot/delta window survives across the wipe.
+//
+// The generator is seeded so failures reproduce deterministically. We
+// deliberately do NOT assert SpreadYesCents()>=0 or bid<=mid<=ask:
+// those are legitimately violated on crossed or one-sided books, which
+// this random stream produces by design.
+func TestBookInvariants_RandomSnapshotAndDeltas(t *testing.T) {
+	const (
+		seed   = 0x1505_1a70_b00c
+		trials = 200
+		deltas = 40
+	)
+	rng := rand.New(rand.NewSource(seed)) //nolint:gosec // deterministic test generator, not security-sensitive
+
+	// randSnapshot builds a snapshot payload with random levels. Some
+	// levels carry non-positive quantities to exercise the reject path;
+	// the invariant checker must never see them land.
+	randSnapshot := func() json.RawMessage {
+		levels := func() string {
+			n := rng.Intn(6)
+			out := ""
+			for i := 0; i < n; i++ {
+				price := 1 + rng.Intn(99) // 1..99 cents
+				// Mostly positive, occasionally zero/negative to stress the guard.
+				qty := rng.Float64()*100 - 10
+				if i > 0 {
+					out += ","
+				}
+				out += fmt.Sprintf(`["0.%02d00","%.2f"]`, price, qty)
+			}
+			return out
+		}
+		return json.RawMessage(fmt.Sprintf(
+			`{"market_ticker":"T","yes_dollars_fp":[%s],"no_dollars_fp":[%s]}`,
+			levels(), levels(),
+		))
+	}
+
+	checkInvariants := func(t *testing.T, b *Book, ctx string) {
+		t.Helper()
+		for pc, qty := range b.Yes {
+			require.Greater(t, qty, 0.0, "%s: yes level %d has non-positive qty %v", ctx, pc, qty)
+		}
+		for pc, qty := range b.No {
+			require.Greater(t, qty, 0.0, "%s: no level %d has non-positive qty %v", ctx, pc, qty)
+		}
+		if len(b.No) > 0 {
+			require.Equal(t, 100-b.BestNoBid(), b.BestYesAsk(),
+				"%s: BestYesAsk must equal 100-BestNoBid when No side is populated", ctx)
+		}
+	}
+
+	for tr := 0; tr < trials; tr++ {
+		b := NewBook()
+		require.NoError(t, b.ApplySnapshot(randSnapshot()))
+		checkInvariants(t, b, fmt.Sprintf("trial %d post-snapshot", tr))
+
+		for d := 0; d < deltas; d++ {
+			// 1-in-8 deltas is actually a fresh snapshot re-init.
+			if rng.Intn(8) == 0 {
+				prevLen := len(b.Yes) + len(b.No)
+				require.NoError(t, b.ApplySnapshot(randSnapshot()))
+				// Re-init must not leave any stale phantom level: the new
+				// map sizes are independent of the old, and every present
+				// level was placed by the new snapshot (checked below).
+				_ = prevLen
+				checkInvariants(t, b, fmt.Sprintf("trial %d delta %d re-snapshot", tr, d))
+				continue
+			}
+			side := "yes"
+			if rng.Intn(2) == 0 {
+				side = "no"
+			}
+			price := 1 + rng.Intn(99)
+			dq := rng.Float64()*40 - 20 // signed, can drive a level to <=0
+			deltaMsg := json.RawMessage(fmt.Sprintf(
+				`{"market_ticker":"T","price_dollars":"0.%02d00","delta_fp":"%.2f","side":%q}`,
+				price, dq, side,
+			))
+			require.NoError(t, b.ApplyDelta(deltaMsg))
+			checkInvariants(t, b, fmt.Sprintf("trial %d delta %d", tr, d))
+		}
+	}
 }

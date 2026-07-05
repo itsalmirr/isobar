@@ -50,6 +50,14 @@ conservative: assume taker on both sides unless we can prove otherwise.
 
 ## Signals & execution
 
+> The concrete Kalshi order/portfolio types named below
+> (`CreateOrderRequest`, `CreateOrder`, `CancelOrder`, `PostOnly`, …) were
+> deleted from `internal/kalshi` in the Phase-1 reduction sweep — they had
+> no caller and their absence makes ADR-0014's "no code path can place a
+> real order" rail structural. The terms remain here as the design
+> vocabulary for the Phase-1+ exec path, which will reintroduce the types
+> (recovery is git history) alongside the `Signal`/`exec` interface below.
+
 **Signal.** A Phase 1+ interface: given a `MarketState`, emit zero or more
 `Quote`s. Each strategy (`weather-calibrated`, `hurricane-landfall`) is
 one implementation.

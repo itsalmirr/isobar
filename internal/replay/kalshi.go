@@ -9,9 +9,12 @@ import (
 // KalshiFrame is the decoded top-level shape of a Kalshi WS frame as
 // stored in our journal Payload. Consumers typically discriminate on
 // Type before reading the fuller Msg body.
+//
+// Seq and Sid are decoded but unread today — reserved for ADR-0015's
+// feed adapter, whose sequence-gap detection reads them per (ticker,
+// session). Do not delete in a dead-code sweep.
 type KalshiFrame struct {
 	Type string          `json:"type"`
-	ID   int64           `json:"id,omitempty"`
 	Seq  int64           `json:"seq,omitempty"`
 	Sid  int64           `json:"sid,omitempty"`
 	Msg  json.RawMessage `json:"msg,omitempty"`

@@ -12,7 +12,16 @@ exposes:
 
   - `Client` — REST client with built-in rate limiting, retry, and
     explicit per-stage transport timeouts. Signs every request with
-    RSA-PSS using `Signer`.
+    RSA-PSS using `Signer`. Its live surface is read-only market-data
+    discovery: `GetMarketsPage` and `DiscoverOpenTickers`. The
+    order-management and portfolio-query methods (`CreateOrder`,
+    `CancelOrder`, `GetOrder(s)`, `GetFills`, `GetPositions`,
+    `GetBalance`, the `*Raw`/`GetRaw` probes, and their types) were
+    deleted in the Phase-1 reduction sweep — they had no caller, so
+    ADR-0014's "no code path that can place a real order" rail is now
+    structural rather than a documented promise. Recovery is git history
+    (ADR-0002 delete-don't-freeze precedent); the exec path will
+    reintroduce a typed order surface when `cmd/bot` lands.
   - `Subscriber` — WebSocket subscriber with auto-reconnect, ticker
     swap (`Reload`), and a frame-liveness watchdog with TCP-level ping.
   - `Signer` — RSA-PSS signature generator (SHA-256, salt = hash length).

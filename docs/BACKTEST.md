@@ -229,8 +229,8 @@ hard-to-model slippage and queueing on top.
 - `internal/edge/scan.go` — `Scan`, `EdgeRow`, the backtest branch
 - `internal/edge/truth.go` — `LoadTruth`, `TruthIndex.Get`,
   `stationFromTruthFilename`
-- `internal/edge/fee.go` — `FeePerContractCents`, `RoundTripFeeCents`,
-  `EdgeAfterFeeCents`
+- `internal/edge/fee.go` — `FeePerContractCentsMode`, `RoundTripFeeCentsMode`,
+  `EdgeAfterFeeCentsMode`
 - `cmd/edge-scan/main.go` — CSV column order and writer
 - `scripts/run-backtest.sh` — end-to-end wrapper
 - [ADR-0007](./decisions/0007-calibration-ground-truth-cli.md) — why

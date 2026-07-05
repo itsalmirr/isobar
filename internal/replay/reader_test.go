@@ -235,6 +235,83 @@ func TestEnvelope_CurrentVersionReadsThrough(t *testing.T) {
 		"v1 frames must round-trip through replay without re-labeling")
 }
 
+// TestForEachFrameOversizedLineDoesNotAbortRemainingFiles pins the
+// scanner-level recovery contract for the oversized-line case: a line
+// exceeding MaxLineBytes makes bufio.Scanner halt with ErrTooLong, which
+// used to propagate and abort every remaining file. The reader must now
+// skip the rest of the offending file and still process the next one.
+func TestForEachFrameOversizedLineDoesNotAbortRemainingFiles(t *testing.T) {
+	dir := t.TempDir()
+	f1 := filepath.Join(dir, "a.jsonl")
+	f2 := filepath.Join(dir, "b.jsonl")
+
+	// f1: one good frame, then an oversized line (> MaxLineBytes), then
+	// another good frame. Everything from the oversized line on is lost,
+	// but the pre-oversize frame survives.
+	huge := make([]byte, MaxLineBytes+1024)
+	for i := range huge {
+		huge[i] = 'x'
+	}
+	writeJSONL(t, f1, []string{
+		`{"t":1,"src":"x","k":"y"}`,
+		`{"t":2,"src":"x","k":"y","p":"` + string(huge) + `"}`,
+		`{"t":3,"src":"x","k":"y"}`,
+	})
+	// f2: a wholly intact file that MUST still be read.
+	writeJSONL(t, f2, []string{
+		`{"t":10,"src":"x","k":"y"}`,
+		`{"t":11,"src":"x","k":"y"}`,
+	})
+
+	var walls []int64
+	err := ForEachFrame([]string{f1, f2}, func(env Envelope, _ int, _ bool) error {
+		walls = append(walls, env.Wall)
+		return nil
+	})
+	require.NoError(t, err, "an oversized line must not abort the run")
+	// Frame 1 from f1 (pre-oversize) plus both frames from f2. The
+	// oversized line and everything after it in f1 is skipped.
+	require.Equal(t, []int64{1, 10, 11}, walls)
+}
+
+// TestForEachFrameTruncatedGzipDoesNotAbortRemainingFiles pins the
+// scanner-level recovery contract for the crash-mid-rotation case: a
+// rotated .gz truncated mid-stream reads its intact lines and then
+// surfaces io.ErrUnexpectedEOF. The reader must keep the intact frames,
+// swallow the truncation, and still process the following file.
+func TestForEachFrameTruncatedGzipDoesNotAbortRemainingFiles(t *testing.T) {
+	dir := t.TempDir()
+	f1 := filepath.Join(dir, "a.jsonl.gz")
+	f2 := filepath.Join(dir, "b.jsonl")
+
+	// Build a valid gzip stream of two frames, then truncate the tail so
+	// the gzip footer is missing — the exact shape of a recorder crash
+	// mid-rotation. gzip.NewReader still opens (header intact); the read
+	// yields the intact lines then errors with io.ErrUnexpectedEOF.
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	_, err := gw.Write([]byte("{\"t\":1,\"src\":\"x\",\"k\":\"y\"}\n{\"t\":2,\"src\":\"x\",\"k\":\"y\"}\n"))
+	require.NoError(t, err)
+	require.NoError(t, gw.Close())
+	full := buf.Bytes()
+	truncated := full[:len(full)-8] // drop the gzip footer/CRC tail
+	require.NoError(t, os.WriteFile(f1, truncated, 0o600))
+
+	writeJSONL(t, f2, []string{
+		`{"t":10,"src":"x","k":"y"}`,
+		`{"t":11,"src":"x","k":"y"}`,
+	})
+
+	var walls []int64
+	err = ForEachFrame([]string{f1, f2}, func(env Envelope, _ int, _ bool) error {
+		walls = append(walls, env.Wall)
+		return nil
+	})
+	require.NoError(t, err, "a truncated gzip must not abort the run")
+	// The two intact frames from the truncated gz plus both from f2.
+	require.Equal(t, []int64{1, 2, 10, 11}, walls)
+}
+
 func TestForEachFrameReadsLargeLines(t *testing.T) {
 	// 256 KiB payload, well under MaxLineBytes but above Scanner's 64 KiB default.
 	big := make([]byte, 256<<10)

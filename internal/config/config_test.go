@@ -72,7 +72,7 @@ openmeteo:
   poll_interval: 5m
   variables: [temperature_2m]
   locations:
-    - { name: NY, series: [KXHIGHNY], lat: 40.7794, lon: -73.9692 }
+    - { name: NY, lat: 40.7794, lon: -73.9692 }
 `), 0o600))
 
 	cfg, err := Load(path)
@@ -201,6 +201,13 @@ func TestValidateOpenMeteo(t *testing.T) {
 	require.ErrorContains(t, c.Validate(), "locations")
 
 	c.OpenMeteo.Locations = []OpenMeteoLocation{{Name: "NY", Lat: 40, Lon: -73}}
+	c.OpenMeteo.PollInterval = 5 * time.Minute
+	// An empty variable list must be rejected: it produces an empty `&hourly=`
+	// query that Open-Meteo answers with a permanent 400, so a green boot would
+	// record nothing forever.
+	require.ErrorContains(t, c.Validate(), "variables")
+
+	c.OpenMeteo.Variables = []string{"temperature_2m"}
 	c.OpenMeteo.PollInterval = 30 * time.Second
 	require.ErrorContains(t, c.Validate(), "poll_interval")
 
@@ -348,7 +355,7 @@ openmeteo:
   poll_interval: 5m
   variables: [temperature_2m]
   locations:
-    - { name: CHI, series: [KXHIGHCHI], lat: 41.9742, lon: -87.9073 }
+    - { name: CHI, lat: 41.9742, lon: -87.9073 }
 `), 0o600))
 
 	_, err := Load(path)

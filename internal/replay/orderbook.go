@@ -95,24 +95,42 @@ func (b *Book) ApplySnapshot(msg json.RawMessage) error {
 		b.initialized = false
 		return fmt.Errorf("parse snapshot: %w", err)
 	}
+	b.applySnapshotMsg(&s)
+	return nil
+}
+
+// applySnapshotMsg populates the book from an already-decoded snapshot
+// struct. It is the decode-once inner half of ApplySnapshot: the frame
+// kernel (ApplyFrameToBooks) decodes the Msg a single time to read the
+// ticker, then hands the struct here rather than paying a second
+// sonic.Unmarshal of the same bytes — the dominant allocation on the
+// offline replay hot path. The caller owns the decode-error path (see
+// ApplyFrameToBooks); this method assumes s is well-formed and never
+// fails.
+//
+// Negative or zero level quantities are rejected here, mirroring the
+// delta path (ApplyDelta drops a level once its quantity reaches <=0):
+// a snapshot claiming a negative resting quantity is malformed, and
+// storing it would let a top-of-book scalar read a book that violates
+// the never-negative resting-quantity contract.
+func (b *Book) applySnapshotMsg(s *snapshotMsg) {
 	b.Yes = make(map[int]float64, len(s.YesDollarsFP))
 	b.No = make(map[int]float64, len(s.NoDollarsFP))
 	for _, lvl := range s.YesDollarsFP {
 		pc, qty, err := parseLevel(lvl)
-		if err != nil {
-			continue // tolerate malformed level
+		if err != nil || qty <= 0 {
+			continue // tolerate malformed or non-positive level
 		}
 		b.Yes[pc] = qty
 	}
 	for _, lvl := range s.NoDollarsFP {
 		pc, qty, err := parseLevel(lvl)
-		if err != nil {
+		if err != nil || qty <= 0 {
 			continue
 		}
 		b.No[pc] = qty
 	}
 	b.initialized = true
-	return nil
 }
 
 // ApplyDelta adjusts one level by the signed delta quantity. A delta
@@ -128,6 +146,14 @@ func (b *Book) ApplyDelta(msg json.RawMessage) error {
 	if err := sonic.Unmarshal(msg, &d); err != nil {
 		return fmt.Errorf("parse delta: %w", err)
 	}
+	return b.applyDeltaMsg(&d)
+}
+
+// applyDeltaMsg applies an already-decoded delta struct. It is the
+// decode-once inner half of ApplyDelta, letting ApplyFrameToBooks reuse
+// the single decode it performed to read the ticker instead of
+// re-parsing the same Msg bytes. See applySnapshotMsg for the rationale.
+func (b *Book) applyDeltaMsg(d *deltaMsg) error {
 	pc, err := priceDollarsToCents(d.Price)
 	if err != nil {
 		return fmt.Errorf("delta price %q: %w", d.Price, err)
@@ -297,23 +323,46 @@ func clearLogSuppression(ticker string) {
 // This is the shared book-reconstruction kernel used by cmd/analyze and
 // cmd/edge-scan. Pass walls=nil if you don't need per-ticker wall stamps.
 func ApplyFrameToBooks(books map[string]*Book, walls map[string]int64, env Envelope, f KalshiFrame) (malformed bool, err error) {
-	ticker := f.MarketTicker()
-	if ticker == "" {
-		return false, nil
-	}
+	// Book frames carry market_ticker inside the snapshot/delta body,
+	// so decode the Msg exactly once here and read the ticker off the
+	// decoded struct rather than paying a second full sonic.Unmarshal
+	// via f.MarketTicker(). That redundant decode was the dominant
+	// allocation on the offline replay hot path (analyze walks every
+	// recorded frame). Non-book frames fall through to MarketTicker(),
+	// which is cheap enough at their far lower rate.
 	switch f.Type {
 	case "orderbook_snapshot":
+		var s snapshotMsg
+		// A decode error still populates s.MarketTicker for any
+		// well-formed prefix of the body, so read the ticker before
+		// branching on the error: the state machine must create and
+		// reset books[ticker] even for a malformed snapshot so that
+		// subsequent deltas for it are rejected rather than replayed
+		// against phantom state.
+		decErr := sonic.Unmarshal(f.Msg, &s)
+		ticker := s.MarketTicker
+		if ticker == "" {
+			return false, nil
+		}
 		if books[ticker] == nil {
 			books[ticker] = NewBook()
 		}
-		if applyErr := books[ticker].ApplySnapshot(f.Msg); applyErr != nil {
+		book := books[ticker]
+		if decErr != nil {
+			// Wipe state and stay uninitialized. A half-decoded
+			// snapshot is exactly the failure mode we're hardening
+			// against.
+			book.Yes = map[int]float64{}
+			book.No = map[int]float64{}
+			book.initialized = false
 			snapshotErrorsTotal.Add(1)
 			logOnceOrSuppress(slog.LevelError, ticker, "snapshot_apply_failed",
 				"orderbook: snapshot apply failed; book reset to uninitialized",
-				slog.String("err", applyErr.Error()),
+				slog.String("err", decErr.Error()),
 			)
-			return true, fmt.Errorf("%w: ticker=%s: %w", ErrSnapshotApplyFailed, ticker, applyErr)
+			return true, fmt.Errorf("%w: ticker=%s: parse snapshot: %w", ErrSnapshotApplyFailed, ticker, decErr)
 		}
+		book.applySnapshotMsg(&s)
 		// Successful snapshot — book is ready. Clear any prior
 		// suppression window so the next failure logs again (and
 		// includes the prior window's suppressed-count).
@@ -323,6 +372,15 @@ func ApplyFrameToBooks(books map[string]*Book, walls map[string]int64, env Envel
 		}
 		return false, nil
 	case "orderbook_delta":
+		var d deltaMsg
+		// A malformed delta body still yields a usable ticker for its
+		// well-formed prefix; if even that is missing the frame is a
+		// no-op, matching the empty-ticker guard for other frame types.
+		decErr := sonic.Unmarshal(f.Msg, &d)
+		ticker := d.MarketTicker
+		if ticker == "" {
+			return false, nil
+		}
 		book := books[ticker]
 		if book == nil {
 			// Stray delta for an unknown ticker — pre-existing
@@ -341,7 +399,10 @@ func ApplyFrameToBooks(books map[string]*Book, walls map[string]int64, env Envel
 			)
 			return false, fmt.Errorf("%w: ticker=%s", ErrBookUninitialized, ticker)
 		}
-		if applyErr := book.ApplyDelta(f.Msg); applyErr != nil {
+		if decErr != nil {
+			return true, fmt.Errorf("apply delta ticker=%s: parse delta: %w", ticker, decErr)
+		}
+		if applyErr := book.applyDeltaMsg(&d); applyErr != nil {
 			return true, fmt.Errorf("apply delta ticker=%s: %w", ticker, applyErr)
 		}
 		if walls != nil {
@@ -349,6 +410,9 @@ func ApplyFrameToBooks(books map[string]*Book, walls map[string]int64, env Envel
 		}
 		return false, nil
 	}
+	// Non-book frame type (subscribed, trade, heartbeat, …): nothing to
+	// reconstruct. f.MarketTicker() remains the accessor for callers
+	// that need the ticker of such frames; the book kernel does not.
 	return false, nil
 }
 
