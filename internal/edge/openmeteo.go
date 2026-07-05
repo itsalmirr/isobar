@@ -19,8 +19,8 @@ import (
 // "30". Phase 0 expects 31 members for gfs_seamless ensemble.
 //
 // ModelSet is the canonical sorted model-tag set derived from Members
-// at parse time (see [pollModelSet] and [memberModelTag] in scan.go for
-// the derivation). It is invariant per *Poll — the underlying member
+// at parse time (see [pollModelSetFromMembers] and [memberModelTag] in
+// scan.go for the derivation). It is invariant per *Poll — the underlying member
 // IDs don't change — so the edge scanner reads it directly instead of
 // recomputing per trade. Empty if the Poll was constructed without
 // going through [ParsePoll] (test-only).

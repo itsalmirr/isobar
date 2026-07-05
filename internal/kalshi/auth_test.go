@@ -7,6 +7,8 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/pem"
+	"os"
+	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
@@ -89,4 +91,29 @@ func TestSignerTimestampsAdvance(t *testing.T) {
 	n1, _ := strconv.ParseInt(ts1, 10, 64)
 	n2, _ := strconv.ParseInt(ts2, 10, 64)
 	require.Greater(t, n2, n1)
+}
+
+func TestLoadPEMPrefersInline(t *testing.T) {
+	b, src, err := LoadPEM("inline-pem", "/nonexistent/ignored.pem")
+	require.NoError(t, err)
+	require.Equal(t, []byte("inline-pem"), b)
+	require.Equal(t, "inline", src)
+}
+
+func TestLoadPEMReadsFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "key.pem")
+	require.NoError(t, os.WriteFile(path, []byte("file-pem"), 0o600))
+
+	b, src, err := LoadPEM("", path)
+	require.NoError(t, err)
+	require.Equal(t, []byte("file-pem"), b)
+	require.Equal(t, "file:"+path, src)
+}
+
+func TestLoadPEMErrors(t *testing.T) {
+	_, _, err := LoadPEM("", "")
+	require.EqualError(t, err, "kalshi: no PEM source configured")
+
+	_, _, err = LoadPEM("", filepath.Join(t.TempDir(), "missing.pem"))
+	require.ErrorContains(t, err, "read private key")
 }

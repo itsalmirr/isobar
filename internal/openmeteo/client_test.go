@@ -19,17 +19,31 @@ func discardLogger() *slog.Logger {
 }
 
 func TestNewPollerValidatesOptions(t *testing.T) {
+	// Each case blanks exactly one required field of an otherwise-valid
+	// Options so the triggered error is unambiguous. Config-owned knobs
+	// (model, forecast days, poll interval) are rejected rather than
+	// silently re-defaulted — internal/config owns the defaults.
 	cases := []struct {
-		name string
-		opts Options
+		name   string
+		mutate func(*Options)
 	}{
-		{"no base url", Options{PollInterval: time.Minute, Locations: []Location{{Name: "x"}}}},
-		{"too-short poll", Options{BaseURL: "x", PollInterval: 30 * time.Second, Locations: []Location{{Name: "x"}}}},
-		{"no locations", Options{BaseURL: "x", PollInterval: time.Minute}},
+		{"no base url", func(o *Options) { o.BaseURL = "" }},
+		{"no model", func(o *Options) { o.Model = "" }},
+		{"non-positive poll interval", func(o *Options) { o.PollInterval = 0 }},
+		{"no locations", func(o *Options) { o.Locations = nil }},
+		{"non-positive forecast days", func(o *Options) { o.ForecastDays = 0 }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := NewPoller(tc.opts)
+			opts := Options{
+				BaseURL:      "http://example",
+				Model:        "gfs_seamless",
+				ForecastDays: 3,
+				PollInterval: time.Minute,
+				Locations:    []Location{{Name: "x"}},
+			}
+			tc.mutate(&opts)
+			_, err := NewPoller(opts)
 			require.Error(t, err)
 		})
 	}
@@ -38,15 +52,18 @@ func TestNewPollerValidatesOptions(t *testing.T) {
 func TestNewPollerDefaults(t *testing.T) {
 	p, err := NewPoller(Options{
 		BaseURL:      "http://example",
+		Model:        "gfs_seamless",
+		ForecastDays: 3,
 		PollInterval: time.Minute,
 		Locations:    []Location{{Name: "NY", Lat: 40, Lon: -73}},
 	})
 	require.NoError(t, err)
 	require.NotNil(t, p)
-	require.Equal(t, "gfs_seamless", p.opts.Model)
-	require.Equal(t, 3, p.opts.ForecastDays)
 	require.NotNil(t, p.opts.Client)
 	require.NotNil(t, p.opts.OnFetch)
+	require.Equal(t, retryInitialBackoff, p.opts.RetryInitialBackoff)
+	require.Equal(t, retryMaxBackoff, p.opts.RetryMaxBackoff)
+	require.Equal(t, retryMaxAttempts, p.opts.RetryMaxAttempts)
 }
 
 func TestFetchOneBuildsExpectedQuery(t *testing.T) {
@@ -95,6 +112,8 @@ func TestFetchOneReturnsErrorOnNon2xx(t *testing.T) {
 
 	p, err := NewPoller(Options{
 		BaseURL:      srv.URL,
+		Model:        "gfs_seamless",
+		ForecastDays: 3,
 		PollInterval: time.Minute,
 		Locations:    []Location{{Name: "NY", Lat: 40, Lon: -73}},
 	})
@@ -119,6 +138,8 @@ func TestRunFiresImmediatelyAndHonorsContext(t *testing.T) {
 
 	p, err := NewPoller(Options{
 		BaseURL:      srv.URL,
+		Model:        "gfs_seamless",
+		ForecastDays: 3,
 		PollInterval: time.Minute, // long so Run relies on initial immediate fetch
 		Locations: []Location{
 			{Name: "NY", Lat: 40, Lon: -73},
@@ -175,6 +196,8 @@ func TestFetchOneRespectsBodyLimit(t *testing.T) {
 
 	p, err := NewPoller(Options{
 		BaseURL:      srv.URL,
+		Model:        "gfs_seamless",
+		ForecastDays: 3,
 		PollInterval: time.Minute,
 		Locations:    []Location{{Name: "NY", Lat: 40, Lon: -73}},
 	})

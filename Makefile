@@ -106,6 +106,15 @@ lint: clockcheck
 clockcheck:
 	$(GO) run ./tools/clockcheck/cmd/clockcheck ./internal/...
 
+# deadcode: whole-program reachability from all mains (reduction-audit
+# protocol, reduction/00-baseline.md §Phase 1). ADVISORY — not part of
+# `all`: deliberate test seams (FakeClock, SetNowForTest, NoopAlarmHook)
+# and Phase-6 observability accessors are always flagged; the signal is
+# the DIFF against reduction/01-deadcode.md's kept-list, not zero output.
+.PHONY: deadcode
+deadcode:
+	$(GO) run golang.org/x/tools/cmd/deadcode@v0.44.0 ./cmd/... ./tools/...
+
 .PHONY: fmt
 fmt:
 	$(GO) tool gofumpt -w .

@@ -125,7 +125,7 @@ func run(ctx context.Context, logger *slog.Logger, cfg config.Config, configSHA 
 	}()
 
 	if cfg.Kalshi.Enabled {
-		g.Go(func() error { return startKalshi(ctx, logger, cfg, configSHA, g, alarms) })
+		g.Go(func() error { return startKalshi(ctx, logger, cfg, configSHA, alarms) })
 	}
 	if cfg.OpenMeteo.Enabled {
 		g.Go(func() error { return startOpenMeteo(ctx, logger, cfg, configSHA, alarms) })
@@ -137,7 +137,11 @@ func run(ctx context.Context, logger *slog.Logger, cfg config.Config, configSHA 
 // payload. Bump when fields are renamed/removed (additions are
 // backward-compatible). Downstream tools (edge-scan, analyze) match
 // on this string before trusting field names.
-const bootSchemaVersion = "isobar-tape.boot/v1"
+//
+// v2: stations entries carry only {Code, Location, Lat, Lon, TZ} —
+// the unread City/UTCOffsetHours/HighSeries/LowSeries/CLIPil fields
+// were deleted from market.Station in the Phase-2 reduction.
+const bootSchemaVersion = "isobar-tape.boot/v2"
 
 // bootPayload is the JSON shape carried in the boot frame's Payload
 // field. Field order/names are part of the public tape format.
@@ -148,6 +152,18 @@ type bootPayload struct {
 	BuildTime     string           `json:"build_time,omitempty"`
 	Stations      []market.Station `json:"stations"`
 	SchemaVersion string           `json:"schema_version"`
+}
+
+// writeFrame stamps and enqueues one journal frame. Every frame tape
+// emits (boot marker, WS payload, REST poll) goes through here so the
+// Stamp source stays clock.Now uniformly (ADR-0012).
+func writeFrame(jrn *journal.Journal, source, kind string, payload json.RawMessage) {
+	jrn.Write(journal.Frame{
+		Stamp:   clock.Now(),
+		Source:  source,
+		Kind:    kind,
+		Payload: payload,
+	})
 }
 
 // writeBootFrame emits a single cutover-marker frame at journal open.
@@ -171,16 +187,11 @@ func writeBootFrame(jrn *journal.Journal, configSHA string) {
 		slog.Warn("boot frame: marshal failed; skipping", "err", err)
 		return
 	}
-	jrn.Write(journal.Frame{
-		Stamp:   clock.Now(),
-		Source:  "isobar-tape",
-		Kind:    "boot",
-		Payload: b,
-	})
+	writeFrame(jrn, "isobar-tape", "boot", b)
 }
 
-func startKalshi(ctx context.Context, logger *slog.Logger, cfg config.Config, configSHA string, g *errgroup.Group, alarms *alarmSink) error {
-	pemBytes, source, err := loadKalshiPEM(cfg.Kalshi)
+func startKalshi(ctx context.Context, logger *slog.Logger, cfg config.Config, configSHA string, alarms *alarmSink) error {
+	pemBytes, source, err := kalshi.LoadPEM(cfg.Kalshi.PrivateKey, cfg.Kalshi.PrivateKeyPath)
 	if err != nil {
 		return err
 	}
@@ -229,13 +240,22 @@ func startKalshi(ctx context.Context, logger *slog.Logger, cfg config.Config, co
 		},
 	})
 
+	// Scope the rediscovery loop and the subscriber to a child group whose
+	// lifetime ends before the deferred jrn.Close above. runRediscovery may
+	// grow to emit journal frames (a "set changed" marker is the obvious next
+	// feature), and a Write from a goroutine outliving jrn.Close would race
+	// the journal's teardown. Returning gk.Wait() keeps the deferred Close
+	// ordered strictly after both children exit; sub.Run takes gctx so a
+	// rediscovery error cross-cancels the subscriber instead of deadlocking
+	// the Wait on shutdown.
+	gk, gctx := errgroup.WithContext(ctx)
 	if cfg.Kalshi.RediscoverInterval > 0 {
-		g.Go(func() error {
-			return runRediscovery(ctx, logger, rest, sub, cfg.Kalshi.Series, cfg.Kalshi.RediscoverInterval)
+		gk.Go(func() error {
+			return runRediscovery(gctx, logger, rest, sub, cfg.Kalshi.Series, cfg.Kalshi.RediscoverInterval)
 		})
 	}
-
-	return sub.Run(ctx)
+	gk.Go(func() error { return sub.Run(gctx) })
+	return gk.Wait()
 }
 
 // runRediscovery periodically re-runs DiscoverOpenTickers and reloads the
@@ -356,12 +376,7 @@ func startOpenMeteo(ctx context.Context, logger *slog.Logger, cfg config.Config,
 		PollInterval: cfg.OpenMeteo.PollInterval,
 		Logger:       logger,
 		OnFetch: func(loc openmeteo.Location, raw []byte) {
-			jrn.Write(journal.Frame{
-				Stamp:   clock.Now(),
-				Source:  "openmeteo",
-				Kind:    "rest:" + loc.Name,
-				Payload: json.RawMessage(raw),
-			})
+			writeFrame(jrn, "openmeteo", "rest:"+loc.Name, raw)
 		},
 	})
 	if err != nil {
@@ -438,30 +453,8 @@ func openJournal(cfg config.Config, source string, logger *slog.Logger, alarms *
 // in a journal Frame with the current timestamp pair and the given source.
 func makeWSFrameHandler(jrn *journal.Journal, source string) func([]byte) {
 	return func(raw []byte) {
-		jrn.Write(journal.Frame{
-			Stamp:   clock.Now(),
-			Source:  source,
-			Kind:    "ws",
-			Payload: json.RawMessage(raw),
-		})
+		writeFrame(jrn, source, "ws", raw)
 	}
-}
-
-// loadKalshiPEM returns the PEM bytes for the Kalshi signer, preferring
-// the inline value if present. Returns ("", "", err) only if neither is set
-// or the file read fails. The second return identifies the source for logs.
-func loadKalshiPEM(k config.Kalshi) ([]byte, string, error) {
-	if k.PrivateKey != "" {
-		return []byte(k.PrivateKey), "inline (KALSHI_PRIVATE_KEY)", nil
-	}
-	if k.PrivateKeyPath == "" {
-		return nil, "", errors.New("kalshi: no PEM source configured")
-	}
-	b, err := os.ReadFile(k.PrivateKeyPath)
-	if err != nil {
-		return nil, "", fmt.Errorf("kalshi: read private key %s: %w", k.PrivateKeyPath, err)
-	}
-	return b, "file (" + k.PrivateKeyPath + ")", nil
 }
 
 // redactKeyID shows only the first 8 chars of a UUID-ish ID, for safe logging.

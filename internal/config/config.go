@@ -63,12 +63,12 @@ type Kalshi struct {
 	PrivateKeyPath string `yaml:"-"`
 }
 
-// OpenMeteoLocation pairs a Kalshi series identifier set with NOAA grid coords.
+// OpenMeteoLocation is one named grid point to poll. Name must match a
+// station Location tag ("NY"/"MIA"/...) for boot-time coord validation.
 type OpenMeteoLocation struct {
-	Name   string   `yaml:"name"`
-	Series []string `yaml:"series"`
-	Lat    float64  `yaml:"lat"`
-	Lon    float64  `yaml:"lon"`
+	Name string  `yaml:"name"`
+	Lat  float64 `yaml:"lat"`
+	Lon  float64 `yaml:"lon"`
 }
 
 // OpenMeteo configures the NOAA GFS ensemble REST poller.
@@ -259,6 +259,14 @@ func (c Config) Validate() error {
 		}
 		if len(c.OpenMeteo.Locations) == 0 {
 			return errors.New("config: openmeteo.locations must list at least one location")
+		}
+		// An empty variable list serializes to `&hourly=`, which Open-Meteo
+		// rejects with a non-retryable HTTP 400. The poller would then boot
+		// clean, tick fetchFailuresTotal, and persist zero forecast frames
+		// forever — the silent "boots green, records nothing" trap ADR-0011
+		// fought on the journal side. Fail fast at config load instead.
+		if len(c.OpenMeteo.Variables) == 0 {
+			return errors.New("config: openmeteo.variables must list at least one hourly variable")
 		}
 		if c.OpenMeteo.PollInterval < time.Minute {
 			return errors.New("config: openmeteo.poll_interval must be >= 1m to avoid rate limits")

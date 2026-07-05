@@ -25,9 +25,6 @@ func (r Resolution) Contains(tempF float64) bool {
 	return tempF >= r.Lo && tempF < r.Hi
 }
 
-// Width returns Hi - Lo. Open-ended ranges return +Inf.
-func (r Resolution) Width() float64 { return r.Hi - r.Lo }
-
 // resolveUnknownBranchTotal counts the number of times Spec.Resolve()
 // was invoked on a Spec whose Kind is neither BracketBetween nor
 // BracketThreshold (i.e. BracketUnknown or any future-added kind that
@@ -99,8 +96,8 @@ func ResolveUnknownBranchTotal() uint64 {
 // branch is defensive — no production caller can reach it because
 // ParseTicker only produces Spec values with Kind ∈ {BracketBetween,
 // BracketThreshold}. Programmatic constructions (e.g. tests) that hit
-// it get a NaN-bounded Resolution (Contains() always returns false,
-// Width() returns NaN), the counter increments, and a one-time warn
+// it get a NaN-bounded Resolution (Contains() always returns false),
+// the counter increments, and a one-time warn
 // log fires per process so any future regression is observable.
 func (s Spec) Resolve() Resolution {
 	switch s.Kind {
@@ -140,8 +137,8 @@ func ResolveWithSiblings(spec Spec, siblings []Spec) Resolution {
 	if spec.Kind != BracketThreshold {
 		return spec.Resolve()
 	}
-	// Find min and max B-bracket keys among siblings (excluding spec itself).
-	minB, maxB := math.Inf(+1), math.Inf(-1)
+	// Find the minimum B-bracket key among siblings (excluding spec itself).
+	minB := math.Inf(+1)
 	for _, sib := range siblings {
 		if sib.Kind != BracketBetween {
 			continue
@@ -151,9 +148,6 @@ func ResolveWithSiblings(spec Spec, siblings []Spec) Resolution {
 		}
 		if sib.Key < minB {
 			minB = sib.Key
-		}
-		if sib.Key > maxB {
-			maxB = sib.Key
 		}
 	}
 	if math.IsInf(minB, +1) {

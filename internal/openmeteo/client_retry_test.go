@@ -36,6 +36,8 @@ func shortRetryPoller(t *testing.T, baseURL string, locs []Location) *Poller {
 	t.Helper()
 	p, err := NewPoller(Options{
 		BaseURL:             baseURL,
+		Model:               "gfs_seamless",
+		ForecastDays:        3,
 		PollInterval:        time.Minute,
 		Locations:           locs,
 		Logger:              discardLogger(),
@@ -170,6 +172,8 @@ func TestPoller_FailureCounter(t *testing.T) {
 	)
 	p, err := NewPoller(Options{
 		BaseURL:      srv.URL,
+		Model:        "gfs_seamless",
+		ForecastDays: 3,
 		PollInterval: time.Minute,
 		Locations: []Location{
 			{Name: "NY", Lat: 40, Lon: -73},
@@ -210,6 +214,78 @@ func TestPoller_FailureCounter(t *testing.T) {
 	require.Nil(t, nyRaw.Load(), "NY OnFetch should not fire on retry exhaustion")
 }
 
+// TestPoller_ClientTimeoutIsRetried guards the distinction between a
+// parent-context cancellation (clean shutdown) and an http.Client.Timeout
+// transient. Both surface as errors.Is(err, context.DeadlineExceeded), but
+// only the latter — where the parent ctx is still live — must be retried and
+// counted as a fetch failure rather than aborting the whole tick.
+//
+// The regression this pins: a single slow location was misclassified as
+// shutdown, so it was never retried AND every remaining location in the tick
+// was silently dropped with no bump to FetchFailuresTotal. Here NY hangs
+// past the client Timeout while LA is healthy; we assert NY is retried the
+// full envelope, LA is still fetched, and the failure counter increments.
+func TestPoller_ClientTimeoutIsRetried(t *testing.T) {
+	var nyHits, laHits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lat := r.URL.Query().Get("latitude")
+		if lat == "40.0000" {
+			nyHits.Add(1)
+			// Hang past the client Timeout, then bail when the request ctx
+			// dies so the goroutine doesn't leak past srv.Close.
+			select {
+			case <-time.After(10 * time.Second):
+			case <-r.Context().Done():
+			}
+			return
+		}
+		laHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":"LA"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	var laRaw atomic.Value // []byte
+	p, err := NewPoller(Options{
+		BaseURL:      srv.URL,
+		Model:        "gfs_seamless",
+		ForecastDays: 3,
+		PollInterval: time.Minute,
+		Locations: []Location{
+			{Name: "NY", Lat: 40, Lon: -73},
+			{Name: "LA", Lat: 34, Lon: -118},
+		},
+		Logger: discardLogger(),
+		// Client-side Timeout well below the server's 10s hang so Do returns
+		// a DeadlineExceeded transient while the parent ctx stays live.
+		Client:              &http.Client{Timeout: 40 * time.Millisecond},
+		RetryInitialBackoff: 5 * time.Millisecond,
+		RetryMaxBackoff:     20 * time.Millisecond,
+		RetryMaxAttempts:    3,
+		OnFetch: func(loc Location, raw []byte) {
+			if loc.Name == "LA" {
+				cp := make([]byte, len(raw))
+				copy(cp, raw)
+				laRaw.Store(cp)
+			}
+		},
+	})
+	require.NoError(t, err)
+
+	p.fetchAll(context.Background())
+
+	require.Equal(t, int64(3), nyHits.Load(),
+		"client timeout must be retried the full envelope, not misclassified as shutdown")
+	require.Equal(t, uint64(1), p.FetchFailuresTotal(),
+		"exhausted client timeout must count as a fetch failure")
+
+	require.Equal(t, int64(1), laHits.Load(),
+		"a slow location must not abandon the remaining locations in the tick")
+	got := laRaw.Load()
+	require.NotNil(t, got, "LA OnFetch should have fired despite NY timing out")
+	require.Equal(t, `{"ok":"LA"}`, string(got.([]byte)))
+}
+
 // TestPoller_BackoffEnvelope records server-hit timestamps and asserts the
 // inter-hit delays approximate the configured backoff schedule (1x, 2x,
 // 4x of InitialBackoff) within a tolerant jitter band. Uses a small
@@ -231,6 +307,8 @@ func TestPoller_BackoffEnvelope(t *testing.T) {
 
 	p, err := NewPoller(Options{
 		BaseURL:             srv.URL,
+		Model:               "gfs_seamless",
+		ForecastDays:        3,
 		PollInterval:        time.Minute,
 		Locations:           []Location{{Name: "NY", Lat: 40, Lon: -73}},
 		Logger:              discardLogger(),
@@ -286,6 +364,8 @@ func TestPoller_NetworkErrorRetries(t *testing.T) {
 
 	p, err := NewPoller(Options{
 		BaseURL:             addr,
+		Model:               "gfs_seamless",
+		ForecastDays:        3,
 		PollInterval:        time.Minute,
 		Locations:           []Location{{Name: "NY", Lat: 40, Lon: -73}},
 		Logger:              discardLogger(),

@@ -192,3 +192,13 @@ func (s Spec) Station() string {
 func (s Spec) IsHigh() bool {
 	return strings.HasPrefix(s.Series, "KXHIGH")
 }
+
+// Variable returns the calibration variable the series resolves on:
+// "tmax" for KXHIGH* (daily high), "tmin" for KXLOWT* (daily low).
+// This is the key the MOS, climate, and Bayesian layers bin by.
+func (s Spec) Variable() string {
+	if s.IsHigh() {
+		return "tmax"
+	}
+	return "tmin"
+}

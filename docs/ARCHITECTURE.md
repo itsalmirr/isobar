@@ -277,12 +277,14 @@ scanner.
 
 - HTTP `GET ensemble-api.open-meteo.com/v1/...` with a 30-second
   timeout and a 32 MiB response cap per fetch.
-- `NewPoller` validates `poll_interval >= 1m` at construction; Open-Meteo
-  free-tier rate limits forbid anything tighter.
+- The `poll_interval >= 1m` floor is enforced by `config.Validate`
+  (Open-Meteo free-tier rate limits forbid anything tighter);
+  `NewPoller` rejects a missing model/forecast-days/interval instead of
+  silently re-defaulting — `internal/config` owns the defaults.
 - `Run` fires the first fetch *immediately* (before the first ticker
   tick) so Phase 0 has data right after process start.
 - `Model` is a free-form string passed through verbatim to the API's
-  `models=` parameter (defaults to `"gfs_seamless"`). Multi-model
+  `models=` parameter (`config.Defaults` supplies `"gfs_seamless"`). Multi-model
   callers can pass `"gfs_seamless,ecmwf_ifs025"` to get both ensembles
   in one response; the per-member field-name fan-out is handled at decode
   time by `internal/edge.matchTemperatureMember`.
@@ -301,21 +303,22 @@ scanner.
 
 Single source of truth for the four-station registry plus the older
 market-ticker parser kept for `cmd/peek` and dashboards. Fees are *not*
-here anymore — they moved to `internal/edge.FeePerContractCents` so
+here anymore — they moved to `internal/edge.FeePerContractCentsMode` so
 all scanner-side concerns live in one package.
 
-- `Station{Code, Location, City, Lat, Lon, UTCOffsetHours, HighSeries,
-  LowSeries, CLIPil}` is the canonical record. Lookup helpers:
-  `AllStations`, `AllStationCodes`, `StationByCode`, `StationByLocation`,
-  `StationBySeries`. Linear-scan O(N) is intentional with N=4 —
-  benchmarks show it beats a hash map by ~3x on cache-line-resident
-  inputs. Switch to a map when N exceeds ~16.
+- `Station{Code, Location, Lat, Lon, TZ}` is the canonical record
+  (the unread `City`/`UTCOffsetHours`/`HighSeries`/`LowSeries`/`CLIPil`
+  fields were deleted in the Phase-2 reduction; the station↔series
+  mapping lives in `internal/edge`). Lookup helpers: `AllStations`,
+  `AllStationCodes`, `StationByCode`. Linear-scan O(N) is intentional
+  with N=4 — it beats a hash map on cache-line-resident inputs. Switch
+  to a map when N exceeds ~16.
 - Chicago resolves on `KMDW` (Midway), *not* `KORD` (O'Hare) — per
   ADR-0007 and commit `35d5622`. Adding a new station means appending
   to `allStations` *and* updating `scripts/calibration-fetch-*.sh` to
   include the matching code.
-- Per-location `UTCOffsetHours` is hardcoded for US daylight time
-  (April–October). Re-validate before any winter-month recording window.
+- Civil-day boundaries come from the IANA `TZ` field via
+  `StationTZ(code)`; the tz database handles DST transitions.
 - The market-ticker parser handles Kalshi's asymmetric naming
   (`KXHIGH{2-3-letter}` vs `KXLOWT{3-letter}`). Ticker shape is
   `<SERIES>-<YYMMMDD>-<{B|T}><KEY>`; the bracket-direction inference
@@ -349,10 +352,10 @@ Surface area, in dependency order:
   so per-member sparseness doesn't silently lose entire trades.
   `ErrInsufficientCoverage` only fires when *all* members miss the
   floor.
-- **Fee model** (`FeePerContractCents`, `RoundTripFeeCents`,
-  `EdgeAfterFeeCents`, constant `KalshiFeeBPS = 0.07`). Kalshi's
+- **Fee model** (`FeePerContractCentsMode`, `RoundTripFeeCentsMode`,
+  `EdgeAfterFeeCentsMode`, constant `KalshiTakerFeeBPS = 0.07`). Kalshi's
   parabolic taker fee `ceil(7·P·(1−P))` cents per side, peaking at
-  P=0.50 and zero at the boundaries. `RoundTripFeeCents` is currently
+  P=0.50 and zero at the boundaries. `RoundTripFeeCentsMode` is currently
   equal to one entry fee because Phase 0's hold-to-expiry strategy pays
   no settlement fee; the function exists as a separate entry point so
   cancel-and-quote strategies can swap to a genuine round-trip without

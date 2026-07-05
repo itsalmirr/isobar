@@ -116,6 +116,20 @@ type Options struct {
 	// events may pass NoopAlarmHook.
 	OnDropAlarm func(src string, drops uint64, since time.Duration)
 
+	// OnWriteError is invoked on every failed encode/write/flush/fsync on
+	// the writer path, carrying the source label and the running
+	// write-error count. Unlike OnDropAlarm it is OPTIONAL and nil-tolerant:
+	// a nil hook is skipped. It exists because the ADR-0011 drop counter
+	// and OnDropAlarm only observe queue-full drops on the enqueue side; a
+	// full disk or read-only filesystem drains the queue normally (never
+	// full → no drop alarm) while every frame is logged-and-discarded on
+	// the write side, re-introducing exactly the silent-loss failure mode
+	// ADR-0011 was built to eliminate. This hook (plus WriteErrorsTotal())
+	// is the parallel seam for that path; it deliberately does NOT
+	// multiplex onto OnDropAlarm, whose delta accounting and alarms-file
+	// schema are built around queue-drop counting.
+	OnWriteError func(src string, writeErrors uint64, err error)
+
 	// AlarmThreshold is the minimum sustained drops/sec rate that arms
 	// the alarm. 0 → 1 drop/sec.
 	AlarmThreshold uint64
@@ -151,6 +165,15 @@ type Journal struct {
 	// existing accessor and the health-check.sh operator script.
 	dropped atomic.Uint64
 
+	// writeErrors is the monotonic per-instance count of encode/write/
+	// flush/fsync failures on the writer path. Exposed via
+	// WriteErrorsTotal(). It is the write-side twin of dropped: dropped
+	// tracks queue-full losses on enqueue, writeErrors tracks losses that
+	// happen after a frame has been dequeued (ENOSPC, read-only FS, a
+	// closed fd). Kept separate so the ADR-0011 drop-alarm accounting and
+	// the alarms-file schema stay uncontaminated by write-path failures.
+	writeErrors atomic.Uint64
+
 	// Alarm machinery. droppedAtLastTick is the counter value sampled
 	// at the previous 1-second alarm tick; the delta is the per-second
 	// drop rate. alarmActive is the edge-trigger debounce — true while
@@ -175,6 +198,7 @@ type Journal struct {
 	alarmThreshold uint64
 	alarmSustain   time.Duration
 	onDropAlarm    func(src string, drops uint64, since time.Duration)
+	onWriteError   func(src string, writeErrors uint64, err error)
 }
 
 // ErrAlarmHookRequired is returned by Open when Options.OnDropAlarm
@@ -183,6 +207,12 @@ type Journal struct {
 // now a startup-time prerequisite, the same way Dir and Source are.
 // Tests that don't exercise drop events should pass NoopAlarmHook.
 var ErrAlarmHookRequired = errors.New("journal: Options.OnDropAlarm required (use NoopAlarmHook for tests)")
+
+// errNoOpenFile is the sentinel handed to the write-error path when a
+// frame is dequeued but there is no open file to write it to — the state
+// left behind when a re-open after a size rotate fails. It lets the
+// writer count the lost frame rather than nil-deref bw.Write.
+var errNoOpenFile = errors.New("journal: no open file (re-open after rotate failed)")
 
 // NoopAlarmHook is a placeholder hook that does nothing. Use it in
 // tests that don't care about drop events; production code must wire
@@ -228,6 +258,7 @@ func Open(opts Options, logger *slog.Logger) (*Journal, error) {
 		alarmThreshold: opts.AlarmThreshold,
 		alarmSustain:   opts.AlarmSustain,
 		onDropAlarm:    opts.OnDropAlarm,
+		onWriteError:   opts.OnWriteError,
 	}
 
 	j.logger.Info("journal: drop-alarm sink installed")
@@ -279,6 +310,15 @@ func (j *Journal) Write(f Frame) {
 // ADR-0011 §5 preserves this name for the operator health-check.sh
 // script and existing test assertions.
 func (j *Journal) Dropped() uint64 { return j.dropped.Load() }
+
+// WriteErrorsTotal returns the number of encode/write/flush/fsync
+// failures on the writer path. This is the write-side counterpart to
+// Dropped(): a persistent disk-full or read-only-filesystem condition
+// drains the queue without ever filling it, so Dropped() stays flat
+// while WriteErrorsTotal() climbs. Operators and the OnWriteError hook
+// use this as the primary signal that the tape is silently lossy on the
+// durability-critical path.
+func (j *Journal) WriteErrorsTotal() uint64 { return j.writeErrors.Load() }
 
 // AlarmHookPanicTotal returns the monotonic count of OnDropAlarm
 // invocations that panicked. Reads are atomic and safe from any
@@ -382,10 +422,12 @@ func (j *Journal) run() {
 		}
 		if err := bw.Flush(); err != nil {
 			j.logger.Error("flush failed", "err", err)
+			j.recordWriteError(err)
 			return
 		}
 		if err := f.Sync(); err != nil {
 			j.logger.Error("fsync failed", "err", err)
+			j.recordWriteError(err)
 		}
 	}
 
@@ -411,27 +453,52 @@ func (j *Journal) run() {
 	}
 
 	writeOne := func(e envelope) {
+		// A failed re-open after a size rotate leaves bw==nil while the
+		// run loop keeps draining the queue (see maybeRotateBySize); guard
+		// here so a dequeued frame cannot nil-deref bw.Write and kill the
+		// writer goroutine. Mirrors the same guards in flushAndSync and
+		// rotate. A nil bw means we have no destination, so the frame is a
+		// write loss and is counted as one.
+		if bw == nil {
+			j.recordWriteError(errNoOpenFile)
+			return
+		}
 		encBuf.Reset()
 		if err := encoder.Encode(&e); err != nil {
 			j.logger.Error("encode failed", "err", err)
+			j.recordWriteError(err)
 			return
 		}
 		// json.Encoder appends a newline already; bw.Write returns the byte count.
 		n, err := bw.Write(encBuf.Bytes())
 		if err != nil {
 			j.logger.Error("write failed", "err", err)
+			j.recordWriteError(err)
 			return
 		}
 		written += int64(n)
 	}
 
-	maybeRotateBySize := func() {
+	// maybeRotateBySize rotates the current file when it has grown past
+	// MaxFileBytes. It returns false when the post-rotate re-open fails —
+	// the caller must then return from run() so the writer goroutine exits
+	// cleanly instead of looping with bw==nil. This mirrors the age-rotate
+	// path's `return` on re-open failure (see the rotateTimer case) rather
+	// than falling through and leaving a nil bufio.Writer behind.
+	maybeRotateBySize := func() (ok bool) {
 		if j.opts.MaxFileBytes > 0 && written >= j.opts.MaxFileBytes {
 			rotate()
 			if err := open(); err != nil {
-				j.logger.Error("re-open after size rotate failed", "err", err)
+				j.logger.Error("re-open after size rotate failed; writer exiting", "err", err)
+				// The journal can no longer persist frames — the queue
+				// will drain into a nil file. Count this as a write-path
+				// failure and arm the OnWriteError hook so the operator
+				// sees the outage, not just a silent goroutine exit.
+				j.recordWriteError(err)
+				return false
 			}
 		}
+		return true
 	}
 
 	if err := open(); err != nil {
@@ -462,7 +529,9 @@ func (j *Journal) run() {
 				select {
 				case e := <-j.in:
 					writeOne(e)
-					maybeRotateBySize()
+					if !maybeRotateBySize() {
+						return
+					}
 				default:
 					flushAndSync()
 					if f != nil {
@@ -474,7 +543,9 @@ func (j *Journal) run() {
 
 		case e := <-j.in:
 			writeOne(e)
-			maybeRotateBySize()
+			if !maybeRotateBySize() {
+				return
+			}
 
 		case <-flushTimer.C:
 			flushAndSync()
@@ -591,6 +662,33 @@ func (j *Journal) safeInvokeAlarm(src string, drops uint64, since time.Duration)
 	j.onDropAlarm(src, drops, since)
 }
 
+// recordWriteError bumps the write-error counter and, if an OnWriteError
+// hook was supplied, invokes it under a deferred recover so a panicking
+// hook cannot kill the writer goroutine — the same guarantee
+// safeInvokeAlarm gives the drop path. Panics are folded into the
+// existing alarmHookPanics counter so AlarmHookPanicTotal() remains the
+// single "an operator hook misbehaved" signal. The counter always
+// advances even when the hook is nil, so WriteErrorsTotal() is a
+// complete tally regardless of whether a sink is wired.
+func (j *Journal) recordWriteError(err error) {
+	n := j.writeErrors.Add(1)
+	if j.onWriteError == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			j.alarmHookPanics.Add(1)
+			j.logger.Error("journal: OnWriteError panicked — writer survives, hook skipped this call",
+				"src", j.opts.Source,
+				"write_errors", n,
+				"recover", fmt.Sprintf("%v", r),
+				"stack", string(debug.Stack()),
+			)
+		}
+	}()
+	j.onWriteError(j.opts.Source, n, err)
+}
+
 // newPath builds dir/source/YYYY-MM-DD/source-HHMMSS.NNNNNNNNN.jsonl,
 // creating directories as needed.
 func newPath(dir, source string) (string, error) {
@@ -616,12 +714,28 @@ func gzipFile(src string) error {
 	if err != nil {
 		return err
 	}
-	defer out.Close()
 
 	gz := gzip.NewWriter(out)
 	if _, err := io.Copy(gz, in); err != nil {
 		_ = gz.Close()
+		_ = out.Close()
 		return err
 	}
-	return gz.Close()
+	if err := gz.Close(); err != nil {
+		_ = out.Close()
+		return err
+	}
+	// The .gz must be durable before rotate() unlinks the plain .jsonl
+	// (the only fsynced copy). gz.Close() flushes the gzip footer into
+	// out's kernel buffers but does not push them to stable storage; a
+	// power loss after os.Remove but before write-back would lose the
+	// rotated segment entirely. fsync here, then capture Close's error
+	// (a deferred blind Close would swallow an ENOSPC surfacing at
+	// close) so rotate() only removes the plain file when the compressed
+	// copy is truly on disk.
+	if err := out.Sync(); err != nil {
+		_ = out.Close()
+		return err
+	}
+	return out.Close()
 }

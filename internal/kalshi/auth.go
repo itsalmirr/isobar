@@ -8,10 +8,31 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/pem"
+	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"time"
 )
+
+// LoadPEM resolves the signer's private key from its two configured
+// sources, preferring the inline PEM when both are set (the same
+// precedence config.Validate documents for KALSHI_PRIVATE_KEY vs
+// KALSHI_PRIVATE_KEY_PATH). The second return is a source label
+// ("inline" / "file:<path>") safe for logging — never log the bytes.
+func LoadPEM(inline, path string) ([]byte, string, error) {
+	if inline != "" {
+		return []byte(inline), "inline", nil
+	}
+	if path == "" {
+		return nil, "", errors.New("kalshi: no PEM source configured")
+	}
+	b, err := os.ReadFile(path) //nolint:gosec // operator-supplied key path from config/env, not user input
+	if err != nil {
+		return nil, "", fmt.Errorf("kalshi: read private key %s: %w", path, err)
+	}
+	return b, "file:" + path, nil
+}
 
 // Signer produces RSA-PSS authentication headers for Kalshi API requests.
 type Signer struct {

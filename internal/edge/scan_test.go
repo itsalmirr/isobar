@@ -606,15 +606,15 @@ func TestScan_EndToEndMOS(t *testing.T) {
 		t.Errorf("calibration sanity: want P=%v outside [0.30, 0.50] band — fixture/math drifted?", want)
 	}
 
-	// EdgeCents = EdgeAfterFeeCents(PFair, yes_price_dollars). With
-	// PFair=PFairMOS ≈ 0.38 and yes_price=10c → 0.10:
+	// EdgeCents = EdgeAfterFeeCentsMode(PFair, yes_price_dollars, FeeTaker).
+	// With PFair=PFairMOS ≈ 0.38 and yes_price=10c → 0.10:
 	//   raw edge = round(0.38*100) - 10 - fee = 38 - 10 - ~1 = ~27¢.
 	// Lower bound is conservative — the precise integer depends on the
 	// MOS p and fee rounding, so we assert the edge math is consistent
-	// with the row's PFair via the public EdgeAfterFeeCents helper.
-	wantEdge := EdgeAfterFeeCents(row.PFair, 0.10)
+	// with the row's PFair via the public EdgeAfterFeeCentsMode helper.
+	wantEdge := EdgeAfterFeeCentsMode(row.PFair, 0.10, FeeTaker)
 	if row.EdgeCents != wantEdge {
-		t.Errorf("EdgeCents = %d, want %d (= EdgeAfterFeeCents(PFair=%v, 0.10))",
+		t.Errorf("EdgeCents = %d, want %d (= EdgeAfterFeeCentsMode(PFair=%v, 0.10, FeeTaker))",
 			row.EdgeCents, wantEdge, row.PFair)
 	}
 	if row.EdgeCents <= 0 {
@@ -623,29 +623,17 @@ func TestScan_EndToEndMOS(t *testing.T) {
 	}
 }
 
-// TestPollModelSet_CacheConsistency locks in the equivalence claim made
-// by the A11 caching change (perf/poll-modelset-cache): the precomputed
-// Poll.ModelSet field, populated once by ParsePoll, must equal the
-// per-trade pollModelSet(extremes) computation that the scan hot path
-// previously did, for the typical case where all members survive the
-// MinHourlySamplesPerMember coverage filter.
+// TestParsePoll_ModelSetMatchesMembers guards against drift between the
+// precomputed Poll.ModelSet field and its producer: ParsePoll must fill
+// ModelSet with exactly pollModelSetFromMembers(members) for every poll
+// it emits. The scan hot path reads Poll.ModelSet directly (scan.go), so
+// if ParsePoll ever stopped keeping the two in step, the model-set
+// mismatch guard would compare against a stale set.
 //
 // Verifies for two representative shapes:
-//   - single-model GFS-only (matches synthPoll: 3 bare-numeric members)
-//   - multi-model GFS+ECMWF (matches synthMultiModelPoll: one of each)
-//
-// Each case parses the poll the same way Scan does, derives the
-// extremes map via DailyExtremesF (the unfiltered, all-coverage path
-// would be even simpler but DailyExtremesF is what Scan actually
-// calls), then asserts ModelSetEqual(poll.ModelSet, pollModelSet(extremes)).
-// If this ever drifts, A11's "cache is safe" claim has regressed.
-func TestPollModelSet_CacheConsistency(t *testing.T) {
-	tz, err := time.LoadLocation("America/New_York")
-	if err != nil {
-		t.Fatalf("LoadLocation: %v", err)
-	}
-	civilDate := time.Date(2026, 4, 29, 0, 0, 0, 0, time.UTC)
-
+//   - single-model GFS-only (synthPoll: 3 bare-numeric members)
+//   - multi-model GFS+ECMWF (synthMultiModelPoll: one of each)
+func TestParsePoll_ModelSetMatchesMembers(t *testing.T) {
 	cases := []struct {
 		name string
 		raw  []byte
@@ -659,14 +647,10 @@ func TestPollModelSet_CacheConsistency(t *testing.T) {
 			if parseErr != nil {
 				t.Fatalf("ParsePoll: %v", parseErr)
 			}
-			extremes, extErr := poll.DailyExtremesF(civilDate, tz)
-			if extErr != nil {
-				t.Fatalf("DailyExtremesF: %v", extErr)
-			}
-			fromExtremes := pollModelSet(extremes)
-			if !mos.ModelSetEqual(poll.ModelSet, fromExtremes) {
-				t.Errorf("Poll.ModelSet=%v != pollModelSet(extremes)=%v; the cached precompute drifted from the per-trade derivation",
-					poll.ModelSet, fromExtremes)
+			want := pollModelSetFromMembers(poll.Members)
+			if !mos.ModelSetEqual(poll.ModelSet, want) {
+				t.Errorf("Poll.ModelSet=%v != pollModelSetFromMembers(members)=%v; ParsePoll drifted from its producer",
+					poll.ModelSet, want)
 			}
 			if len(poll.ModelSet) == 0 {
 				t.Errorf("Poll.ModelSet is empty; ParsePoll must populate it for every non-empty Members map")

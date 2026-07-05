@@ -56,7 +56,7 @@ Checklist immediately after start (first 60s):
 - [ ] `journal opened` appears for each enabled source.
 - [ ] First record in today's `data/kalshi/<date>/*.jsonl` and
       `data/openmeteo/<date>/*.jsonl` is a `kind:"boot"` frame with
-      `src:"isobar-tape"` and `schema_version:"isobar-tape.boot/v1"`
+      `src:"isobar-tape"` and `schema_version:"isobar-tape.boot/v2"`
       (see §3.1).
 - [ ] If `data/alarms/<today>.jsonl` exists from a prior run, eyeball it
       before believing the new tape is clean (see §3.2).
@@ -155,10 +155,12 @@ ls -lt data/kalshi/$(date -u +%Y-%m-%d) | head -5
 Every `cmd/tape` start emits a single `kind:"boot"` frame as the first
 record in **both** `data/kalshi/<date>/<file>.jsonl` and
 `data/openmeteo/<date>/<file>.jsonl` for that run. Source: see
-[`cmd/tape/main.go:140`](../cmd/tape/main.go) (`bootSchemaVersion`) +
-[`writeBootFrame` at :157](../cmd/tape/main.go).
+[`cmd/tape/main.go:144`](../cmd/tape/main.go) (`bootSchemaVersion`) +
+[`writeBootFrame` at :173](../cmd/tape/main.go).
 
-Payload shape (`schema_version:"isobar-tape.boot/v1"`):
+Payload shape (`schema_version:"isobar-tape.boot/v2"`; v1 frames on
+older tape additionally carried the since-deleted Station fields
+`City`/`UTCOffsetHours`/`HighSeries`/`LowSeries`/`CLIPil`):
 
 ```jsonc
 {
@@ -171,8 +173,8 @@ Payload shape (`schema_version:"isobar-tape.boot/v1"`):
     "build_commit":  "<short-sha>",
     "build_version": "<git describe>",   // optional
     "build_time":    "<RFC 3339>",       // optional
-    "stations": [ { "Code":"KNYC", … }, … ],  // market.AllStationsCanonical()
-    "schema_version": "isobar-tape.boot/v1"
+    "stations": [ { "Code":"KNYC", "Location":"NY", "Lat":40.7794, "Lon":-73.9692, "TZ":"America/New_York" }, … ],  // market.AllStationsCanonical()
+    "schema_version": "isobar-tape.boot/v2"
   }
 }
 ```

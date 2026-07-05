@@ -74,9 +74,10 @@ We also standardize on these facts:
 - **Good:** Any future series-name surprise is 60 seconds of
   `make run-peek` away from a definitive answer. No more recording
   into a black hole.
-- **Good:** `cmd/peek` carries `kalshi.Client.GetRaw` (a minimal public
-  wrapper on the private `getRaw`) which is itself useful for any ops
-  tool that needs arbitrary signed GETs.
+- **Good:** `cmd/peek` uses `kalshi.Client.GetMarketsPage` for its
+  probe. (An earlier `kalshi.Client.GetRaw` arbitrary-path wrapper was
+  removed in the Phase-1 reduction sweep along with the rest of the
+  unused trading/portfolio surface; recovery is git history.)
 - **Bad:** One more binary to maintain and keep compiling. Trivial —
   peek has no runtime dependencies beyond what `cmd/tape` already uses.
 - **Bad:** `peek` authenticates with the same Kalshi key as production.

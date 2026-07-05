@@ -11,9 +11,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestLoadHourlyCSV_RoundTrip mirrors the cmd/calibrate-bayesian
-// loadHourly test against the shared loader; ensures the same
-// best-effort schema policy as the internal one.
+// TestLoadHourlyCSV_RoundTrip covers UTC parse, ascending sort, and the
+// best-effort skip of missing ("M"), trace ("T"), and unparseable rows.
+// Sole test for this loader — the fitter's mirror copy was deleted.
 func TestLoadHourlyCSV_RoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "KNYC-hourly.csv")
@@ -33,6 +33,8 @@ func TestLoadHourlyCSV_RoundTrip(t *testing.T) {
 		assert.True(t, hr[i-1].TS.Before(hr[i].TS), "sorted ascending")
 	}
 	assert.Equal(t, 54.0, hr[0].TmpF)
+	assert.Equal(t, 52.0, hr[1].TmpF)
+	assert.Equal(t, 52.0, hr[2].TmpF)
 	assert.Equal(t, time.UTC, hr[0].TS.Location())
 }
 
