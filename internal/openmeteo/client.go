@@ -179,8 +179,11 @@ func (p *Poller) fetchAll(ctx context.Context) {
 		raw, err := p.fetchWithRetry(ctx, loc)
 		if err != nil {
 			// Ctx cancellation isn't a fetch failure — it's clean shutdown.
-			// Don't bump the counter or warn loudly.
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			// Don't bump the counter or warn loudly. Checked on ctx
+			// itself: an exhausted retry envelope whose last error was a
+			// client-side timeout also unwraps to DeadlineExceeded, and
+			// that IS a fetch failure that must count.
+			if ctx.Err() != nil {
 				return
 			}
 			p.fetchFailuresTotal.Add(1)
@@ -243,9 +246,15 @@ func (p *Poller) fetchWithRetry(ctx context.Context, loc Location) ([]byte, erro
 			nextBackoff = 0
 		}
 
-		// Context errors propagate immediately as non-retryable so the
-		// caller can return ctx.Err() upstream.
-		if errors.Is(fetchErr, context.Canceled) || errors.Is(fetchErr, context.DeadlineExceeded) {
+		// Parent-context cancellation propagates immediately as
+		// non-retryable so the caller can return ctx.Err() upstream.
+		// The check is on ctx itself, NOT errors.Is(fetchErr,
+		// context.DeadlineExceeded): a per-request http.Client timeout
+		// also unwraps to DeadlineExceeded, and that is exactly the
+		// transient "timeout" the package doc promises to retry. The
+		// old error-value check silently exempted every client-side
+		// timeout from the retry envelope.
+		if ctx.Err() != nil {
 			nonRetryableErr = fetchErr
 			p.logAttempt(ctx, slog.LevelDebug, "openmeteo fetch attempt", loc, attempt, latency, statusCode, fetchErr, 0)
 			return nil
@@ -334,13 +343,12 @@ func nextBackoffFor(attempt int, initial, max time.Duration) time.Duration {
 // isRetryable returns true for transient I/O failures: network errors
 // (dial / timeout / reset / EOF — anything where statusCode is 0 because
 // we never got a response) and HTTP 5xx / 429. Returns false for HTTP
-// 4xx other than 429 (we sent a bad request) and ctx errors (caller's
-// decision).
+// 4xx other than 429 (we sent a bad request). Parent-context
+// cancellation is handled by the caller before this is consulted —
+// deliberately not via errors.Is here, because per-request client
+// timeouts also unwrap to context.DeadlineExceeded and must retry.
 func isRetryable(err error, statusCode int) bool {
 	if err == nil {
-		return false
-	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
 	if statusCode == 0 {
