@@ -110,9 +110,10 @@ wrapper does not currently forward `--mos`; pass it on the underlying
 
 ## CSV column reference
 
-`cmd/edge-scan/main.go` writes the columns in this order. Backtest-mode
-columns (last five) are populated only when `--truth` is set; otherwise
-they are blank / `false` / `0`.
+`cmd/edge-scan/main.go` writes the columns in this order. The `bayes_*`
+columns are populated only when `--bayesian-kernel` + `--hourly-obs`
+are set; the backtest-mode columns (last five) only when `--truth` is
+set. Otherwise they are blank / `false` / `0`.
 
 | Column | Type | Meaning |
 |---|---|---|
@@ -126,18 +127,23 @@ they are blank / `false` / `0`.
 | `trade_price_cents` | int | executed YES-price in integer cents |
 | `p_fair_naive` | float | fraction of ensemble members in bracket |
 | `p_fair_mos` | float | MOS-calibrated p_fair; 0 when MOS not applied |
-| `p_fair` | float | the p_fair used for edge math (MOS if applied, else naive) |
-| `mos_applied` | bool | true iff `p_fair` came from MOS |
+| `p_fair` | float | the p_fair used for edge math (Bayes if applied, else MOS, else naive) |
+| `mos_applied` | bool | true iff MOS produced a valid prior for this row |
 | `climate_p` | float | bare climate empirical frequency; blank when no obs |
 | `p_fair_climate_shrunk` | float | `0.2·climate + 0.8·naive`; blank when climate_p is blank |
 | `climate_applied` | bool | true iff climate-shrunk was computable |
 | `edge_climate_shrunk_cents` | int | post-fee edge using climate-shrunk p_fair |
+| `p_fair_bayes` | float | posterior p_fair after the T−3h update; 0 when not applied |
+| `bayes_applied` | bool | true iff the posterior update fired for this row |
+| `bayes_skip_reason` | string | why not: `no_prior`, `wrong_civil_day`, `cold_start`, `h_remain_zero`, `prior-only`, or blank |
+| `bayes_running_temp_f` | float | R(t) at trade time; blank when not applied |
+| `bayes_h_remain` | int | integer hours to civil-day close; blank when not applied |
+| `bayes_obs_weight` | float | posterior ObsWeight (1 = obs-dominated); blank when not applied |
 | `n_members` | int | ensemble member count contributing to p_fair_naive |
 | `n_members_in_bkt` | int | subset whose daily extreme landed in bracket |
 | `poll_age_s` | int | seconds between trade and the paired poll |
-| `fee_cents` | int | Kalshi parabolic taker fee at the trade price |
-| `edge_cents` | int | `\|p_fair − price\| · 100 − fee` (the entry threshold |
-| | | uses this) |
+| `fee_cents` | int | Kalshi parabolic fee at the trade price (taker by default; maker with `--maker-fees`) |
+| `edge_cents` | int | `\|p_fair − price\| · 100 − fee` (the entry threshold uses this) |
 | `has_truth` | bool | true iff `(station, valid_date)` was in `TruthIndex` |
 | `actual_temp_f` | int | TMAX (`KXHIGH*`) or TMIN (`KXLOWT*`) on `valid_date` |
 | `yes_resolved` | bool | true iff the bracket would have paid YES |
@@ -146,11 +152,12 @@ they are blank / `false` / `0`.
 
 ## Sample output
 
-A small excerpt from a tradeable-edge row:
+A small excerpt from a tradeable-edge row (run without
+`--bayesian-kernel`, so the `bayes_*` columns are at their defaults):
 
 ```csv
-ts_ms,ticker,series,valid_date,bracket_kind,bracket_key,side,trade_price_cents,p_fair_naive,p_fair_mos,p_fair,mos_applied,climate_p,p_fair_climate_shrunk,climate_applied,edge_climate_shrunk_cents,n_members,n_members_in_bkt,poll_age_s,fee_cents,edge_cents,has_truth,actual_temp_f,yes_resolved,our_side,our_pnl_cents
-1714431512000,KXHIGHNY-26APR29-B62.5,KXHIGHNY,2026-04-29,B,62.5,yes,38,0.6452,0.6217,0.6217,true,0.5806,0.6323,true,23,31,20,142,2,22,true,63,true,yes,60
+ts_ms,ticker,series,valid_date,bracket_kind,bracket_key,side,trade_price_cents,p_fair_naive,p_fair_mos,p_fair,mos_applied,climate_p,p_fair_climate_shrunk,climate_applied,edge_climate_shrunk_cents,p_fair_bayes,bayes_applied,bayes_skip_reason,bayes_running_temp_f,bayes_h_remain,bayes_obs_weight,n_members,n_members_in_bkt,poll_age_s,fee_cents,edge_cents,has_truth,actual_temp_f,yes_resolved,our_side,our_pnl_cents
+1777477112000,KXHIGHNY-26APR29-B62.5,KXHIGHNY,2026-04-29,B,62.5,yes,38,0.6452,0.6217,0.6217,true,0.5806,0.6323,true,23,0.0000,false,,,,,31,20,142,2,22,true,63,true,yes,60
 ```
 
 Reading it column-by-column:
@@ -185,9 +192,9 @@ every Spec observed in the scan window, groups by
 T-bracket's key is at or below the lowest sibling B midpoint — if so,
 it flips to `(−Inf, K)`. Commit
 `a0d1c26` ("fix(edge): use ResolveWithSiblings for T-brackets") landed
-this in Lane A; the bracket-convention check itself is still marked
-FIXME in `internal/edge/resolution.go` and needs verification against
-a Kalshi market detail page before live trading.
+this in Lane A; the bracket convention itself (previously a FIXME) has
+since been locked in — see the evidence notes on `Spec.Resolve` in
+`internal/edge/resolution.go` and its tests.
 
 **Truth-file coverage windows.** NWS CLI bulletins are usually issued
 the morning after the civil date they resolve (`D+1` AM). When asking
