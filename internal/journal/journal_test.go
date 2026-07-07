@@ -385,8 +385,8 @@ func TestJournalSurvivesFailedReopenAfterRotate(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, entries)
 	dayDir := filepath.Join(dir, entries[0].Name())
-	require.NoError(t, os.Chmod(dayDir, 0o500))
-	t.Cleanup(func() { _ = os.Chmod(dayDir, 0o750) })
+	require.NoError(t, os.Chmod(dayDir, 0o500))       //nolint:gosec // directory mode for failure injection, not a secret file
+	t.Cleanup(func() { _ = os.Chmod(dayDir, 0o750) }) //nolint:gosec // restore the journal package's own dir mode
 
 	// Frame 2 rotates again; the re-open now fails. Frame 3 hits the
 	// writer with no open file — pre-fix this was a nil-pointer panic
@@ -399,7 +399,7 @@ func TestJournalSurvivesFailedReopenAfterRotate(t *testing.T) {
 
 	// Restore write permission: the writer must lazily re-open and
 	// resume journaling without a restart.
-	require.NoError(t, os.Chmod(dayDir, 0o750))
+	require.NoError(t, os.Chmod(dayDir, 0o750)) //nolint:gosec // journal dirs are created 0o750 by newPath
 	j.Write(Frame{Source: "test", Kind: "recovered", Payload: json.RawMessage(`"back"`)})
 	require.Eventually(t, func() bool {
 		for _, p := range walkExt(t, dir, ".jsonl") {
