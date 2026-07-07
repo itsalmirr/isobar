@@ -106,6 +106,36 @@ func TestSeriesParsesFeeParams(t *testing.T) {
 	}
 }
 
+// TestEventsStopsOnEmptyPageWithCursor guards the pagination loop
+// against an API quirk the kalshi REST client already defends against:
+// a page with zero events but a non-empty cursor. Without the guard,
+// Events would re-request the same cursor forever.
+func TestEventsStopsOnEmptyPageWithCursor(t *testing.T) {
+	var hits int
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if r.URL.Query().Get("cursor") == "" {
+			_, _ = w.Write([]byte(eventsPage1)) // cursor "abc123", 1 event
+			return
+		}
+		// Every subsequent page: empty events, cursor still set.
+		_, _ = w.Write([]byte(`{"cursor":"abc123","events":[]}`))
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	events, err := c.Events(ctx, "KXHIGHNY", "open")
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("len(events) = %d, want 1", len(events))
+	}
+	if hits != 2 {
+		t.Fatalf("hits = %d, want 2 (one real page, one empty page, then stop)", hits)
+	}
+}
+
 func TestEventsNon200IsError(t *testing.T) {
 	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "nope", http.StatusTooManyRequests)
