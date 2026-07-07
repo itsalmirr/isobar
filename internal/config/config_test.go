@@ -325,6 +325,25 @@ func TestValidateStationCoordsSkipsUnknownLocation(t *testing.T) {
 	}))
 }
 
+// TestLoadExampleConfig is the shipped-artifact guard: the Quickstart
+// tells operators to `cp config/config.example.yaml config/config.yaml`,
+// so the example itself must pass Load end-to-end — including the
+// canonical station-coordinate validation. (Regression: the example
+// shipped downtown-Miami coords for MIA, ~3.5 km from KMIA, so a fresh
+// checkout following the README refused to boot with a coord-drift
+// error.)
+func TestLoadExampleConfig(t *testing.T) {
+	clearAllKnownEnv(t)
+	t.Setenv("KALSHI_API_KEY_ID", "k")
+	t.Setenv("KALSHI_PRIVATE_KEY_PATH", "/tmp/fake.pem")
+
+	cfg, err := Load(filepath.Join("..", "..", "config", "config.example.yaml"))
+	require.NoError(t, err, "the shipped example config must boot")
+	require.True(t, cfg.Kalshi.Enabled)
+	require.True(t, cfg.OpenMeteo.Enabled)
+	require.Len(t, cfg.OpenMeteo.Locations, 4)
+}
+
 // TestLoadFailsOnDriftedCHICoords is the end-to-end Load-level guard:
 // a YAML file with the historical ORD coords for CHI must cause Load
 // to return an error rather than silently boot the recorder.
