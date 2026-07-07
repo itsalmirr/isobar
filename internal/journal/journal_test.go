@@ -352,6 +352,68 @@ func TestJournalAgeBasedRotation(t *testing.T) {
 	require.GreaterOrEqual(t, len(files), 2, "age-based rotation should produce >=2 files")
 }
 
+// TestJournalSurvivesFailedReopenAfterRotate is the regression guard
+// for the writer-goroutine crash: when the re-open after a size
+// rotation fails (disk full, permissions, dir removed), the writer
+// used to dereference the nil bufio.Writer on the next frame and
+// panic — killing the whole recorder process. The writer must instead
+// drop-and-count while the disk is unwritable and recover once it is
+// writable again.
+func TestJournalSurvivesFailedReopenAfterRotate(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permission-based failure injection is a no-op as root")
+	}
+	j, dir := newTestJournal(t, Options{
+		MaxFileBytes: 1 << 8, // 256 B — a single frame triggers rotation
+		MaxFileAge:   time.Hour,
+		QueueSize:    64,
+		SampleEvery:  1, // log every dropped frame (sampling not under test)
+	})
+	defer func() { _ = j.Close() }()
+
+	big := json.RawMessage(`{"pad":"` + strings.Repeat("x", 300) + `"}`)
+
+	// Frame 1 exceeds MaxFileBytes → the writer rotates and re-opens.
+	j.Write(Frame{Source: "test", Kind: "x", Payload: big})
+	require.Eventually(t, func() bool {
+		return len(walkExt(t, dir, ".jsonl")) >= 2
+	}, 2*time.Second, 5*time.Millisecond, "first rotation should re-open a second file")
+
+	// Make the day directory unwritable so the NEXT rotation's re-open
+	// fails. newPath targets dir/<YYYY-MM-DD>/.
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	require.NotEmpty(t, entries)
+	dayDir := filepath.Join(dir, entries[0].Name())
+	require.NoError(t, os.Chmod(dayDir, 0o500))
+	t.Cleanup(func() { _ = os.Chmod(dayDir, 0o750) })
+
+	// Frame 2 rotates again; the re-open now fails. Frame 3 hits the
+	// writer with no open file — pre-fix this was a nil-pointer panic
+	// that took down the process (and this test binary).
+	j.Write(Frame{Source: "test", Kind: "x", Payload: big})
+	j.Write(Frame{Source: "test", Kind: "x", Payload: big})
+	require.Eventually(t, func() bool {
+		return j.Dropped() >= 1
+	}, 2*time.Second, 5*time.Millisecond, "frames while unwritable must be counted as drops")
+
+	// Restore write permission: the writer must lazily re-open and
+	// resume journaling without a restart.
+	require.NoError(t, os.Chmod(dayDir, 0o750))
+	j.Write(Frame{Source: "test", Kind: "recovered", Payload: json.RawMessage(`"back"`)})
+	require.Eventually(t, func() bool {
+		for _, p := range walkExt(t, dir, ".jsonl") {
+			b, readErr := os.ReadFile(p) //nolint:gosec // test-local path under t.TempDir()
+			if readErr == nil && bytes.Contains(b, []byte(`"recovered"`)) {
+				return true
+			}
+		}
+		return false
+	}, 2*time.Second, 5*time.Millisecond, "writer must recover once the dir is writable again")
+
+	require.NoError(t, j.Close())
+}
+
 // TestJournalDropReportLogsWhenQueueFills drives the drop-report
 // ticker branch (count > 0 triggers a warn log). We shrink
 // dropReportInterval, overflow the queue, and wait for at least one

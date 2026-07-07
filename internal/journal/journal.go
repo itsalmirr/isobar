@@ -411,6 +411,24 @@ func (j *Journal) run() {
 	}
 
 	writeOne := func(e envelope) {
+		// A prior rotate left us without an open file (the re-open
+		// failed — disk full, permissions, dir removed). Retry lazily
+		// per frame instead of dereferencing the nil writer: the panic
+		// would kill the writer goroutine and, with it, the whole
+		// recorder. Frames lost while the disk is unwritable are
+		// counted into the same dropped counter the queue-full path
+		// uses, so Dropped() and the ADR-0011 drop alarm surface the
+		// outage instead of it being silent (or fatal).
+		if bw == nil {
+			if err := open(); err != nil {
+				n := j.dropped.Add(1)
+				if j.sampleEvery > 0 && n%j.sampleEvery == 0 {
+					j.logger.Error("journal: no open file (re-open failing); frame dropped",
+						"err", err, "total_drops", n)
+				}
+				return
+			}
+		}
 		encBuf.Reset()
 		if err := encoder.Encode(&e); err != nil {
 			j.logger.Error("encode failed", "err", err)
@@ -429,7 +447,9 @@ func (j *Journal) run() {
 		if j.opts.MaxFileBytes > 0 && written >= j.opts.MaxFileBytes {
 			rotate()
 			if err := open(); err != nil {
-				j.logger.Error("re-open after size rotate failed", "err", err)
+				// Not fatal: writeOne retries the open lazily on the
+				// next frame and counts drops in the meantime.
+				j.logger.Error("re-open after size rotate failed; will retry per frame", "err", err)
 			}
 		}
 	}
@@ -483,8 +503,13 @@ func (j *Journal) run() {
 			if j.opts.MaxFileAge > 0 && f != nil && time.Since(opened) >= j.opts.MaxFileAge {
 				rotate()
 				if err := open(); err != nil {
-					j.logger.Error("re-open after age rotate failed", "err", err)
-					return
+					// Keep the writer alive: writeOne retries the open
+					// lazily per frame and counts drops. Exiting here
+					// (the previous behaviour) silently stopped all
+					// journaling for the rest of the process while
+					// producers kept enqueueing into a queue nobody
+					// drained — with no counter and no alarm.
+					j.logger.Error("re-open after age rotate failed; will retry per frame", "err", err)
 				}
 			}
 
@@ -570,10 +595,11 @@ func (j *Journal) checkDropAlarm() {
 // AlarmHookPanicTotal() (or, in Phase 6, the Prometheus gauge).
 func (j *Journal) safeInvokeAlarm(src string, drops uint64, since time.Duration) {
 	if j.onDropAlarm == nil {
-		// Belt-and-braces: Open() always installs a non-nil hook
-		// (custom or default-slog-warn fallback). Guarding here so a
-		// future refactor that resets j.onDropAlarm cannot reintroduce
-		// a nil-deref crash in the writer goroutine.
+		// Belt-and-braces: Open() refuses a nil hook up front
+		// (ErrAlarmHookRequired), so this cannot be nil in a
+		// constructed Journal. Guarding here so a future refactor
+		// that resets j.onDropAlarm cannot reintroduce a nil-deref
+		// crash in the writer goroutine.
 		return
 	}
 	defer func() {
@@ -591,8 +617,9 @@ func (j *Journal) safeInvokeAlarm(src string, drops uint64, since time.Duration)
 	j.onDropAlarm(src, drops, since)
 }
 
-// newPath builds dir/source/YYYY-MM-DD/source-HHMMSS.NNNNNNNNN.jsonl,
-// creating directories as needed.
+// newPath builds dir/YYYY-MM-DD/source-HHMMSS.NNNNNNNNN.jsonl, creating
+// directories as needed. Callers that want a per-source tree (cmd/tape
+// does) pass a Dir that already ends in the source segment.
 func newPath(dir, source string) (string, error) {
 	now := time.Now().UTC()
 	day := now.Format("2006-01-02")
@@ -604,7 +631,10 @@ func newPath(dir, source string) (string, error) {
 	return filepath.Join(folder, fmt.Sprintf("%s-%s.jsonl", source, stamp)), nil
 }
 
-// gzipFile compresses src into src+".gz". Returns nil on success.
+// gzipFile compresses src into src+".gz". Returns nil on success. The
+// output file's Close error is propagated (not deferred-and-dropped):
+// the caller deletes the plain file on success, so a swallowed close
+// error could destroy the only good copy of the data.
 func gzipFile(src string) error {
 	in, err := os.Open(src) //nolint:gosec // src is a journal file path we wrote ourselves
 	if err != nil {
@@ -616,12 +646,16 @@ func gzipFile(src string) error {
 	if err != nil {
 		return err
 	}
-	defer out.Close()
 
 	gz := gzip.NewWriter(out)
 	if _, err := io.Copy(gz, in); err != nil {
 		_ = gz.Close()
+		_ = out.Close()
 		return err
 	}
-	return gz.Close()
+	if err := gz.Close(); err != nil {
+		_ = out.Close()
+		return err
+	}
+	return out.Close()
 }
