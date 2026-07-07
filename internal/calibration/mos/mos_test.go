@@ -386,6 +386,67 @@ func TestFitFlagsTrainingFallbackWhenHoldoutTooSmall(t *testing.T) {
 	}
 }
 
+// TestFitHoldoutBoundary pins the train/holdout split exactly:
+// holdoutDays=N reserves precisely the final N civil dates, and
+// holdoutDays=0 reserves nothing. The previous boundary
+// (maxDate − N·24h, inclusive) held out N+1 days — with N=0 the final
+// day was silently diverted out of training even though callers asked
+// for "no holdout".
+func TestFitHoldoutBoundary(t *testing.T) {
+	startDate, _ := time.Parse("2006-01-02", "2024-04-01")
+	mkPairs := func(days, perDay int) []Pair {
+		var pairs []Pair
+		for d := 0; d < days; d++ {
+			for k := 0; k < perDay; k++ {
+				x := 60.0 + float64(k)
+				pairs = append(pairs, Pair{
+					Station: "KNYC", ValidDate: startDate.AddDate(0, 0, d),
+					Variable: "tmax", Forecast: x, Observed: x + 1 + 0.1*float64(k%3),
+				})
+			}
+		}
+		return pairs
+	}
+
+	t.Run("holdoutDays=0 keeps every pair in training", func(t *testing.T) {
+		const days, perDay = 20, 3
+		c, err := Fit(mkPairs(days, perDay), 0, testClock())
+		if err != nil {
+			t.Fatalf("Fit: %v", err)
+		}
+		bc := c.Bins[binKey("KNYC", "MAM", "tmax")]
+		if bc.NTrain != days*perDay {
+			t.Errorf("NTrain = %d, want %d (all pairs)", bc.NTrain, days*perDay)
+		}
+		if bc.NHoldout != 0 {
+			t.Errorf("NHoldout = %d, want 0", bc.NHoldout)
+		}
+	})
+
+	t.Run("holdoutDays=5 reserves exactly the final 5 dates", func(t *testing.T) {
+		const days, perDay, holdout = 20, 3, 5
+		c, err := Fit(mkPairs(days, perDay), holdout, testClock())
+		if err != nil {
+			t.Fatalf("Fit: %v", err)
+		}
+		bc := c.Bins[binKey("KNYC", "MAM", "tmax")]
+		if bc.NTrain != (days-holdout)*perDay {
+			t.Errorf("NTrain = %d, want %d", bc.NTrain, (days-holdout)*perDay)
+		}
+		if bc.NHoldout != holdout*perDay {
+			t.Errorf("NHoldout = %d, want %d", bc.NHoldout, holdout*perDay)
+		}
+		// Window labels bracket the split: training ends the day before
+		// the holdout starts.
+		if want := startDate.AddDate(0, 0, days-holdout).Format("2006-01-02"); c.HoldoutWindowStart != want {
+			t.Errorf("HoldoutWindowStart = %s, want %s", c.HoldoutWindowStart, want)
+		}
+		if want := startDate.AddDate(0, 0, days-holdout-1).Format("2006-01-02"); c.TrainingWindowEnd != want {
+			t.Errorf("TrainingWindowEnd = %s, want %s", c.TrainingWindowEnd, want)
+		}
+	})
+}
+
 // TestLoadCoefficients_LegacyFileBackCompat: a Coefficients JSON written
 // before FitModelSet existed must still load — defaulting to ["gfs"] —
 // rather than erroring. Without this back-compat, every existing
