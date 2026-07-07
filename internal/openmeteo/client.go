@@ -257,7 +257,7 @@ func (p *Poller) fetchWithRetry(ctx context.Context, loc Location) ([]byte, erro
 		if ctx.Err() != nil {
 			nonRetryableErr = fetchErr
 			p.logAttempt(ctx, slog.LevelDebug, "openmeteo fetch attempt", loc, attempt, latency, statusCode, fetchErr, 0)
-			return nil
+			return nil //nolint:nilerr // stops retry.Do; fetchWithRetry surfaces ctx.Err() to the caller below
 		}
 
 		if !isRetryable(fetchErr, statusCode) {
