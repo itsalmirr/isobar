@@ -176,17 +176,20 @@ func (m tradeMsg) side() string {
 // legacy bare price_dollars string.
 func (m tradeMsg) priceDollars() float64 {
 	if m.YesPrice > 0 || m.NoPrice > 0 {
+		// The YES-price of the print is yes_price regardless of which
+		// side the taker was on; derive it from no_price (100 − no)
+		// only when yes_price is absent. The side switch is kept as
+		// shape validation: a missing/unknown side means we can't
+		// trust the message. (A previous revision returned the raw
+		// no_price for side="no" — the *NO* price — inverting the
+		// price for every no-side taker in the int-cents shape; the
+		// string path below always converted correctly.)
 		var c int
 		switch m.side() {
-		case "yes":
+		case "yes", "no":
 			c = m.YesPrice
 			if c == 0 {
 				c = 100 - m.NoPrice
-			}
-		case "no":
-			c = m.NoPrice
-			if c == 0 {
-				c = 100 - m.YesPrice
 			}
 		default:
 			return -1
