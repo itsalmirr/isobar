@@ -86,10 +86,14 @@ for st in NYC MIA LAX MDW; do
   z="$CLI_DIR/K${st}.zip"
   if [ ! -f "$z" ]; then
     missing+=("$z")
-  else
-    bulletins=$(unzip -l "$z" 2>/dev/null | awk '/\.txt$/' | wc -l | tr -d ' ')
-    echo "  K${st}.zip: ${bulletins} bulletins"
+else
+  if ! unzip -tq "$z" >/dev/null 2>&1; then
+    missing+=("$z (corrupt zip)")
+    continue
   fi
+  bulletins=$(unzip -l "$z" | awk '/\.txt$/' | wc -l | tr -d ' ')
+  echo "  K${st}.zip: ${bulletins} bulletins"
+fi
 done
 if [ ${#missing[@]} -gt 0 ]; then
   echo "ERROR: missing CLI zips:" >&2
