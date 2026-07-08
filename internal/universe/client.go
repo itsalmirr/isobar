@@ -279,7 +279,10 @@ func (c *Client) Events(ctx context.Context, seriesTicker, status string) ([]Eve
 			}
 			out = append(out, ev)
 		}
-		if page.Cursor == "" {
+		// A non-empty cursor on an empty page would loop forever if we
+		// blindly followed it; one empty page is enough to declare
+		// "done". Mirrors the guard in kalshi.Client.DiscoverOpenTickers.
+		if page.Cursor == "" || len(page.Events) == 0 {
 			return out, nil
 		}
 		cursor = page.Cursor

@@ -128,9 +128,18 @@ type EdgeRow struct {
 	// Bayesian posterior update of the MOS prior (ADR-0010). Populated
 	// only when ScanOptions.BayesianKernel + HourlyObs are set AND
 	// the MOS prior itself was valid for this trade.
+	// BayesSkipReason values:
+	//   ""                update applied (BayesApplied=true)
+	//   "no_prior"        MOS prior missing for this trade (nothing to update)
+	//   "wrong_civil_day" trade time is not on the bracket's resolution
+	//                     civil day (station-local) — e.g. a next-day
+	//                     bracket traded today has no same-day R(t) yet
+	//   "cold_start"      no hourly obs in the civil-day window up to trade time
+	//   "h_remain_zero"   settlement boundary reached
+	//   "prior-only"      kernel bin missing (bayesian.Update fell back to prior)
 	PFairBayes        float64 // 0 when not applied
 	BayesApplied      bool
-	BayesSkipReason   string  // "no_kernel" | "no_obs_for_station" | "cold_start" | "h_remain_zero" | "prior_only" | ""
+	BayesSkipReason   string
 	BayesRunningTempF float64 // R(t) at trade time; 0 when not applied
 	BayesHRemain      int     // integer hours_remaining at trade time; 0 when not applied
 	BayesObsWeight    float64 // posterior's ObsWeight (1 = observation dominated, 0 = prior dominated)
@@ -448,8 +457,19 @@ func Scan(opts ScanOptions) (*Result, error) {
 			case !mosApplied:
 				bayesSkipReason = "no_prior"
 			default:
-				tradeTimeUTC := time.UnixMilli(msg.TSMs).UTC()
-				r, hRemain, ok := opts.HourlyObs.RunningExtremum(station, variable, tradeTimeUTC)
+				// The update is only meaningful when the trade happens
+				// during the civil day the bracket resolves on: R(t) is
+				// defined over [day_open(ValidDate), t] (ADR-0010). A
+				// next-day bracket traded today has no same-day
+				// observations yet — folding *today's* running extremum
+				// into *tomorrow's* TMAX/TMIN estimate would poison the
+				// posterior with the wrong day's weather, confidently
+				// (late-day kernel bins carry tiny Var[Δ]).
+				if !sameCivilDate(tradeTime.In(tz), spec.ValidDate) {
+					bayesSkipReason = "wrong_civil_day"
+					break
+				}
+				r, hRemain, ok := opts.HourlyObs.RunningExtremum(station, variable, tradeTime)
 				switch {
 				case !ok:
 					bayesSkipReason = "cold_start"
@@ -748,6 +768,17 @@ func collectSiblings(kalshiFiles []string) (map[string][]Spec, error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+// sameCivilDate reports whether two times fall on the same calendar
+// date by Y/M/D, ignoring their locations' clock readings beyond that.
+// Callers convert to the relevant timezone first (e.g. trade time in
+// station-local time vs. Spec.ValidDate, which is stored as a UTC
+// midnight carrying the civil date in its Y/M/D fields).
+func sameCivilDate(a, b time.Time) bool {
+	ay, am, ad := a.Date()
+	by, bm, bd := b.Date()
+	return ay == by && am == bm && ad == bd
 }
 
 // stationLocation returns the IANA timezone for each Kalshi-resolved

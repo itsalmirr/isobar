@@ -168,25 +168,38 @@ type tradeMsg struct {
 	TSMs            int64           `json:"ts_ms"`
 }
 
-// yesPriceCents returns the canonical YES-side price in integer cents,
-// derived from whichever trade-message fields are populated:
-//   - yes_price set → use directly
-//   - no_price set, yes_price absent → 100 - no_price
-//   - both absent → fall back to legacy price_dollars (interpreted as the
-//     trade's executed-side price; for no-side legacy frames we invert)
-//
-// Returns ok=false if no usable price could be derived, or the price is
-// outside the (0, 100) trading band.
-//
-// The math in [Scan] is always done in YES-perspective regardless of which
-// side the recorded trade was on, so callers should use this rather than
-// reading YesPrice/NoPrice directly.
-func (m tradeMsg) yesPriceCents() (int, bool) {
-	switch {
-	case m.YesPrice > 0:
-		c := m.YesPrice
-		if c <= 0 || c >= 100 {
-			return 0, false
+// side returns the trade's taker side, preferring `taker_side` (recorded
+// Kalshi WS shape) and falling back to `side` (older docs/tests).
+func (m tradeMsg) side() string {
+	if m.TakerSide != "" {
+		return m.TakerSide
+	}
+	return m.Side
+}
+
+// priceDollars returns the executed YES-price as a fraction in (0,1), or
+// -1 if it can't be derived. Tries, in order: int yes_price/no_price (v2
+// docs shape), string yes_price_dollars/no_price_dollars (recorded WS),
+// legacy bare price_dollars string.
+func (m tradeMsg) priceDollars() float64 {
+	if m.YesPrice > 0 || m.NoPrice > 0 {
+		// The YES-price of the print is yes_price regardless of which
+		// side the taker was on; derive it from no_price (100 − no)
+		// only when yes_price is absent. The side switch is kept as
+		// shape validation: a missing/unknown side means we can't
+		// trust the message. (A previous revision returned the raw
+		// no_price for side="no" — the *NO* price — inverting the
+		// price for every no-side taker in the int-cents shape; the
+		// string path below always converted correctly.)
+		var c int
+		switch m.side() {
+		case "yes", "no":
+			c = m.YesPrice
+			if c == 0 {
+				c = 100 - m.NoPrice
+			}
+		default:
+			return -1
 		}
 		return c, true
 	case m.NoPrice > 0:

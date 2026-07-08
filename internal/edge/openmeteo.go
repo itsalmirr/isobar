@@ -251,7 +251,13 @@ func (p *Poll) dailyExtremesFInternal(civilDate time.Time, loc *time.Location) (
 	startLocal := time.Date(civilDate.Year(), civilDate.Month(), civilDate.Day(),
 		0, 0, 0, 0, loc)
 	startUTC := startLocal.UTC()
-	endUTC := startLocal.Add(24 * time.Hour).UTC()
+	// AddDate (not Add(24h)): a civil day spans 23 or 25 real hours on
+	// DST transition days. Add(24h) truncated the last hour of the
+	// fall-back day and leaked the next day's first hour into the
+	// spring-forward day, skewing TMAX/TMIN on those dates. Matches the
+	// civil-day construction in bayesian/hourly.go and
+	// cmd/calibrate-bayesian/fit.go.
+	endUTC := startLocal.AddDate(0, 0, 1).UTC()
 
 	out := map[string]MemberDaily{}
 	skipped := 0
