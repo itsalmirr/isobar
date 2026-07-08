@@ -157,12 +157,12 @@ type bootPayload struct {
 // writeFrame stamps and enqueues one journal frame. Every frame tape
 // emits (boot marker, WS payload, REST poll) goes through here so the
 // Stamp source stays clock.Now uniformly (ADR-0012).
-func writeFrame(jrn *journal.Journal, source, kind string, payload json.RawMessage) {
+func writeFrame(jrn *journal.Journal, source, kind string, payload []byte) {
 	jrn.Write(journal.Frame{
 		Stamp:   clock.Now(),
 		Source:  source,
 		Kind:    kind,
-		Payload: payload,
+		Payload: json.RawMessage(payload),
 	})
 }
 
