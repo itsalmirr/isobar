@@ -292,10 +292,13 @@ func Scan(opts ScanOptions) (*Result, error) {
 			res.SkippedReason["trade_decode_error"]++
 			return nil //nolint:nilerr // malformed trade messages are counted and skipped
 		}
-		spec, parseErr := ParseTicker(msg.MarketTicker)
-		if parseErr != nil {
-			res.SkippedReason["non_weather_ticker"]++
-			return nil //nolint:nilerr // non-weather tickers are expected noise in the tape
+		spec, err := ParseTicker(msg.MarketTicker)
+		if err != nil {
+			if errors.Is(err, ErrNotWeatherTicker) {
+				res.SkippedReason["non_weather_ticker"]++
+				return nil
+			}
+			return fmt.Errorf("parse ticker %q: %w", msg.MarketTicker, err)
 		}
 		res.WeatherTrades++
 
@@ -332,14 +335,15 @@ func Scan(opts ScanOptions) (*Result, error) {
 		// the surviving subset.
 		res.MembersSkipped += skipped
 
-		// Resolution. T-brackets default to high-side (≥ K). The first-pass
-		// scan over Kalshi files (above) groups every observed Spec by
-		// (series, valid_date) so ResolveWithSiblings can flip a T-bracket
-		// to low-side when its key sits below the lowest sibling B-bracket
-		// midpoint. The bracket convention was previously marked FIXME
-		// and is now closed (see resolution.go and its tests).
-		sibKey := siblingKey(spec.Series, spec.ValidDate)
-		resolution := ResolveWithSiblings(spec, siblings[sibKey])
+		// Resolution. T-brackets default to high-side (≥ K). Low-side T
+		// markets — e.g. KXHIGHNY-T56 in a market whose B-brackets start
+		// at 56.5 — get a known-wrong p_fair under this default. Detection
+		// requires sibling-bracket context (see ResolveWithSiblings); the
+		// scanner doesn't yet pre-bucket trades by (series, valid_date),
+		// so this is a recognised limitation rather than something the
+		// scanner can flag per-trade today. Bracket convention itself is
+		// also still tagged FIXME in resolution.go.
+		resolution := spec.Resolve()
 
 		// Naive p_fair = fraction of members whose daily extreme falls in
 		// the bracket. KXHIGH* uses TMAX, KXLOWT* uses TMIN. We also sum
@@ -485,11 +489,36 @@ func Scan(opts ScanOptions) (*Result, error) {
 			}
 		}
 
-		priceDollars := msg.priceDollars()
-		if priceDollars < 0 {
+		// Reject malformed trade sides up front. Any value other than the
+		// two Kalshi v2 enums is suspicious and treating it as "yes" by
+		// default (the previous behavior) silently routed unknown messages
+		// into the wrong half of the edge math.
+		if msg.Side != "yes" && msg.Side != "no" {
+			res.SkippedReason["bad_trade_side"]++
+			return nil
+		}
+
+		// Canonical YES-perspective prices (cents). The trade-message price
+		// fields can come from either side, so we always normalise here so
+		// every downstream calculation is in the same frame. yes + no = 100.
+		yesPriceCents, ok := msg.yesPriceCents()
+		if !ok {
 			res.SkippedReason["bad_trade_price"]++
 			return nil
 		}
+		noPriceCents := 100 - yesPriceCents
+		yesPriceDollars := float64(yesPriceCents) / 100
+
+		// The actual price the recorded trade executed at, in cents — depends
+		// on the trade's side (yes-side trades fill at yes_price, etc.). We
+		// expose this for the CSV but never feed it into edge math.
+		execPriceCents := yesPriceCents
+		if msg.Side == "no" {
+			execPriceCents = noPriceCents
+		}
+
+		// Fee is symmetric in (P, 1-P), so it's the same regardless of side.
+		fee := FeePerContractCents(yesPriceDollars)
 
 		// Climate-shrunk-naive baseline. Reported alongside p_fair as a
 		// diagnostic column; not used as the trading model.
@@ -507,34 +536,23 @@ func Scan(opts ScanOptions) (*Result, error) {
 		}
 
 		row := EdgeRow{
-			TSMs:              msg.TSMs,
-			Ticker:            spec.Ticker,
-			Series:            spec.Series,
-			ValidDate:         spec.ValidDate,
-			BracketKind:       spec.Kind.String(),
-			BracketKey:        spec.Key,
-			Side:              msg.side(),
-			TradePriceCents:   int(priceDollars*100 + 0.5),
-			PFairNaive:        pFairNaive,
-			PFairMOS:          pFairMOS,
-			PFair:             pFair,
-			MOSApplied:        mosApplied,
-			SkippedReason:     mosSkipReason,
-			ClimateP:          climateP,
-			PFairClimate:      pFairClimate,
-			ClimateApplied:    climateApplied,
-			EdgeClimateCents:  edgeClimateCents,
-			PFairBayes:        pFairBayes,
-			BayesApplied:      bayesApplied,
-			BayesSkipReason:   bayesSkipReason,
-			BayesRunningTempF: bayesRunningTempF,
-			BayesHRemain:      bayesHRemain,
-			BayesObsWeight:    bayesObsWeight,
-			NMembers:          nMembers,
-			NMembersInBkt:     nIn,
-			PollAgeS:          int(age.Seconds()),
-			FeeCents:          FeePerContractCentsMode(priceDollars, opts.FeeMode),
-			EdgeCents:         EdgeAfterFeeCentsMode(pFair, priceDollars, opts.FeeMode),
+			TsMs:            msg.TsMs,
+			Ticker:          spec.Ticker,
+			Series:          spec.Series,
+			ValidDate:       spec.ValidDate,
+			BracketKind:     spec.Kind.String(),
+			BracketKey:      spec.Key,
+			Side:            msg.Side,
+			TradePriceCents: execPriceCents,
+			PFairNaive:      pFair,
+			NMembers:        nMembers,
+			NMembersInBkt:   nIn,
+			PollAgeS:        int(age.Seconds()),
+			FeeCents:        fee,
+			// EdgeCents is the YES-perspective post-fee mispricing magnitude
+			// — same number for either trade side because the underlying
+			// market is the same.
+			EdgeCents: EdgeAfterFeeCents(pFair, yesPriceDollars),
 		}
 
 		// Realized-PnL backtest path. If no truth available we skip with a
@@ -554,13 +572,13 @@ func Scan(opts ScanOptions) (*Result, error) {
 			row.ActualTempF = actual
 			row.YesResolved = resolution.Contains(float64(actual))
 
-			// Decide hypothetical action: take the side with the larger
-			// post-fee edge, if it clears the threshold AND the named
-			// entry filter (if any) admits this trade.
-			noPriceDollars := 1 - priceDollars
-			fee := FeePerContractCentsMode(priceDollars, opts.FeeMode)
-			edgeYesCents := int(pFair*100+0.5) - row.TradePriceCents - fee
-			edgeNoCents := int((1-pFair)*100+0.5) - int(noPriceDollars*100+0.5) - fee
+			// Decide hypothetical action: take whichever side has the larger
+			// post-fee edge, if it clears the threshold. Both edges are
+			// computed in the canonical YES-perspective frame, so this works
+			// identically whether the recorded trade was yes-side or no-side.
+			pFairYesCents := int(pFair*100 + 0.5)
+			edgeYesCents := pFairYesCents - yesPriceCents - fee
+			edgeNoCents := (100 - pFairYesCents) - noPriceCents - fee
 
 			filterAdmits := entryFilterAdmits(opts.EntryFilter, spec.Series, row.TradePriceCents)
 
@@ -568,13 +586,12 @@ func Scan(opts ScanOptions) (*Result, error) {
 			case filterAdmits && edgeYesCents >= opts.EdgeThresholdCents && edgeYesCents >= edgeNoCents:
 				row.OurSide = "yes"
 				if row.YesResolved {
-					row.OurPnLCents = 100 - row.TradePriceCents - fee
+					row.OurPnLCents = 100 - yesPriceCents - fee
 				} else {
-					row.OurPnLCents = -row.TradePriceCents - fee
+					row.OurPnLCents = -yesPriceCents - fee
 				}
 			case filterAdmits && edgeNoCents >= opts.EdgeThresholdCents:
 				row.OurSide = "no"
-				noPriceCents := 100 - row.TradePriceCents
 				if !row.YesResolved {
 					row.OurPnLCents = 100 - noPriceCents - fee
 				} else {
