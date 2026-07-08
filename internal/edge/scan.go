@@ -129,9 +129,18 @@ type EdgeRow struct {
 	// Bayesian posterior update of the MOS prior (ADR-0010). Populated
 	// only when ScanOptions.BayesianKernel + HourlyObs are set AND
 	// the MOS prior itself was valid for this trade.
+	// BayesSkipReason values:
+	//   ""                update applied (BayesApplied=true)
+	//   "no_prior"        MOS prior missing for this trade (nothing to update)
+	//   "wrong_civil_day" trade time is not on the bracket's resolution
+	//                     civil day (station-local) — e.g. a next-day
+	//                     bracket traded today has no same-day R(t) yet
+	//   "cold_start"      no hourly obs in the civil-day window up to trade time
+	//   "h_remain_zero"   settlement boundary reached
+	//   "prior-only"      kernel bin missing (bayesian.Update fell back to prior)
 	PFairBayes        float64 // 0 when not applied
 	BayesApplied      bool
-	BayesSkipReason   string  // "no_kernel" | "no_obs_for_station" | "cold_start" | "h_remain_zero" | "prior_only" | ""
+	BayesSkipReason   string
 	BayesRunningTempF float64 // R(t) at trade time; 0 when not applied
 	BayesHRemain      int     // integer hours_remaining at trade time; 0 when not applied
 	BayesObsWeight    float64 // posterior's ObsWeight (1 = observation dominated, 0 = prior dominated)
@@ -705,27 +714,71 @@ func applyBayes(in bayesInputs) bayesResult {
 	}
 }
 
-// climateInputs bundles the per-trade inputs applyClimate reads.
-type climateInputs struct {
-	lookup     *climate.Lookup
-	station    string
-	variable   string
-	validDate  time.Time
-	resolution Resolution
-	pFairNaive float64
-	price      float64
-	feeMode    FeeMode
-}
+		row := EdgeRow{
+			TsMs:            msg.TsMs,
+			Ticker:          spec.Ticker,
+			Series:          spec.Series,
+			ValidDate:       spec.ValidDate,
+			BracketKind:     spec.Kind.String(),
+			BracketKey:      spec.Key,
+			Side:            msg.Side,
+			TradePriceCents: execPriceCents,
+			PFairNaive:      pFair,
+			NMembers:        nMembers,
+			NMembersInBkt:   nIn,
+			PollAgeS:        int(age.Seconds()),
+			FeeCents:        fee,
+			// EdgeCents is the YES-perspective post-fee mispricing magnitude
+			// — same number for either trade side because the underlying
+			// market is the same.
+			EdgeCents: EdgeAfterFeeCents(pFair, yesPriceDollars),
+		}
 
-// climateResult is the by-value climate-shrunk-naive baseline. climateP and
-// pFairClimate are NaN when no lookup is configured or no historical
-// observations match (applied=false), matching the EdgeRow field contract.
-type climateResult struct {
-	climateP         float64
-	pFairClimate     float64
-	edgeClimateCents int
-	applied          bool
-}
+		// Realized-PnL backtest path. If no truth available we skip with a
+		// reason — this is the user's "no imaginary bets" rule: never score
+		// a trade whose outcome we can't look up.
+		if opts.Truth != nil {
+			truth, ok := opts.Truth.Get(station, spec.ValidDate)
+			if !ok {
+				res.SkippedReason["no_truth_available"]++
+				return nil
+			}
+			row.HasTruth = true
+			actual := truth.TMaxF
+			if !spec.IsHigh() {
+				actual = truth.TMinF
+			}
+			row.ActualTempF = actual
+			row.YesResolved = resolution.Contains(float64(actual))
+
+			// Decide hypothetical action: take whichever side has the larger
+			// post-fee edge, if it clears the threshold. Both edges are
+			// computed in the canonical YES-perspective frame, so this works
+			// identically whether the recorded trade was yes-side or no-side.
+			pFairYesCents := int(pFair*100 + 0.5)
+			edgeYesCents := pFairYesCents - yesPriceCents - fee
+			edgeNoCents := (100 - pFairYesCents) - noPriceCents - fee
+
+			filterAdmits := entryFilterAdmits(opts.EntryFilter, spec.Series, row.TradePriceCents)
+
+			switch {
+			case filterAdmits && edgeYesCents >= opts.EdgeThresholdCents && edgeYesCents >= edgeNoCents:
+				row.OurSide = "yes"
+				if row.YesResolved {
+					row.OurPnLCents = 100 - yesPriceCents - fee
+				} else {
+					row.OurPnLCents = -yesPriceCents - fee
+				}
+			case filterAdmits && edgeNoCents >= opts.EdgeThresholdCents:
+				row.OurSide = "no"
+				if !row.YesResolved {
+					row.OurPnLCents = 100 - noPriceCents - fee
+				} else {
+					row.OurPnLCents = -noPriceCents - fee
+				}
+			default:
+				// no edge OR filter excluded — skip the trade (PnL = 0, OurSide = "")
+			}
 
 // applyClimate computes the climate-shrunk-naive diagnostic p_fair. It is
 // reported alongside p_fair, never used as the trading model.

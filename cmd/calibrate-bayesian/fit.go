@@ -187,7 +187,13 @@ func fitStationVariable(
 			delta := final - running
 			accum.Add(station, variable, hRemain, delta)
 		}
-		stSum.PairsFit++
+		// Only count the (date, variable) pair when it actually
+		// contributed Δ samples. A day with truth but no usable hourly
+		// obs previously inflated PairsFit, making the summary claim
+		// pairs that never reached the kernel.
+		if init {
+			stSum.PairsFit++
+		}
 	}
 }
 
@@ -309,7 +315,7 @@ func writeKernel(path string, k bayesian.Kernel) error {
 type stationSummary struct {
 	TruthRows      int
 	HourlyRows     int
-	PairsFit       int // (date, variable) pairs that had truth + ≥1 obs
+	PairsFit       int // (date, variable) pairs that contributed ≥1 Δ sample
 	SkippedNoTruth int
 }
 

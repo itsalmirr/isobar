@@ -126,9 +126,14 @@ func (s Spec) Resolve() Resolution {
 }
 
 // ResolveWithSiblings returns the Resolution for spec using the sibling
-// bracket Specs (same series + same valid_date) to disambiguate
-// T-bracket direction. If no siblings or all siblings are also T, falls
-// back to the high-side default.
+// bracket Specs to disambiguate T-bracket direction. The caller may pass
+// any list of Specs; this function defensively filters to siblings in
+// the same series and on the same valid_date so that a caller mistakenly
+// passing tickers from a different market can't mis-resolve the bracket.
+//
+// If no qualifying siblings remain (or all are also T), falls back to
+// the high-side default and the caller should treat the result with
+// FIXME-level scepticism.
 //
 // Disambiguation rule: a T-bracket is "low-side" iff its key is ≤ the
 // lowest sibling B-bracket midpoint. Otherwise it is "high-side"
@@ -141,6 +146,9 @@ func ResolveWithSiblings(spec Spec, siblings []Spec) Resolution {
 	minB := math.Inf(+1)
 	for _, sib := range siblings {
 		if sib.Kind != BracketBetween {
+			continue
+		}
+		if sib.Series != spec.Series || !sib.ValidDate.Equal(spec.ValidDate) {
 			continue
 		}
 		if sib.Ticker == spec.Ticker {
