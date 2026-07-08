@@ -2,10 +2,15 @@ package edge
 
 import (
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/wh0o0pz/isobar/internal/calibration/climate"
+	"github.com/wh0o0pz/isobar/internal/calibration/mos"
 )
 
 // TestScan_EndToEndSynthetic stands up a synthetic data tree with one
@@ -55,11 +60,26 @@ func TestScan_EndToEndSynthetic(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	climateDir := filepath.Join(dir, "climate")
+	if err := os.MkdirAll(climateDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(climateDir, "KNYC.csv"),
+		[]byte("valid_date,tmax_f,tmin_f,issued_at,bulletin_id\n"+
+			"2021-04-29,62,40,2021-04-30T06:00:00Z,CLINYC_test.txt\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	clim := climate.New()
+	if err := clim.Load(climateDir, []string{"KNYC"}); err != nil {
+		t.Fatalf("climate.Load: %v", err)
+	}
+
 	res, err := Scan(ScanOptions{
 		DataDir:    dir,
 		StartDate:  time.Date(2026, 4, 29, 0, 0, 0, 0, time.UTC),
 		EndDate:    time.Date(2026, 4, 30, 0, 0, 0, 0, time.UTC),
 		MaxPollAge: time.Hour,
+		Climate:    clim,
 	})
 	if err != nil {
 		t.Fatalf("Scan: %v", err)
@@ -93,6 +113,21 @@ func TestScan_EndToEndSynthetic(t *testing.T) {
 	if row.EdgeCents != 43 {
 		t.Errorf("EdgeCents = %d, want 43 (|0 - 45c| - 2c fee)", row.EdgeCents)
 	}
+	if !row.ClimateApplied {
+		t.Fatalf("ClimateApplied false, row=%+v", row)
+	}
+	if row.ClimateP != 1 {
+		t.Errorf("ClimateP = %v, want 1", row.ClimateP)
+	}
+	if row.PFairClimate != 0.2 {
+		t.Errorf("PFairClimate = %v, want 0.2", row.PFairClimate)
+	}
+	if row.EdgeClimateCents != 23 {
+		t.Errorf("EdgeClimateCents = %d, want 23", row.EdgeClimateCents)
+	}
+	if res.ClimateApplied != 1 {
+		t.Errorf("ClimateApplied count = %d, want 1", res.ClimateApplied)
+	}
 }
 
 func TestScan_NonWeatherTradesSkipped(t *testing.T) {
@@ -112,7 +147,7 @@ func TestScan_NonWeatherTradesSkipped(t *testing.T) {
 		[]envelope{{Wall: time.Now().UnixNano(), Source: "kalshi", Kind: "ws", Payload: frame}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(filepath.Join(dir, "openmeteo", "2026-04-29"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(dir, "openmeteo", "2026-04-29"), 0o750); err != nil {
 		t.Fatal(err)
 	}
 	res, err := Scan(ScanOptions{
@@ -175,12 +210,12 @@ func TestScan_BacktestRealizedPnL(t *testing.T) {
 
 	// Truth file at <dir>/truth/KNYC.csv with TMAX=80, TMIN=40 for Apr 29.
 	truthDir := filepath.Join(dir, "truth")
-	if err := os.MkdirAll(truthDir, 0o755); err != nil {
+	if err := os.MkdirAll(truthDir, 0o750); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(truthDir, "KNYC.csv"),
 		[]byte("valid_date,tmax_f,tmin_f,issued_at,bulletin_id\n"+
-			"2026-04-29,80,40,2026-04-30T06:00:00Z,CLINYC_test.txt\n"), 0o644); err != nil {
+			"2026-04-29,80,40,2026-04-30T06:00:00Z,CLINYC_test.txt\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	truth, err := LoadTruth(truthDir)
@@ -310,9 +345,9 @@ func TestScan_BacktestNoTruthSkipped(t *testing.T) {
 		t.Fatal(err)
 	}
 	truthDir := filepath.Join(dir, "truth")
-	_ = os.MkdirAll(truthDir, 0o755)
+	_ = os.MkdirAll(truthDir, 0o750)
 	_ = os.WriteFile(filepath.Join(truthDir, "KNYC.csv"),
-		[]byte("valid_date,tmax_f,tmin_f\n2026-04-29,80,40\n"), 0o644)
+		[]byte("valid_date,tmax_f,tmin_f\n2026-04-29,80,40\n"), 0o600)
 	truth, _ := LoadTruth(truthDir)
 
 	res, err := Scan(ScanOptions{
@@ -435,10 +470,10 @@ type envelope struct {
 
 func writeJournal(t *testing.T, dir, name string, envs []envelope) error {
 	t.Helper()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return err
 	}
-	f, err := os.Create(filepath.Join(dir, name))
+	f, err := os.Create(filepath.Join(dir, name)) //nolint:gosec // test helper writes under t.TempDir()
 	if err != nil {
 		return err
 	}

@@ -119,6 +119,87 @@ func TestDailyExtremesF_InsufficientCoverage(t *testing.T) {
 	}
 }
 
+// TestDailyExtremesF_PartialMemberSkip exercises the per-member coverage
+// rule: a poll where one of three members has <12 in-window samples must
+// surface the other two (not abort the whole poll). The "skipped" count
+// is surfaced via DailyExtremesFWithSkip.
+//
+// Build the poll directly (bypass JSON parsing — encoding/json refuses
+// NaN) where member 01 has only 6 valid in-window samples while 00 and
+// 02 are fully populated. Earlier behaviour: ErrInsufficientCoverage for
+// the whole poll. New behaviour: members 00 and 02 returned, skipped=1.
+func TestDailyExtremesF_PartialMemberSkip(t *testing.T) {
+	t0, _ := time.Parse("2006-01-02T15:04", "2026-04-29T00:00")
+	times := make([]time.Time, 72)
+	for i := range times {
+		times[i] = t0.Add(time.Duration(i) * time.Hour)
+	}
+	control := make([]float64, 72)
+	mem01 := make([]float64, 72) // intentionally sparse
+	mem02 := make([]float64, 72)
+	for i := 0; i < 72; i++ {
+		control[i] = float64(i)
+		mem02[i] = float64(i) + 2
+		mem01[i] = math.NaN()
+	}
+	// Only 6 valid samples for member 01 inside the in-window range
+	// (hours 4..27 UTC for EDT civil 2026-04-29) — below the 12-sample floor.
+	for _, ok := range []int{4, 5, 6, 7, 8, 9} {
+		mem01[ok] = float64(ok) + 1
+	}
+
+	p := &Poll{
+		Latitude:    40.78,
+		Longitude:   -73.97,
+		HourlyTimes: times,
+		Members: map[string][]float64{
+			"00": control,
+			"01": mem01,
+			"02": mem02,
+		},
+	}
+	loc, _ := time.LoadLocation("America/New_York")
+	civil := time.Date(2026, 4, 29, 0, 0, 0, 0, time.UTC)
+	out, skipped, err := p.DailyExtremesFWithSkip(civil, loc)
+	if err != nil {
+		t.Fatalf("DailyExtremesFWithSkip: %v", err)
+	}
+	if skipped != 1 {
+		t.Errorf("skipped = %d, want 1 (member 01 below %d-sample floor)",
+			skipped, MinHourlySamplesPerMember)
+	}
+	if len(out) != 2 {
+		t.Errorf("len(out) = %d, want 2 (surviving members 00 and 02)", len(out))
+	}
+	if _, ok := out["01"]; ok {
+		t.Errorf("member 01 must have been dropped for partial coverage")
+	}
+	if _, ok := out["00"]; !ok {
+		t.Errorf("control member 00 missing — should survive")
+	}
+	if _, ok := out["02"]; !ok {
+		t.Errorf("member 02 missing — should survive")
+	}
+}
+
+// TestDailyExtremesF_AllMembersSparseStillErrors asserts that the "skip
+// sparse member" change preserves the original failure mode when every
+// member is sparse — i.e. the poll really is unusable.
+func TestDailyExtremesF_AllMembersSparseStillErrors(t *testing.T) {
+	p, _ := ParsePoll(synthPoll(t))
+	loc, _ := time.LoadLocation("America/New_York")
+	// Apr 26 is entirely before the synthetic poll's window — every
+	// member has 0 in-window samples → every member dropped → error.
+	_, skipped, err := p.DailyExtremesFWithSkip(
+		time.Date(2026, 4, 26, 0, 0, 0, 0, time.UTC), loc)
+	if !errors.Is(err, ErrInsufficientCoverage) {
+		t.Fatalf("err = %v, want ErrInsufficientCoverage", err)
+	}
+	if skipped != p.MemberCount() {
+		t.Errorf("skipped = %d, want %d (all members)", skipped, p.MemberCount())
+	}
+}
+
 func TestMatchTemperatureMember(t *testing.T) {
 	cases := map[string]struct {
 		id string
@@ -131,6 +212,16 @@ func TestMatchTemperatureMember(t *testing.T) {
 		"precipitation":           {"", false},
 		"temperature_2m_member1":  {"", false},
 		"temperature_2m_memberAB": {"", false},
+
+		// Multi-model: ?models=A,B suffixes every series with the model tag.
+		"temperature_2m_ncep_gefs_seamless":             {"ncep_gefs_seamless:00", true},
+		"temperature_2m_member01_ncep_gefs_seamless":    {"ncep_gefs_seamless:01", true},
+		"temperature_2m_member30_ncep_gefs_seamless":    {"ncep_gefs_seamless:30", true},
+		"temperature_2m_ecmwf_ifs025_ensemble":          {"ecmwf_ifs025_ensemble:00", true},
+		"temperature_2m_member50_ecmwf_ifs025_ensemble": {"ecmwf_ifs025_ensemble:50", true},
+		// Aggregators stay rejected even with model suffix.
+		"temperature_2m_max_member01_ecmwf_ifs025_ensemble": {"", false},
+		"temperature_2m_max_ecmwf_ifs025_ensemble":          {"", false},
 	}
 	for in, want := range cases {
 		gotID, gotOK := matchTemperatureMember(in)

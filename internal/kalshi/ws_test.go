@@ -3,6 +3,8 @@ package kalshi
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -319,4 +321,248 @@ func TestSubscriberConcurrentOnFrameIsLocal(t *testing.T) {
 	}
 	time.Sleep(50 * time.Millisecond)
 	require.GreaterOrEqual(t, seen.Load(), int64(1))
+}
+
+// TestSubscriber_ReconnectsOnFrameStarvation verifies that the liveness
+// watchdog forces a reconnect when no frames arrive for longer than
+// MaxIdleBetweenFrames. The stub server accepts subscribe and then goes
+// silent; the client must detect the gap and re-enter retry.Do.
+func TestSubscriber_ReconnectsOnFrameStarvation(t *testing.T) {
+	// Stub server that accepts subscribe + sends nothing.
+	var subscribes atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/trade-api/ws/v2", func(rw http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(rw, r, &websocket.AcceptOptions{
+			InsecureSkipVerify: true,
+		})
+		if err != nil {
+			return
+		}
+		ctx := r.Context()
+		if _, _, err := conn.Read(ctx); err == nil {
+			subscribes.Add(1)
+		}
+		<-ctx.Done()
+		_ = conn.Close(websocket.StatusNormalClosure, "test done")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	_, pem := testKeyPair(t)
+	signer, err := NewSigner("keyid", pem)
+	require.NoError(t, err)
+
+	sub := NewSubscriber(SubscriberOptions{
+		WSURL:                "ws" + strings.TrimPrefix(srv.URL, "http") + "/trade-api/ws/v2",
+		Signer:               signer,
+		Channels:             []string{"orderbook_delta"},
+		Tickers:              []string{"X"},
+		Logger:               discardLogger(),
+		PingInterval:         100 * time.Millisecond,
+		MaxIdleBetweenFrames: 200 * time.Millisecond,
+		Reconnect: ReconnectOptions{
+			InitialBackoff: 10 * time.Millisecond,
+			MaxBackoff:     20 * time.Millisecond,
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() { _ = sub.Run(ctx) }()
+
+	// Wait for at least two subscribe attempts — the first connect plus a
+	// reconnect after the watchdog trips. Detect within ~2*PingInterval +
+	// reconnect overhead.
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if subscribes.Load() >= 2 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("expected watchdog to trigger reconnect, got %d subscribes", subscribes.Load())
+}
+
+// newSilentCapturingServer accepts WS upgrades, captures each connection's
+// subscribe payload, and then sends nothing — so the starvation watchdog
+// drives reconnect after reconnect. This is the shape of the 2026-05
+// outage: connections that subscribe successfully but never receive data.
+func newSilentCapturingServer(t *testing.T) (*httptest.Server, chan string) {
+	t.Helper()
+	subscribes := make(chan string, 8)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/trade-api/ws/v2", func(rw http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(rw, r, &websocket.AcceptOptions{
+			InsecureSkipVerify: true,
+		})
+		if err != nil {
+			return
+		}
+		ctx := r.Context()
+		if _, data, err := conn.Read(ctx); err == nil {
+			select {
+			case subscribes <- string(data):
+			default:
+			}
+		}
+		<-ctx.Done()
+		_ = conn.Close(websocket.StatusNormalClosure, "test done")
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, subscribes
+}
+
+// TestSubscriber_RefreshTickersOnReconnect verifies that every connection
+// attempt — the initial connect and each watchdog-forced reconnect —
+// subscribes with the list returned by RefreshTickers at that moment,
+// never the constructor's (potentially stale) list. This is the self-heal
+// path for the 2026-05 outage: a starvation reconnect must re-resolve the
+// market set, or a fully settled list loops forever.
+func TestSubscriber_RefreshTickersOnReconnect(t *testing.T) {
+	srv, subscribes := newSilentCapturingServer(t)
+
+	_, pem := testKeyPair(t)
+	signer, err := NewSigner("keyid", pem)
+	require.NoError(t, err)
+
+	var refreshCalls atomic.Int32
+	sub := NewSubscriber(SubscriberOptions{
+		WSURL:    "ws" + strings.TrimPrefix(srv.URL, "http") + "/trade-api/ws/v2",
+		Signer:   signer,
+		Channels: []string{"orderbook_delta"},
+		Tickers:  []string{"STALE-SETTLED"},
+		Logger:   discardLogger(),
+		RefreshTickers: func(context.Context) ([]string, error) {
+			return []string{fmt.Sprintf("FRESH-%d", refreshCalls.Add(1))}, nil
+		},
+		PingInterval:         100 * time.Millisecond,
+		MaxIdleBetweenFrames: 200 * time.Millisecond,
+		Reconnect: ReconnectOptions{
+			InitialBackoff: 10 * time.Millisecond,
+			MaxBackoff:     20 * time.Millisecond,
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go func() { _ = sub.Run(ctx) }()
+
+	for i := 1; i <= 2; i++ {
+		select {
+		case s := <-subscribes:
+			var msg subscribeMessage
+			require.NoError(t, json.Unmarshal([]byte(s), &msg))
+			require.Equal(t, []string{fmt.Sprintf("FRESH-%d", i)}, msg.Params.MarketTickers,
+				"connection %d must carry that attempt's refreshed list", i)
+		case <-time.After(3 * time.Second):
+			t.Fatalf("subscribe %d never observed", i)
+		}
+	}
+}
+
+// TestSubscriber_RefreshTickersFailureKeepsLastKnownList verifies both
+// non-fatal refresh outcomes: an error and an empty list each leave the
+// last-known tickers in place, so a flaky discovery source degrades to
+// pre-hook behavior instead of wiping the subscription.
+func TestSubscriber_RefreshTickersFailureKeepsLastKnownList(t *testing.T) {
+	srv, subscribes := newSilentCapturingServer(t)
+
+	_, pem := testKeyPair(t)
+	signer, err := NewSigner("keyid", pem)
+	require.NoError(t, err)
+
+	var refreshCalls atomic.Int32
+	sub := NewSubscriber(SubscriberOptions{
+		WSURL:    "ws" + strings.TrimPrefix(srv.URL, "http") + "/trade-api/ws/v2",
+		Signer:   signer,
+		Channels: []string{"orderbook_delta"},
+		Tickers:  []string{"LAST-KNOWN"},
+		Logger:   discardLogger(),
+		RefreshTickers: func(context.Context) ([]string, error) {
+			if refreshCalls.Add(1)%2 == 1 {
+				return nil, errors.New("discovery down")
+			}
+			return nil, nil // empty list — must not wipe the subscription
+		},
+		PingInterval:         100 * time.Millisecond,
+		MaxIdleBetweenFrames: 200 * time.Millisecond,
+		Reconnect: ReconnectOptions{
+			InitialBackoff: 10 * time.Millisecond,
+			MaxBackoff:     20 * time.Millisecond,
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go func() { _ = sub.Run(ctx) }()
+
+	for i := 1; i <= 2; i++ {
+		select {
+		case s := <-subscribes:
+			var msg subscribeMessage
+			require.NoError(t, json.Unmarshal([]byte(s), &msg))
+			require.Equal(t, []string{"LAST-KNOWN"}, msg.Params.MarketTickers,
+				"connection %d must fall back to the last-known list", i)
+		case <-time.After(3 * time.Second):
+			t.Fatalf("subscribe %d never observed", i)
+		}
+	}
+}
+
+// TestSubscriber_PingFailureTriggersReconnect verifies that a peer that
+// closes the connection mid-stream (so the watchdog's Ping fails) causes
+// a reconnect. We close on the second read (the first read returns the
+// subscribe message; the second is the Ping read) by hijacking the conn
+// and closing it.
+func TestSubscriber_PingFailureTriggersReconnect(t *testing.T) {
+	var subscribes atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/trade-api/ws/v2", func(rw http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(rw, r, &websocket.AcceptOptions{
+			InsecureSkipVerify: true,
+		})
+		if err != nil {
+			return
+		}
+		ctx := r.Context()
+		if _, _, err := conn.Read(ctx); err == nil {
+			subscribes.Add(1)
+		}
+		// Immediately abnormally close so the next Ping fails.
+		_ = conn.CloseNow()
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	_, pem := testKeyPair(t)
+	signer, err := NewSigner("keyid", pem)
+	require.NoError(t, err)
+
+	sub := NewSubscriber(SubscriberOptions{
+		WSURL:                "ws" + strings.TrimPrefix(srv.URL, "http") + "/trade-api/ws/v2",
+		Signer:               signer,
+		Channels:             []string{"orderbook_delta"},
+		Tickers:              []string{"X"},
+		Logger:               discardLogger(),
+		PingInterval:         100 * time.Millisecond,
+		MaxIdleBetweenFrames: 10 * time.Second, // High so only Ping failure can trip
+		Reconnect: ReconnectOptions{
+			InitialBackoff: 10 * time.Millisecond,
+			MaxBackoff:     20 * time.Millisecond,
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() { _ = sub.Run(ctx) }()
+
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if subscribes.Load() >= 2 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("expected ping failure to trigger reconnect, got %d subscribes", subscribes.Load())
 }

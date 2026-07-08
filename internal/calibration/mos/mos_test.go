@@ -1,11 +1,24 @@
 package mos
 
 import (
+	"bytes"
+	"encoding/json"
 	"math"
 	"math/rand/v2"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/wh0o0pz/isobar/internal/clock"
 )
+
+// testClock returns a fixed FakeClock anchored at 2026-01-01 UTC so MOS
+// Fit produces byte-identical Coefficients given byte-identical pairs.
+// One canonical anchor across the file keeps test failures readable.
+func testClock() clock.Clock {
+	return clock.Fake(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+}
 
 func TestSeason(t *testing.T) {
 	tests := []struct {
@@ -89,7 +102,7 @@ func TestFitRecoversKnownLinearStructure(t *testing.T) {
 		}
 	}
 
-	coeffs, err := Fit(pairs, 0) // no holdout — use all data for fit
+	coeffs, err := Fit(pairs, 0, testClock()) // no holdout — use all data for fit
 	if err != nil {
 		t.Fatalf("Fit: %v", err)
 	}
@@ -139,7 +152,7 @@ func TestFitProducesMultipleBins(t *testing.T) {
 			}
 		}
 	}
-	c, err := Fit(pairs, 0)
+	c, err := Fit(pairs, 0, testClock())
 	if err != nil {
 		t.Fatalf("Fit: %v", err)
 	}
@@ -163,7 +176,7 @@ func TestFitDropsBinsBelowMinTrain(t *testing.T) {
 			Observed:  62 + float64(i),
 		}
 	}
-	_, err := Fit(pairs, 0)
+	_, err := Fit(pairs, 0, testClock())
 	// Either the bin is dropped (Fit returns "no bin had at least N pairs")
 	// or returns an empty Coefficients. Both are acceptable.
 	if err == nil {
@@ -218,7 +231,7 @@ func TestFitHandlesBiasCorrectly(t *testing.T) {
 			Observed:  y,
 		}
 	}
-	c, err := Fit(pairs, 0)
+	c, err := Fit(pairs, 0, testClock())
 	if err != nil {
 		t.Fatalf("Fit: %v", err)
 	}
@@ -246,12 +259,236 @@ func TestFitEmitsSchemaVersion(t *testing.T) {
 			Observed:  60 + rng.Float64()*20,
 		}
 	}
-	c, err := Fit(pairs, 0)
+	c, err := Fit(pairs, 0, testClock())
 	if err != nil {
 		t.Fatalf("Fit: %v", err)
 	}
 	if c.SchemaVersion != CoefficientsSchemaVersion {
 		t.Errorf("SchemaVersion = %q, want %q", c.SchemaVersion, CoefficientsSchemaVersion)
+	}
+}
+
+// TestFitUsesHoldoutSigmaWhenSufficient verifies that with ≥
+// MinHoldoutForSigma holdout pairs, σ comes from holdout residuals (and is
+// labelled "holdout"), not the in-sample training residual stdev. The two
+// σ values must differ — otherwise the test is vacuous.
+//
+// Setup: training pairs come from y = trueA + trueB·x + N(0, σ_train²),
+// holdout pairs from the same a, b but with a *larger* noise σ_holdout.
+// The fit recovers a, b accurately and the residual stdevs on each set
+// are clean estimates of their respective noise scales.
+func TestFitUsesHoldoutSigmaWhenSufficient(t *testing.T) {
+	rng := rand.New(rand.NewPCG(11, 11))
+	const (
+		trueA, trueB             = 1.5, 0.95
+		sigmaTrain, sigmaHoldout = 1.0, 3.0 // 3× larger holdout noise
+		nTrainPerDay             = 5
+		nHoldoutAll              = 60 // ≥ MinHoldoutForSigma (30)
+	)
+
+	startDate, _ := time.Parse("2006-01-02", "2024-04-01")
+	// Training window: 40 days starting at startDate, each with nTrainPerDay
+	// pairs. Holdout window: the trailing 10 days.
+	holdoutDays := 10
+	trainDays := 40
+
+	var pairs []Pair
+	for d := 0; d < trainDays; d++ {
+		date := startDate.AddDate(0, 0, d)
+		for k := 0; k < nTrainPerDay; k++ {
+			x := 55.0 + rng.Float64()*25 // 55-80°F forecast
+			y := trueA + trueB*x + rng.NormFloat64()*sigmaTrain
+			pairs = append(pairs, Pair{
+				Station: "KNYC", ValidDate: date, Variable: "tmax",
+				Forecast: x, Observed: y,
+			})
+		}
+	}
+	for k := 0; k < nHoldoutAll; k++ {
+		date := startDate.AddDate(0, 0, trainDays+(k%holdoutDays))
+		x := 55.0 + rng.Float64()*25
+		y := trueA + trueB*x + rng.NormFloat64()*sigmaHoldout
+		pairs = append(pairs, Pair{
+			Station: "KNYC", ValidDate: date, Variable: "tmax",
+			Forecast: x, Observed: y,
+		})
+	}
+
+	c, err := Fit(pairs, holdoutDays, testClock())
+	if err != nil {
+		t.Fatalf("Fit: %v", err)
+	}
+	bc, ok := c.Bins[binKey("KNYC", "MAM", "tmax")]
+	if !ok {
+		t.Fatalf("MAM bin missing; bins=%v", c.SortedBinKeys())
+	}
+	if bc.SigmaSource != SigmaSourceHoldout {
+		t.Errorf("SigmaSource = %q, want %q", bc.SigmaSource, SigmaSourceHoldout)
+	}
+	if bc.NHoldout < MinHoldoutForSigma {
+		t.Errorf("NHoldout = %d, want ≥ %d", bc.NHoldout, MinHoldoutForSigma)
+	}
+	// σ should be closer to σ_holdout (3.0) than σ_train (1.0). Loose
+	// band to absorb sample noise — what matters is direction.
+	if math.Abs(bc.Sigma-sigmaHoldout) > 0.8 {
+		t.Errorf("Sigma = %v, want ≈ %v (holdout σ); training σ was %v",
+			bc.Sigma, sigmaHoldout, sigmaTrain)
+	}
+	if bc.Sigma < 1.5 {
+		t.Errorf("Sigma = %v looks like training-σ (%v), not holdout-σ (%v)",
+			bc.Sigma, sigmaTrain, sigmaHoldout)
+	}
+}
+
+// TestFitFlagsTrainingFallbackWhenHoldoutTooSmall verifies the negative
+// path: with < MinHoldoutForSigma holdout pairs (or none), σ stays at the
+// training-residual stdev and SigmaSource is "training-fallback" so a
+// downstream consumer can see it was the conservative path.
+func TestFitFlagsTrainingFallbackWhenHoldoutTooSmall(t *testing.T) {
+	rng := rand.New(rand.NewPCG(13, 13))
+	const trueA, trueB, trueSigma = 0.5, 1.0, 1.2
+	startDate, _ := time.Parse("2006-01-02", "2024-04-01")
+
+	// 60 training pairs in April-May (MAM), no holdout configured at all
+	// (holdoutDays = 0).
+	pairs := make([]Pair, 60)
+	for i := range pairs {
+		date := startDate.AddDate(0, 0, i%50)
+		x := 60.0 + rng.Float64()*15
+		y := trueA + trueB*x + rng.NormFloat64()*trueSigma
+		pairs[i] = Pair{
+			Station: "KNYC", ValidDate: date, Variable: "tmax",
+			Forecast: x, Observed: y,
+		}
+	}
+	c, err := Fit(pairs, 0, testClock())
+	if err != nil {
+		t.Fatalf("Fit: %v", err)
+	}
+	bc, ok := c.Bins[binKey("KNYC", "MAM", "tmax")]
+	if !ok {
+		t.Fatalf("bin missing")
+	}
+	// With holdoutDays=0, all pairs land in train (or holdout subset is
+	// strictly less than MinHoldoutForSigma=30). Either way SigmaSource
+	// must be training-fallback.
+	if bc.NHoldout >= MinHoldoutForSigma {
+		t.Fatalf("test bug: NHoldout=%d ≥ %d — adjust fixture",
+			bc.NHoldout, MinHoldoutForSigma)
+	}
+	if bc.SigmaSource != SigmaSourceTrainingFallback {
+		t.Errorf("SigmaSource = %q, want %q",
+			bc.SigmaSource, SigmaSourceTrainingFallback)
+	}
+	if math.Abs(bc.Sigma-trueSigma) > 0.3 {
+		t.Errorf("Sigma = %v, want ≈ %v (training residual stdev)",
+			bc.Sigma, trueSigma)
+	}
+}
+
+// TestLoadCoefficients_LegacyFileBackCompat: a Coefficients JSON written
+// before FitModelSet existed must still load — defaulting to ["gfs"] —
+// rather than erroring. Without this back-compat, every existing
+// calibration artifact on disk would silently lose its fitted model.
+func TestLoadCoefficients_LegacyFileBackCompat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "legacy.json")
+	// Hand-roll a JSON with the v1 schema version and NO fit_model_set
+	// key, mimicking a file written before this field was added.
+	body := []byte(`{
+		"schema_version": "isobar.mos/v1",
+		"fitted_at": "2025-01-01T00:00:00Z",
+		"training_window_end": "2024-12-31",
+		"holdout_window_start": "2025-01-01",
+		"bins": {
+			"KNYC|MAM|tmax": {"a": 1.0, "b": 1.0, "sigma": 2.0, "n_train": 30, "n_holdout": 5}
+		}
+	}`)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadCoefficients(path)
+	if err != nil {
+		t.Fatalf("LoadCoefficients: %v", err)
+	}
+	if len(c.FitModelSet) != 1 || c.FitModelSet[0] != ModelGFS {
+		t.Errorf("FitModelSet = %v, want [%q] (legacy back-compat default)",
+			c.FitModelSet, ModelGFS)
+	}
+}
+
+// TestLoadCoefficients_RoundTripsModelSet: a Coefficients with an
+// explicit FitModelSet (e.g. ["gfs"] written by today's calibrate-fit)
+// must round-trip through JSON without dropping or mutating the field.
+func TestLoadCoefficients_RoundTripsModelSet(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "modern.json")
+	orig := Coefficients{
+		SchemaVersion:      CoefficientsSchemaVersion,
+		FittedAt:           time.Now().UTC().Truncate(time.Second),
+		TrainingWindowEnd:  "2024-12-31",
+		HoldoutWindowStart: "2025-01-01",
+		FitModelSet:        []string{ModelGFS},
+		Bins: map[string]BinCoeffs{
+			"KNYC|MAM|tmax": {A: 0.5, B: 1.0, Sigma: 2.0, NTrain: 100, NHoldout: 30, SigmaSource: SigmaSourceHoldout},
+		},
+	}
+	body, err := json.Marshal(orig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if werr := os.WriteFile(path, body, 0o600); werr != nil {
+		t.Fatal(werr)
+	}
+	got, err := LoadCoefficients(path)
+	if err != nil {
+		t.Fatalf("LoadCoefficients: %v", err)
+	}
+	if len(got.FitModelSet) != 1 || got.FitModelSet[0] != ModelGFS {
+		t.Errorf("FitModelSet = %v, want [%q]", got.FitModelSet, ModelGFS)
+	}
+}
+
+func TestCanonicalModelSet(t *testing.T) {
+	cases := []struct {
+		in, want []string
+	}{
+		{nil, []string{}},
+		{[]string{"gfs"}, []string{"gfs"}},
+		{[]string{"gfs", "ecmwf"}, []string{"ecmwf", "gfs"}},
+		{[]string{"gfs", "gfs", "ecmwf"}, []string{"ecmwf", "gfs"}}, // dedupe
+		{[]string{"", "gfs"}, []string{"gfs"}},                      // skip empty
+	}
+	for _, tc := range cases {
+		got := CanonicalModelSet(tc.in)
+		if len(got) != len(tc.want) {
+			t.Errorf("CanonicalModelSet(%v) = %v, want %v", tc.in, got, tc.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != tc.want[i] {
+				t.Errorf("CanonicalModelSet(%v) = %v, want %v", tc.in, got, tc.want)
+				break
+			}
+		}
+	}
+}
+
+func TestModelSetEqual(t *testing.T) {
+	cases := []struct {
+		a, b []string
+		want bool
+	}{
+		{[]string{"gfs"}, []string{"gfs"}, true},
+		{[]string{"gfs"}, []string{"ecmwf"}, false},
+		{[]string{"ecmwf", "gfs"}, []string{"ecmwf", "gfs"}, true},
+		{[]string{"gfs"}, []string{"ecmwf", "gfs"}, false},
+		{[]string{}, []string{}, true},
+	}
+	for _, tc := range cases {
+		if got := ModelSetEqual(tc.a, tc.b); got != tc.want {
+			t.Errorf("ModelSetEqual(%v, %v) = %v, want %v", tc.a, tc.b, got, tc.want)
+		}
 	}
 }
 
@@ -270,4 +507,71 @@ func TestSortedBinKeys(t *testing.T) {
 			t.Errorf("SortedBinKeys()[%d] = %q, want %q", i, got[i], want[i])
 		}
 	}
+}
+
+// TestFit_DeterministicAcrossCalls is the A8 regression: with identical
+// pairs and an identical fake clock, two Fit calls must produce
+// byte-identical JSON. Before this fix FittedAt was time.Now().UTC()
+// inside Fit, so two back-to-back fits diverged by tens of nanoseconds —
+// enough to break any artifact-diffing reproducibility check.
+//
+// The JSON map iteration order in encoding/json sorts keys alphabetically,
+// so Bins won't perturb the comparison even though it is a map.
+func TestFit_DeterministicAcrossCalls(t *testing.T) {
+	rng := rand.New(rand.NewPCG(123, 456))
+	startDate, _ := time.Parse("2006-01-02", "2024-04-01")
+	pairs := make([]Pair, 80)
+	for i := range pairs {
+		date := startDate.AddDate(0, 0, i%50)
+		x := 60.0 + rng.Float64()*15
+		y := 0.5 + 1.0*x + rng.NormFloat64()*1.2
+		pairs[i] = Pair{
+			Station: "KNYC", ValidDate: date, Variable: "tmax",
+			Forecast: x, Observed: y,
+		}
+	}
+
+	// Reuse the same fake clock across both fits — the point is that
+	// Fit reads from the injected clock, not from time.Now, so identical
+	// inputs produce identical outputs.
+	clk := testClock()
+
+	c1, err := Fit(pairs, 0, clk)
+	if err != nil {
+		t.Fatalf("Fit (1st): %v", err)
+	}
+	c2, err := Fit(pairs, 0, clk)
+	if err != nil {
+		t.Fatalf("Fit (2nd): %v", err)
+	}
+
+	// FittedAt is the field that used to drift; cheap explicit check.
+	if !c1.FittedAt.Equal(c2.FittedAt) {
+		t.Errorf("FittedAt drifted: %v vs %v", c1.FittedAt, c2.FittedAt)
+	}
+
+	b1, err := json.Marshal(c1)
+	if err != nil {
+		t.Fatalf("marshal c1: %v", err)
+	}
+	b2, err := json.Marshal(c2)
+	if err != nil {
+		t.Fatalf("marshal c2: %v", err)
+	}
+	if !bytes.Equal(b1, b2) {
+		t.Errorf("Fit output diverged across calls with identical inputs.\n  c1=%s\n  c2=%s", b1, b2)
+	}
+}
+
+// TestFit_PanicsOnNilClock documents the explicit-parameter discipline:
+// passing nil panics rather than silently defaulting to time.Now. Tests
+// that need a clock construct clock.Fake; production constructs clock.Wall.
+func TestFit_PanicsOnNilClock(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatalf("Fit(_, _, nil) did not panic")
+		}
+	}()
+	_, _ = Fit([]Pair{{Station: "KNYC", Variable: "tmax", Forecast: 60, Observed: 62, ValidDate: time.Date(2024, 4, 1, 0, 0, 0, 0, time.UTC)}}, 0, nil)
 }

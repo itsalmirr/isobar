@@ -72,7 +72,7 @@ openmeteo:
   poll_interval: 5m
   variables: [temperature_2m]
   locations:
-    - { name: NY, series: [KXHIGHNY], lat: 40.0, lon: -73.0 }
+    - { name: NY, series: [KXHIGHNY], lat: 40.7794, lon: -73.9692 }
 `), 0o600))
 
 	cfg, err := Load(path)
@@ -275,4 +275,84 @@ journal:
 	_, err := Load(path)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "queue_size")
+}
+
+// TestValidateStationCoordsAcceptsCanonical exercises the happy path:
+// each known location with its NWS-canonical Lat/Lon must pass.
+func TestValidateStationCoordsAcceptsCanonical(t *testing.T) {
+	locs := []OpenMeteoLocation{
+		{Name: "NY", Lat: 40.7794, Lon: -73.9692},
+		{Name: "MIA", Lat: 25.7959, Lon: -80.2870},
+		{Name: "LAX", Lat: 33.9425, Lon: -118.4081},
+		{Name: "CHI", Lat: 41.7842, Lon: -87.7553},
+	}
+	require.NoError(t, validateStationCoords(locs))
+}
+
+// TestValidateStationCoordsRejectsORDForCHI is the regression guard
+// for the specific bug audit/chi-blast-radius.md describes: ORD coords
+// (41.9742, -87.9073) in the CHI slot. Validator must reject and the
+// error must name the station, both coord pairs, and the delta.
+func TestValidateStationCoordsRejectsORDForCHI(t *testing.T) {
+	err := validateStationCoords([]OpenMeteoLocation{
+		{Name: "CHI", Lat: 41.9742, Lon: -87.9073},
+	})
+	require.Error(t, err)
+	msg := err.Error()
+	require.Contains(t, msg, "CHI")
+	require.Contains(t, msg, "KMDW")
+	require.Contains(t, msg, "41.9742")
+	require.Contains(t, msg, "41.7842")
+}
+
+// TestValidateStationCoordsToleratesSubMilliDegreeDrift verifies the
+// tolerance is real: a 0.0005° offset (under the 0.001° threshold)
+// passes. This protects the example file from being too restrictive
+// against operator-rounded values.
+func TestValidateStationCoordsToleratesSubMilliDegreeDrift(t *testing.T) {
+	require.NoError(t, validateStationCoords([]OpenMeteoLocation{
+		{Name: "CHI", Lat: 41.7847, Lon: -87.7548}, // ±0.0005 from canonical
+	}))
+}
+
+// TestValidateStationCoordsSkipsUnknownLocation documents the
+// fall-through behaviour: a Name not in the canonical registry is
+// silently accepted (so adding a new series doesn't require a market
+// package change before the operator can poll it).
+func TestValidateStationCoordsSkipsUnknownLocation(t *testing.T) {
+	require.NoError(t, validateStationCoords([]OpenMeteoLocation{
+		{Name: "ATL", Lat: 33.6367, Lon: -84.4281}, // Atlanta — not in registry
+	}))
+}
+
+// TestLoadFailsOnDriftedCHICoords is the end-to-end Load-level guard:
+// a YAML file with the historical ORD coords for CHI must cause Load
+// to return an error rather than silently boot the recorder.
+func TestLoadFailsOnDriftedCHICoords(t *testing.T) {
+	clearAllKnownEnv(t)
+	t.Setenv("KALSHI_API_KEY_ID", "k")
+	t.Setenv("KALSHI_PRIVATE_KEY_PATH", "/tmp/fake.pem")
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "chi-ord.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(`
+kalshi:
+  enabled: true
+  ws_url: wss://example/ws
+  series: [KXHIGHCHI]
+  channels: [orderbook_delta]
+
+openmeteo:
+  enabled: true
+  base_url: https://weather.example
+  poll_interval: 5m
+  variables: [temperature_2m]
+  locations:
+    - { name: CHI, series: [KXHIGHCHI], lat: 41.9742, lon: -87.9073 }
+`), 0o600))
+
+	_, err := Load(path)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "CHI")
+	require.Contains(t, err.Error(), "KMDW")
 }

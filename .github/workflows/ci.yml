@@ -20,10 +20,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify no gitignored-but-tracked files
+        run: |
+          set -euo pipefail
+          # Find any tracked file that matches a .gitignore pattern.
+          # `git ls-files -i -c --exclude-standard` lists tracked files that
+          # would be ignored by gitignore rules — a strict mode is to fail if
+          # this returns any path.
+          VIOLATIONS=$(git ls-files -i -c --exclude-standard || true)
+          if [ -n "$VIOLATIONS" ]; then
+            echo "ERROR: the following files are tracked but match .gitignore rules:" >&2
+            echo "$VIOLATIONS" >&2
+            echo "Fix by: git rm --cached -r <file> and committing." >&2
+            exit 1
+          fi
+          echo "No gitignored-but-tracked files. OK."
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.26'
+          go-version-file: 'go.mod'
           cache: true
 
       - name: Tidy check
@@ -33,6 +49,9 @@ jobs:
 
       - name: Vet
         run: go vet ./...
+
+      - name: Clockcheck (ADR-0012 time-source discipline)
+        run: go run ./tools/clockcheck/cmd/clockcheck ./internal/...
 
       - name: Test (race)
         run: go test -race -count=1 -timeout=120s ./...
@@ -47,8 +66,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.26'
+          go-version-file: 'go.mod'
           cache: true
-      - uses: golangci/golangci-lint-action@v6
+      # Keep this version in lockstep with the local install (Makefile
+      # `lint` target) — drift means "passes locally, fails CI" or worse,
+      # the reverse. Local: `golangci-lint version`.
+      - uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.1
+          version: v2.12.2

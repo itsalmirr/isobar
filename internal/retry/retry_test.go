@@ -113,6 +113,51 @@ func TestDoHonorsContextBetweenAttempts(t *testing.T) {
 	require.GreaterOrEqual(t, calls.Load(), int32(1))
 }
 
+// TestDoResetAfterLongAttempt: an attempt that ran at least ResetAfter
+// before failing resets the attempt counter and backoff, so MaxAttempts
+// bounds consecutive short-lived failures rather than total failures over
+// the loop's lifetime. Nine "ran for 2 minutes, then dropped" attempts
+// must not trip MaxAttempts=3.
+func TestDoResetAfterLongAttempt(t *testing.T) {
+	cur := time.Unix(1000, 0)
+	var calls atomic.Int32
+	err := Do(context.Background(), Config{
+		InitialBackoff: time.Millisecond,
+		MaxBackoff:     2 * time.Millisecond,
+		MaxAttempts:    3,
+		ResetAfter:     time.Minute,
+		Now:            func() time.Time { return cur },
+	}, discardLogger(), func(int) error {
+		if calls.Add(1) < 10 {
+			cur = cur.Add(2 * time.Minute) // attempt "ran" longer than ResetAfter
+			return errors.New("long-lived failure")
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, int32(10), calls.Load())
+}
+
+// TestDoResetAfterShortAttemptsStillBounded: with ResetAfter set but every
+// attempt failing instantly, MaxAttempts must still bound the loop.
+func TestDoResetAfterShortAttemptsStillBounded(t *testing.T) {
+	cur := time.Unix(1000, 0)
+	var calls atomic.Int32
+	err := Do(context.Background(), Config{
+		InitialBackoff: time.Millisecond,
+		MaxBackoff:     time.Millisecond,
+		MaxAttempts:    3,
+		ResetAfter:     time.Minute,
+		Now:            func() time.Time { return cur }, // never advances: every attempt is instant
+	}, discardLogger(), func(int) error {
+		calls.Add(1)
+		return errors.New("flap")
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "max attempts")
+	require.Equal(t, int32(3), calls.Load())
+}
+
 func TestDoNilLogger(t *testing.T) {
 	// Should not panic when logger is nil.
 	err := Do(context.Background(), Config{
