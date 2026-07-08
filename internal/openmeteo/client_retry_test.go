@@ -117,6 +117,46 @@ func TestPoller_DoesNotRetry4xxOther(t *testing.T) {
 	require.Less(t, elapsed, 50*time.Millisecond, "non-retryable should not sleep")
 }
 
+// TestPoller_RetriesOnClientTimeout is the regression guard for the
+// timeout-classification bug: a per-request http.Client timeout
+// unwraps to context.DeadlineExceeded, and the old code matched that
+// error value and bailed out as "non-retryable ctx error" even though
+// the parent context was alive. The package doc promises timeouts are
+// retried like any other transport failure.
+func TestPoller_RetriesOnClientTimeout(t *testing.T) {
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hits.Add(1) == 1 {
+			// First request: outlive the client's 50ms timeout.
+			select {
+			case <-time.After(500 * time.Millisecond):
+			case <-r.Context().Done():
+			}
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	p, err := NewPoller(Options{
+		BaseURL:             srv.URL,
+		PollInterval:        time.Minute,
+		Locations:           []Location{{Name: "NY", Lat: 40, Lon: -73}},
+		Logger:              discardLogger(),
+		Client:              &http.Client{Timeout: 50 * time.Millisecond},
+		RetryInitialBackoff: 10 * time.Millisecond,
+		RetryMaxBackoff:     40 * time.Millisecond,
+		RetryMaxAttempts:    3,
+	})
+	require.NoError(t, err)
+
+	body, err := p.fetchWithRetry(context.Background(), Location{Name: "NY", Lat: 40, Lon: -73})
+	require.NoError(t, err, "a client-side timeout with a live parent ctx must be retried")
+	require.Equal(t, `{"ok":true}`, string(body))
+	require.Equal(t, int64(2), hits.Load(), "one timed-out attempt, then success")
+}
+
 func TestPoller_HonorsCtxCancellation(t *testing.T) {
 	// Server holds the response until either the timeout fires or its ctx
 	// dies. The client ctx will cancel after 100ms; the http.Client.Do

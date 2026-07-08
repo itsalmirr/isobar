@@ -137,8 +137,13 @@ func Fit(pairs []Pair, holdoutDays int, clk clock.Clock) (Coefficients, error) {
 			maxDate = p.ValidDate
 		}
 	}
-	holdoutStart := maxDate.Add(-time.Duration(holdoutDays) * 24 * time.Hour)
-	trainEnd := holdoutStart.Add(-24 * time.Hour)
+	// The holdout is the final holdoutDays civil dates of the window:
+	// [maxDate−(holdoutDays−1), maxDate]. holdoutDays == 0 places
+	// holdoutStart after maxDate, i.e. an empty holdout — previously
+	// the boundary was maxDate−holdoutDays, which held out N+1 days
+	// and, at N=0, still diverted the final day away from training.
+	holdoutStart := maxDate.AddDate(0, 0, 1-holdoutDays)
+	trainEnd := holdoutStart.AddDate(0, 0, -1)
 
 	// Group pairs by bin into train/holdout.
 	type bucket struct {

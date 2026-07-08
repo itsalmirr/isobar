@@ -13,7 +13,50 @@ Section order within a release: `Added` · `Changed` · `Fixed` ·
 
 ## [Unreleased]
 
-Nothing yet — the next behavior-changing commit adds its entry here.
+### Fixed
+- `internal/edge` — the T−3h Bayesian update no longer fires for trades
+  outside the bracket's resolution civil day (station-local). Day-ahead
+  trades previously had *today's* running extremum folded into
+  *tomorrow's* TMAX/TMIN posterior; new per-row skip reason
+  `wrong_civil_day`.
+- `internal/edge` — `tradeMsg.priceDollars()` returned the raw NO price
+  (not the YES price) for `side=no` trades in the int-cents wire shape,
+  inverting the price for every no-side taker on that path.
+- `internal/edge` — ensemble daily extremes now use a DST-safe civil-day
+  window (`AddDate`, not `Add(24h)`): the 25-hour fall-back day lost its
+  final hour and the 23-hour spring-forward day absorbed the next day's
+  first hour.
+- `internal/journal` — the writer goroutine no longer panics (nil
+  `bufio.Writer`) when the re-open after a rotation fails; it drops-and-
+  counts per frame (visible via `Dropped()` and the ADR-0011 alarm) and
+  recovers when the disk is writable again. The age-rotate failure path
+  no longer silently terminates journaling for the process lifetime.
+  `gzipFile` propagates the output file's Close error instead of
+  swallowing it before the plain file is deleted.
+- `internal/calibration/mos` — `Fit` held out N+1 days when asked for N
+  (`holdoutDays=0` still diverted the final day out of training); the
+  holdout is now exactly the final N civil dates.
+- `internal/openmeteo` — per-request `http.Client` timeouts are retried
+  again: they unwrap to `context.DeadlineExceeded` and were misread as
+  parent-context cancellation, skipping the documented retry envelope
+  (and being excluded from `FetchFailuresTotal`).
+- `internal/universe` — `Events` pagination terminates on an empty page
+  with a non-empty cursor instead of spinning forever (same guard
+  `kalshi.Client.DiscoverOpenTickers` already had).
+- `cmd/calibrate-bayesian` — `PairsFit` no longer counts civil dates
+  that contributed zero Δ samples (truth present but no usable obs).
+- `config/config.example.yaml` — the MIA location carried downtown-Miami
+  coordinates that fail boot-time canonical-coordinate validation
+  (±0.001° vs KMIA); copying the example per the Quickstart produced a
+  recorder that refused to boot.
+
+### Docs
+- `docs/BACKTEST.md` — CSV column reference now includes the six
+  `bayes_*` columns the scanner has emitted since v3, and the T-bracket
+  pitfall no longer claims the bracket convention is "still marked
+  FIXME" (it was closed in `internal/edge/resolution.go`).
+- `internal/edge.EdgeRow` — documented the real `BayesSkipReason` enum
+  (`no_prior` / `prior-only` were undocumented or misspelled).
 
 ---
 

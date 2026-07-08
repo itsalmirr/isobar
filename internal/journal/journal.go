@@ -554,8 +554,13 @@ func (j *Journal) run() {
 			if j.opts.MaxFileAge > 0 && f != nil && time.Since(opened) >= j.opts.MaxFileAge {
 				rotate()
 				if err := open(); err != nil {
-					j.logger.Error("re-open after age rotate failed", "err", err)
-					return
+					// Keep the writer alive: writeOne retries the open
+					// lazily per frame and counts drops. Exiting here
+					// (the previous behaviour) silently stopped all
+					// journaling for the rest of the process while
+					// producers kept enqueueing into a queue nobody
+					// drained — with no counter and no alarm.
+					j.logger.Error("re-open after age rotate failed; will retry per frame", "err", err)
 				}
 			}
 
@@ -641,10 +646,11 @@ func (j *Journal) checkDropAlarm() {
 // AlarmHookPanicTotal() (or, in Phase 6, the Prometheus gauge).
 func (j *Journal) safeInvokeAlarm(src string, drops uint64, since time.Duration) {
 	if j.onDropAlarm == nil {
-		// Belt-and-braces: Open() always installs a non-nil hook
-		// (custom or default-slog-warn fallback). Guarding here so a
-		// future refactor that resets j.onDropAlarm cannot reintroduce
-		// a nil-deref crash in the writer goroutine.
+		// Belt-and-braces: Open() refuses a nil hook up front
+		// (ErrAlarmHookRequired), so this cannot be nil in a
+		// constructed Journal. Guarding here so a future refactor
+		// that resets j.onDropAlarm cannot reintroduce a nil-deref
+		// crash in the writer goroutine.
 		return
 	}
 	defer func() {
@@ -702,7 +708,10 @@ func newPath(dir, source string) (string, error) {
 	return filepath.Join(folder, fmt.Sprintf("%s-%s.jsonl", source, stamp)), nil
 }
 
-// gzipFile compresses src into src+".gz". Returns nil on success.
+// gzipFile compresses src into src+".gz". Returns nil on success. The
+// output file's Close error is propagated (not deferred-and-dropped):
+// the caller deletes the plain file on success, so a swallowed close
+// error could destroy the only good copy of the data.
 func gzipFile(src string) error {
 	in, err := os.Open(src) //nolint:gosec // src is a journal file path we wrote ourselves
 	if err != nil {
