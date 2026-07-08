@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/wh0o0pz/isobar/internal/market"
 )
 
 // HourlyObs is one IEM ASOS surface-temperature observation. TS is in
@@ -83,20 +85,17 @@ type stationHourly struct {
 }
 
 // LoadHourlyIndex scans dir for K<STA>-hourly.csv files matching the
-// canonical four-station set (KNYC, KMIA, KLAX, KMDW) and returns a
+// canonical station registry (market.AllStationCodes) and returns a
 // ready-to-use index. A missing file for a known station is not a
 // fatal error — RunningExtremum will simply return ok=false for that
 // station — but a present-but-unparseable file is.
 func LoadHourlyIndex(dir string) (*HourlyIndex, error) {
-	idx := &HourlyIndex{byStation: make(map[string]stationHourly, 4)}
-	for _, code := range canonicalStations {
-		ianaName, err := stationIANA(code)
+	codes := market.AllStationCodes()
+	idx := &HourlyIndex{byStation: make(map[string]stationHourly, len(codes))}
+	for _, code := range codes {
+		tz, err := market.StationTZ(code)
 		if err != nil {
-			return nil, err
-		}
-		tz, err := time.LoadLocation(ianaName)
-		if err != nil {
-			return nil, fmt.Errorf("hourly: load tz %s: %w", ianaName, err)
+			return nil, fmt.Errorf("hourly: %w", err)
 		}
 		path := filepath.Join(dir, code+"-hourly.csv")
 		if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
@@ -193,26 +192,4 @@ func (h *HourlyIndex) RunningExtremum(station, variable string, asOf time.Time) 
 		hRemain = 24
 	}
 	return running, hRemain, true
-}
-
-// canonicalStations is the four-station registry the kernel fitter
-// and the scanner agree on. Kept local to this file so the bayesian
-// package doesn't take a dependency on internal/market (and the
-// mapping is auditable in one place alongside the kernel math).
-var canonicalStations = []string{"KNYC", "KMIA", "KLAX", "KMDW"}
-
-// stationIANA maps a four-letter station code to its IANA tz database
-// name. Mirrors internal/edge/scan.go: stationLocation and the
-// equivalent in cmd/calibrate-bayesian/fit.go; kept here so the
-// hourly index can derive civil-day boundaries from station alone.
-func stationIANA(code string) (string, error) {
-	switch code {
-	case "KNYC", "KMIA":
-		return "America/New_York", nil
-	case "KMDW":
-		return "America/Chicago", nil
-	case "KLAX":
-		return "America/Los_Angeles", nil
-	}
-	return "", fmt.Errorf("station %q has no timezone mapping", code)
 }

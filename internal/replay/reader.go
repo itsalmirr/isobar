@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -115,9 +116,18 @@ const MaxLineBytes = 8 << 20
 // state such as gap tracking.
 //
 // Malformed lines are skipped silently: a single broken frame should
-// not abort a day-long report. To stop iteration early, fn may return
-// io.EOF (sentinel, not an error); any other non-nil error halts
-// iteration and returns that error.
+// not abort a day-long report. That tolerance extends to scanner-level
+// corruption, which is the failure mode of a crash mid-rotation: an
+// oversized line (> MaxLineBytes) or a truncated .gz whose read ends in
+// io.ErrUnexpectedEOF is confined to the file it occurs in — the reader
+// logs a warning (file path + frames read so far) and moves on to the
+// remaining files rather than aborting the whole run. Note the
+// oversized-line case skips the REST of the offending file, not just
+// the one token, because bufio.Scanner cannot resume past ErrTooLong.
+//
+// To stop iteration early, fn may return io.EOF (sentinel, not an
+// error); any other non-nil error halts iteration and returns that
+// error.
 func ForEachFrame(files []string, fn func(env Envelope, bytes int, firstInFile bool) error) error {
 	for _, path := range files {
 		if err := forEachFrameInFile(path, fn); err != nil {
@@ -141,6 +151,7 @@ func forEachFrameInFile(path string, fn func(env Envelope, bytes int, firstInFil
 	sc.Buffer(make([]byte, 64<<10), MaxLineBytes)
 
 	firstInFile := true
+	framesRead := 0
 	for sc.Scan() {
 		line := sc.Bytes()
 		var env Envelope
@@ -160,8 +171,29 @@ func forEachFrameInFile(path string, fn func(env Envelope, bytes int, firstInFil
 			return err
 		}
 		firstInFile = false
+		framesRead++
 	}
 	if err := sc.Err(); err != nil {
+		// Scanner-level corruption is a per-file condition, not a reason
+		// to abandon the whole run. Two cases are recoverable and match
+		// the crash-mid-rotation reality of a rotated .gz tape:
+		//   - bufio.ErrTooLong: a line exceeded MaxLineBytes. The scanner
+		//     cannot resume past it, so the rest of THIS file is skipped;
+		//     the intact frames already read are kept.
+		//   - io.ErrUnexpectedEOF: a truncated final line/gzip footer,
+		//     the signature of a recorder crash mid-rotation. Every
+		//     intact line before the truncation has already been yielded.
+		// Both are logged (path + frame count) and swallowed so the
+		// remaining files still process. Anything else is genuinely
+		// unexpected and propagates.
+		if errors.Is(err, bufio.ErrTooLong) || errors.Is(err, io.ErrUnexpectedEOF) {
+			slog.Default().Warn("replay: recovered from scanner-level tape corruption; skipping rest of file",
+				slog.String("path", path),
+				slog.Int("frames_read", framesRead),
+				slog.String("err", err.Error()),
+			)
+			return nil
+		}
 		return fmt.Errorf("scan %s: %w", path, err)
 	}
 	return nil

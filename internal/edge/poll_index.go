@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -183,60 +184,56 @@ func (m tradeMsg) side() string {
 // legacy bare price_dollars string.
 func (m tradeMsg) priceDollars() float64 {
 	if m.YesPrice > 0 || m.NoPrice > 0 {
-		// The YES-price of the print is yes_price regardless of which
-		// side the taker was on; derive it from no_price (100 − no)
-		// only when yes_price is absent. The side switch is kept as
-		// shape validation: a missing/unknown side means we can't
-		// trust the message. (A previous revision returned the raw
-		// no_price for side="no" — the *NO* price — inverting the
-		// price for every no-side taker in the int-cents shape; the
-		// string path below always converted correctly.)
-		var c int
-		switch m.side() {
-		case "yes", "no":
-			c = m.YesPrice
-			if c == 0 {
-				c = 100 - m.NoPrice
-			}
-		default:
-			return -1
-		}
-		return c, true
-	case m.NoPrice > 0:
-		c := 100 - m.NoPrice
-		if c <= 0 || c >= 100 {
-			return 0, false
-		}
-		return c, true
+		return m.priceFromCentsFields()
 	}
-	if m.YesPriceDollars != "" {
-		var v float64
-		if _, err := fmt.Sscanf(m.YesPriceDollars, "%f", &v); err == nil && v > 0 && v < 1 {
-			return v
-		}
+	if v, ok := parseDollarFraction(m.YesPriceDollars); ok {
+		return v
 	}
-	if m.NoPriceDollars != "" {
-		var v float64
-		if _, err := fmt.Sscanf(m.NoPriceDollars, "%f", &v); err == nil && v > 0 && v < 1 {
-			return 1 - v
-		}
+	if v, ok := parseDollarFraction(m.NoPriceDollars); ok {
+		return 1 - v
 	}
 	if len(m.PriceDollars) > 0 {
 		var s string
 		if err := json.Unmarshal(m.PriceDollars, &s); err == nil {
-			var v float64
-			if _, err := fmt.Sscanf(s, "%f", &v); err == nil && v > 0 && v < 1 {
-				c := int(v*100 + 0.5)
-				if m.Side == "no" {
-					c = 100 - c
-				}
-				if c <= 0 || c >= 100 {
-					return 0, false
-				}
-				return c, true
+			if v, ok := parseDollarFraction(s); ok {
+				return v
 			}
 		}
 	}
 	return 0, false
 }
 
+// priceFromCentsFields derives the YES price from the v2-docs int
+// yes_price/no_price pair, keyed on the taker side; whichever side's
+// field is zero is reconstructed as the complement of the other.
+func (m tradeMsg) priceFromCentsFields() float64 {
+	var c int
+	switch m.side() {
+	case "yes":
+		c = m.YesPrice
+		if c == 0 {
+			c = 100 - m.NoPrice
+		}
+	case "no":
+		c = m.NoPrice
+		if c == 0 {
+			c = 100 - m.YesPrice
+		}
+	default:
+		return -1
+	}
+	if c <= 0 || c >= 100 {
+		return -1
+	}
+	return float64(c) / 100
+}
+
+// parseDollarFraction parses a decimal price string, accepting only
+// exclusive (0,1) values — "0" / "1" / junk all report ok=false.
+func parseDollarFraction(s string) (float64, bool) {
+	if s == "" {
+		return 0, false
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	return v, err == nil && v > 0 && v < 1
+}

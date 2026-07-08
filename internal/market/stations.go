@@ -1,19 +1,26 @@
 // Package market is the canonical registry of weather observing
 // sites the recorder, calibrator, and scanner all agree on. It owns
 // the mapping from short location tags ("NY"/"MIA"/"LAX"/"CHI") to
-// the four-letter NWS station code, lat/lon, UTC offset, Kalshi
-// series prefixes, and NWS CLI bulletin PIL. Adding a new station
-// is a one-place edit; see the Station type comment for the
-// invariants every entry must satisfy.
+// the four-letter NWS station code, lat/lon, and IANA timezone.
+// Adding a new station is a one-place edit; see the Station type
+// comment for the invariants every entry must satisfy.
 package market
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
 
 // Station is the canonical record for one weather observing site we
 // trade brackets on. Single source of truth for code, location tag,
-// coordinates, timezone offset, Kalshi series names, and NWS CLI PIL.
+// coordinates, and civil-day timezone. The station↔series mapping
+// lives in internal/edge (Spec.Station); CLI bulletin PILs are
+// derived from station codes inside scripts/calibration-fetch-cli.sh.
 //
-// Adding a new station: append to allStations, add the location tag
-// to the appropriate series prefix mappings, and verify
-// scripts/calibration-fetch-*.sh include the same set.
+// Adding a new station: append to allStations, extend the series
+// mapping in internal/edge, and verify scripts/calibration-fetch-*.sh
+// include the same set.
 type Station struct {
 	// Code is the WFO/airport identifier used by NWS CLI bulletins
 	// and by data/calibration/obs CSV filenames (e.g. "KNYC").
@@ -22,9 +29,6 @@ type Station struct {
 	// Location is the short tag used by Open-Meteo poll Kind
 	// ("rest:NY") and by config/config.example.yaml entries.
 	Location string
-
-	// City is the human-readable name (for log messages, reports).
-	City string
 
 	// Lat, Lon are the canonical observing-site coordinates (WGS84
 	// decimal degrees), used for Open-Meteo polling and for boot-time
@@ -38,20 +42,12 @@ type Station struct {
 	// stations near coast/elevation gradients.
 	Lat, Lon float64
 
-	// UTCOffsetHours is the local-civil-time offset during US daylight
-	// time (March-November). All four stations are in DST during the
-	// April-October recording window. Re-validate before recording in
-	// the November-March standard-time window.
-	UTCOffsetHours int
-
-	// HighSeries and LowSeries are the Kalshi series prefixes that
-	// resolve on this station's daily TMAX/TMIN.
-	HighSeries, LowSeries string
-
-	// CLIPil is the AFOS PIL prefix for this station's NWS CLI
-	// bulletin (e.g. "CLINYC"). Matches what scripts/calibration-fetch-cli.sh
-	// requests from IEM.
-	CLIPil string
+	// TZ is the IANA tz-database name for the station's civil day. NWS
+	// CLI settlement is on local calendar days, so the recorder,
+	// calibrator, and scanner all derive civil-day boundaries from this.
+	// Prefer StationTZ(code) to LoadLocation-cache it rather than reading
+	// this field directly. DST is handled by the tz database.
+	TZ string
 }
 
 // allStations is the registry. Consumers should use the lookup
@@ -65,28 +61,20 @@ type Station struct {
 // map index once N grows past ~16 (hurricane series, secondary cities).
 var allStations = []Station{
 	{
-		Code: "KNYC", Location: "NY", City: "New York",
-		Lat: 40.7794, Lon: -73.9692, UTCOffsetHours: -4,
-		HighSeries: "KXHIGHNY", LowSeries: "KXLOWTNYC",
-		CLIPil: "CLINYC",
+		Code: "KNYC", Location: "NY",
+		Lat: 40.7794, Lon: -73.9692, TZ: "America/New_York",
 	},
 	{
-		Code: "KMIA", Location: "MIA", City: "Miami",
-		Lat: 25.7959, Lon: -80.2870, UTCOffsetHours: -4,
-		HighSeries: "KXHIGHMIA", LowSeries: "KXLOWTMIA",
-		CLIPil: "CLIMIA",
+		Code: "KMIA", Location: "MIA",
+		Lat: 25.7959, Lon: -80.2870, TZ: "America/New_York",
 	},
 	{
-		Code: "KLAX", Location: "LAX", City: "Los Angeles",
-		Lat: 33.9425, Lon: -118.4081, UTCOffsetHours: -7,
-		HighSeries: "KXHIGHLAX", LowSeries: "KXLOWTLAX",
-		CLIPil: "CLILAX",
+		Code: "KLAX", Location: "LAX",
+		Lat: 33.9425, Lon: -118.4081, TZ: "America/Los_Angeles",
 	},
 	{
-		Code: "KMDW", Location: "CHI", City: "Chicago",
-		Lat: 41.7842, Lon: -87.7553, UTCOffsetHours: -5,
-		HighSeries: "KXHIGHCHI", LowSeries: "KXLOWTCHI",
-		CLIPil: "CLIMDW",
+		Code: "KMDW", Location: "CHI",
+		Lat: 41.7842, Lon: -87.7553, TZ: "America/Chicago",
 	},
 }
 
@@ -126,26 +114,31 @@ func StationByCode(code string) (Station, bool) {
 	return Station{}, false
 }
 
-// StationByLocation looks up a Station by its short location tag
-// ("NY", "MIA", "LAX", "CHI").
-func StationByLocation(loc string) (Station, bool) {
-	for _, s := range allStations {
-		if s.Location == loc {
-			return s, true
-		}
-	}
-	return Station{}, false
-}
+// tzCache memoises the parsed *time.Location per station code so the
+// recorder/calibrator/scanner don't re-parse the tz database on every
+// civil-day boundary computation. Concurrency-safe: StationTZ is called
+// from parallel scan/calibrate goroutines.
+var tzCache sync.Map // string code → *time.Location
 
-// StationBySeries looks up the Station that this Kalshi series resolves
-// on. Accepts either the high or low series. Returns ok=false for
-// unrecognised prefixes (which is also how non-weather tickers fall
-// through).
-func StationBySeries(series string) (Station, bool) {
-	for _, s := range allStations {
-		if s.HighSeries == series || s.LowSeries == series {
-			return s, true
-		}
+// StationTZ returns the parsed IANA *time.Location for the station's civil
+// day, LoadLocation-cached per code. It is the single source of the
+// station→timezone mapping the recorder, calibrator, and scanner share;
+// callers derive local civil-day boundaries (and thus which calendar day a
+// trade resolves on) from it, so a stale or divergent copy would be a
+// bracket-flip-level correctness bug. Returns an error for an unknown code
+// or a station whose TZ fails to load.
+func StationTZ(code string) (*time.Location, error) {
+	if v, ok := tzCache.Load(code); ok {
+		return v.(*time.Location), nil
 	}
-	return Station{}, false
+	st, ok := StationByCode(code)
+	if !ok || st.TZ == "" {
+		return nil, fmt.Errorf("station %q has no timezone mapping", code)
+	}
+	loc, err := time.LoadLocation(st.TZ)
+	if err != nil {
+		return nil, fmt.Errorf("station %s: load tz %s: %w", code, st.TZ, err)
+	}
+	actual, _ := tzCache.LoadOrStore(code, loc)
+	return actual.(*time.Location), nil
 }

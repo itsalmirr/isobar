@@ -1,19 +1,15 @@
 package main
 
 import (
-	"encoding/csv"
-	"encoding/json"
 	"fmt"
-	"io"
 	"math"
-	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/wh0o0pz/isobar/internal/calibration/bayesian"
+	"github.com/wh0o0pz/isobar/internal/calibration/obscsv"
+	"github.com/wh0o0pz/isobar/internal/jsonatomic"
 	"github.com/wh0o0pz/isobar/internal/market"
 )
 
@@ -52,23 +48,6 @@ type truthRow struct {
 	Tmin float64
 }
 
-// stationIANA maps WFO codes to their IANA timezone. Used to convert
-// the truth's local civil-date window into a UTC range we can filter
-// hourly obs on. Mirrors internal/edge/scan.go: stationLocation; kept
-// local here so the fitter doesn't import internal/edge (and to be
-// explicit that the four-station registry is the same).
-func stationIANA(code string) (string, error) {
-	switch code {
-	case "KNYC", "KMIA":
-		return "America/New_York", nil
-	case "KMDW":
-		return "America/Chicago", nil
-	case "KLAX":
-		return "America/Los_Angeles", nil
-	}
-	return "", fmt.Errorf("station %q has no timezone mapping", code)
-}
-
 // runFit drives the per-station, per-variable fit and writes the
 // resulting Kernel JSON to opts.OutPath. Returns a summary the
 // CLI can log.
@@ -82,13 +61,9 @@ func runFit(opts fitOptions) (fitSummary, error) {
 	sum := fitSummary{Stations: make(map[string]stationSummary, len(stations))}
 
 	for _, code := range stations {
-		loc, err := stationIANA(code)
+		tz, err := market.StationTZ(code)
 		if err != nil {
 			return sum, fmt.Errorf("station %s: %w", code, err)
-		}
-		tz, err := time.LoadLocation(loc)
-		if err != nil {
-			return sum, fmt.Errorf("station %s: load tz %s: %w", code, loc, err)
 		}
 
 		truthPath := filepath.Join(opts.TruthDir, code+".csv")
@@ -224,43 +199,25 @@ func fitStationVariable(
 
 // loadTruth parses a CLI truth CSV produced by cmd/calibrate-parse-cli.
 // Schema: valid_date,tmax_f,tmin_f,issued_at,bulletin_id (last two
-// ignored). Rows with non-integer temps are skipped silently — same
-// best-effort policy as internal/edge.LoadTruth.
+// ignored). Rows with a missing/unparseable temp are skipped silently —
+// same best-effort policy as internal/edge.LoadTruth. Column resolution is
+// by header NAME via the shared obscsv reader: the previous positional
+// rec[0]/rec[1]/rec[2] parse would have silently misread the instant the
+// CLI parser reordered its columns.
 func loadTruth(path string) (map[string]truthRow, error) {
-	f, err := os.Open(path) //nolint:gosec // operator-supplied calibration path
+	rows, err := obscsv.ReadFile(path, obscsv.Options{
+		Alias:   obscsv.StrictAliases,
+		Require: []string{obscsv.ColDate, obscsv.ColTmax, obscsv.ColTmin},
+	})
 	if err != nil {
-		return nil, fmt.Errorf("open %s: %w", path, err)
+		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	defer f.Close() //nolint:errcheck // read-only
-	r := csv.NewReader(f)
-	r.FieldsPerRecord = -1 // tolerate trailing-col variance
-	out := make(map[string]truthRow)
-	first := true
-	for {
-		rec, err := r.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", path, err)
-		}
-		if first {
-			first = false
+	out := make(map[string]truthRow, len(rows))
+	for _, row := range rows {
+		if !row.TmaxPresent || !row.TminPresent {
 			continue
 		}
-		if len(rec) < 3 {
-			continue
-		}
-		date := strings.TrimSpace(rec[0])
-		if _, err := time.Parse("2006-01-02", date); err != nil {
-			continue
-		}
-		tmax, err1 := strconv.ParseFloat(strings.TrimSpace(rec[1]), 64)
-		tmin, err2 := strconv.ParseFloat(strings.TrimSpace(rec[2]), 64)
-		if err1 != nil || err2 != nil {
-			continue
-		}
-		out[date] = truthRow{Tmax: tmax, Tmin: tmin}
+		out[row.Date.Format("2006-01-02")] = truthRow{Tmax: row.Tmax, Tmin: row.Tmin}
 	}
 	return out, nil
 }
@@ -349,26 +306,9 @@ func (s *onlineStat) MeanVar() (float64, float64) {
 	return s.Mean, s.M2 / float64(s.N-1)
 }
 
-// writeKernel marshals the kernel and writes via tmp+rename for
-// atomicity (matching cmd/calibrate-fit's convention).
+// writeKernel marshals the kernel and writes via tmp+rename for atomicity.
 func writeKernel(path string, k bayesian.Kernel) error {
-	tmp := path + ".tmp"
-	f, err := os.Create(tmp) //nolint:gosec // operator-supplied output path
-	if err != nil {
-		return err
-	}
-	enc := json.NewEncoder(f)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(k); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return os.Rename(tmp, path)
+	return jsonatomic.WriteIndent(path, k)
 }
 
 // stationSummary is the per-station fit report.

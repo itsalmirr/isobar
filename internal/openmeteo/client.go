@@ -56,6 +56,12 @@ type Location struct {
 }
 
 // Options configures the poller.
+//
+// BaseURL, Model, Locations, and positive ForecastDays/PollInterval are
+// required — NewPoller rejects zero values instead of re-defaulting
+// them. Production defaults (model, forecast days, the >=1m
+// rate-limit floor on poll interval) live in internal/config
+// (Defaults/Validate), the single source of truth.
 type Options struct {
 	BaseURL      string
 	Model        string   // e.g., "gfs_seamless"
@@ -95,15 +101,25 @@ type Poller struct {
 }
 
 // NewPoller validates options and returns a Poller. Call Run to start.
+// Config-owned knobs (model, forecast days, poll interval) must arrive
+// populated; the interval check here is only the mechanical floor that
+// keeps time.NewTicker from panicking — the 1m rate-limit policy is
+// enforced by config.Validate.
 func NewPoller(opts Options) (*Poller, error) {
 	if opts.BaseURL == "" {
 		return nil, errors.New("openmeteo: base_url required")
 	}
-	if opts.PollInterval < time.Minute {
-		return nil, errors.New("openmeteo: poll_interval must be >= 1m")
+	if opts.Model == "" {
+		return nil, errors.New("openmeteo: model required")
+	}
+	if opts.PollInterval <= 0 {
+		return nil, errors.New("openmeteo: poll_interval must be > 0")
 	}
 	if len(opts.Locations) == 0 {
 		return nil, errors.New("openmeteo: at least one location required")
+	}
+	if opts.ForecastDays <= 0 {
+		return nil, errors.New("openmeteo: forecast_days must be >= 1")
 	}
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
@@ -113,12 +129,6 @@ func NewPoller(opts Options) (*Poller, error) {
 	}
 	if opts.OnFetch == nil {
 		opts.OnFetch = func(Location, []byte) {}
-	}
-	if opts.ForecastDays <= 0 {
-		opts.ForecastDays = 3
-	}
-	if opts.Model == "" {
-		opts.Model = "gfs_seamless"
 	}
 	if opts.RetryInitialBackoff <= 0 {
 		opts.RetryInitialBackoff = retryInitialBackoff
@@ -178,11 +188,13 @@ func (p *Poller) fetchAll(ctx context.Context) {
 		}
 		raw, err := p.fetchWithRetry(ctx, loc)
 		if err != nil {
-			// Ctx cancellation isn't a fetch failure — it's clean shutdown.
-			// Don't bump the counter or warn loudly. Checked on ctx
-			// itself: an exhausted retry envelope whose last error was a
-			// client-side timeout also unwraps to DeadlineExceeded, and
-			// that IS a fetch failure that must count.
+			// Parent-context cancellation isn't a fetch failure — it's clean
+			// shutdown. Don't bump the counter or warn loudly, and stop the
+			// cycle. We gate on ctx.Err()!=nil so a client-side http timeout
+			// (which also satisfies errors.Is(DeadlineExceeded) while the
+			// parent ctx is live) is instead treated as a real fetch failure:
+			// bump the counter and continue to the remaining locations rather
+			// than silently abandoning the rest of the tick.
 			if ctx.Err() != nil {
 				return
 			}
@@ -247,14 +259,12 @@ func (p *Poller) fetchWithRetry(ctx context.Context, loc Location) ([]byte, erro
 		}
 
 		// Parent-context cancellation propagates immediately as
-		// non-retryable so the caller can return ctx.Err() upstream.
-		// The check is on ctx itself, NOT errors.Is(fetchErr,
-		// context.DeadlineExceeded): a per-request http.Client timeout
-		// also unwraps to DeadlineExceeded, and that is exactly the
-		// transient "timeout" the package doc promises to retry. The
-		// old error-value check silently exempted every client-side
-		// timeout from the retry envelope.
-		if ctx.Err() != nil {
+		// non-retryable so the caller can return ctx.Err() upstream. We gate
+		// on ctx.Err()!=nil because an http.Client.Timeout firing also yields
+		// an errors.Is(DeadlineExceeded) error while the parent ctx is still
+		// live — that is a client-side transient, not shutdown, and must fall
+		// through to the retryable transport path below (statusCode==0).
+		if ctx.Err() != nil && (errors.Is(fetchErr, context.Canceled) || errors.Is(fetchErr, context.DeadlineExceeded)) {
 			nonRetryableErr = fetchErr
 			p.logAttempt(ctx, slog.LevelDebug, "openmeteo fetch attempt", loc, attempt, latency, statusCode, fetchErr, 0)
 			return nil //nolint:nilerr // stops retry.Do; fetchWithRetry surfaces ctx.Err() to the caller below
@@ -343,10 +353,14 @@ func nextBackoffFor(attempt int, initial, max time.Duration) time.Duration {
 // isRetryable returns true for transient I/O failures: network errors
 // (dial / timeout / reset / EOF — anything where statusCode is 0 because
 // we never got a response) and HTTP 5xx / 429. Returns false for HTTP
-// 4xx other than 429 (we sent a bad request). Parent-context
-// cancellation is handled by the caller before this is consulted —
-// deliberately not via errors.Is here, because per-request client
-// timeouts also unwrap to context.DeadlineExceeded and must retry.
+// 4xx other than 429 (we sent a bad request).
+//
+// Parent-context cancellation is deliberately NOT special-cased here: the
+// sole caller (fetchWithRetry) already filters genuine shutdown via
+// ctx.Err()!=nil upstream, so any DeadlineExceeded reaching this function
+// is an http.Client.Timeout transient — a statusCode==0 transport failure
+// that must remain retryable to honor the reliability contract in the
+// package doc.
 func isRetryable(err error, statusCode int) bool {
 	if err == nil {
 		return false

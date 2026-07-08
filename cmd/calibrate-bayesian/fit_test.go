@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/wh0o0pz/isobar/internal/calibration/bayesian"
+	"github.com/wh0o0pz/isobar/internal/market"
 )
 
 // TestOnlineStat covers Welford's invariants vs a closed-form reference.
@@ -44,8 +45,9 @@ func TestOnlineStat(t *testing.T) {
 	})
 }
 
-// TestStationIANA pins the four canonical mappings; refusing unknowns
-// keeps the fitter honest if the registry grows without updating here.
+// TestStationIANA pins the four canonical mappings via the shared
+// market.StationTZ helper; refusing unknowns keeps the fitter honest if
+// the registry grows without a corresponding tz entry.
 func TestStationIANA(t *testing.T) {
 	cases := map[string]string{
 		"KNYC": "America/New_York",
@@ -54,11 +56,11 @@ func TestStationIANA(t *testing.T) {
 		"KMDW": "America/Chicago",
 	}
 	for code, want := range cases {
-		got, err := stationIANA(code)
+		got, err := market.StationTZ(code)
 		require.NoError(t, err)
-		assert.Equal(t, want, got, "station %s", code)
+		assert.Equal(t, want, got.String(), "station %s", code)
 	}
-	_, err := stationIANA("KORD")
+	_, err := market.StationTZ("KORD")
 	assert.Error(t, err, "unknown station must error")
 }
 
@@ -83,32 +85,6 @@ func TestLoadTruth_RoundTrip(t *testing.T) {
 	assert.Equal(t, 58.0, tr["2024-05-02"].Tmin)
 	assert.NotContains(t, tr, "bogus")
 	assert.NotContains(t, tr, "2024-05-01")
-}
-
-// TestLoadHourly covers UTC parse, sort, and missing-value handling.
-func TestLoadHourly(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "KNYC-hourly.csv")
-	// Deliberately out of order; should be sorted ascending on load.
-	csv := "station,valid,tmpf\n" +
-		"NYC,2024-05-01 02:51,52.00\n" +
-		"NYC,2024-05-01 00:51,54.00\n" +
-		"NYC,2024-05-01 01:51,M\n" + // missing
-		"NYC,2024-05-01 01:30,T\n" + // trace
-		"NYC,2024-05-01 03:39,52.00\n" +
-		"NYC,bogus_ts,99\n" // unparseable ts → skipped
-	require.NoError(t, os.WriteFile(path, []byte(csv), 0o600))
-
-	hr, err := bayesian.LoadHourlyCSV(path)
-	require.NoError(t, err)
-	require.Len(t, hr, 3)
-	for i := 1; i < len(hr); i++ {
-		assert.True(t, hr[i-1].TS.Before(hr[i].TS), "rows must be sorted ascending")
-	}
-	assert.Equal(t, 54.0, hr[0].TmpF)
-	assert.Equal(t, 52.0, hr[1].TmpF)
-	assert.Equal(t, 52.0, hr[2].TmpF)
-	assert.Equal(t, time.UTC, hr[0].TS.Location())
 }
 
 // TestKernelAccumulator_Finalize verifies the MinKernelN drop and the

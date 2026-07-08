@@ -83,6 +83,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, "edge-scan: bad -max-poll-age %q: %v\n", *maxAgeStr, err)
 		os.Exit(2)
 	}
+	if *bayesKernelPath != "" && *hourlyObsDir == "" {
+		fmt.Fprintln(os.Stderr, "edge-scan: -bayesian-kernel requires -hourly-obs")
+		os.Exit(2)
+	}
 
 	if *outDir == "" {
 		*outDir = filepath.Join(*dataDir, "calibration", "edge-scan")
@@ -105,58 +109,15 @@ func main() {
 		EntryFilter:        *entryFilter,
 		FeeMode:            feeMode,
 	}
-	if *truthDir != "" {
-		truth, loadErr := edge.LoadTruth(*truthDir)
-		if loadErr != nil {
-			fmt.Fprintln(os.Stderr, "edge-scan: load truth:", loadErr)
-			os.Exit(1)
-		}
-		fmt.Fprintf(os.Stderr, "loaded truth: %d (station,date) rows from %s\n", truth.Len(), *truthDir)
-		scanOpts.Truth = truth
-	}
-	if *mosPath != "" {
-		coeffs, loadErr := mos.LoadCoefficients(*mosPath)
-		if loadErr != nil {
-			fmt.Fprintln(os.Stderr, "edge-scan: load mos:", loadErr)
-			os.Exit(1)
-		}
-		fmt.Fprintf(os.Stderr, "loaded MOS coefficients: %d bins from %s (fitted %s)\n",
-			len(coeffs.Bins), *mosPath, coeffs.FittedAt.Format(time.RFC3339))
-		scanOpts.MOS = &coeffs
-	}
-	if *climateDir != "" {
-		clim := climate.New()
-		if loadErr := clim.Load(*climateDir, market.AllStationCodes()); loadErr != nil {
-			fmt.Fprintln(os.Stderr, "edge-scan: load climate:", loadErr)
-			os.Exit(1)
-		}
-		fmt.Fprintf(os.Stderr, "loaded climate observations from %s\n", *climateDir)
-		scanOpts.Climate = clim
-	}
-	if *bayesKernelPath != "" {
-		if *hourlyObsDir == "" {
-			fmt.Fprintln(os.Stderr, "edge-scan: -bayesian-kernel requires -hourly-obs")
-			os.Exit(2)
-		}
-		kernel, loadErr := bayesian.LoadKernel(*bayesKernelPath)
-		if loadErr != nil {
-			fmt.Fprintln(os.Stderr, "edge-scan: load bayesian kernel:", loadErr)
-			os.Exit(1)
-		}
-		idx, loadErr := bayesian.LoadHourlyIndex(*hourlyObsDir)
-		if loadErr != nil {
-			fmt.Fprintln(os.Stderr, "edge-scan: load hourly obs:", loadErr)
-			os.Exit(1)
-		}
-		nBins := 0
-		for _, bin := range kernel.Entries {
-			nBins += len(bin)
-		}
-		fmt.Fprintf(os.Stderr, "loaded Bayesian kernel: %d bins (window=%s) from %s\n",
-			nBins, kernel.FitWindow, *bayesKernelPath)
-		fmt.Fprintf(os.Stderr, "loaded hourly obs index from %s\n", *hourlyObsDir)
-		scanOpts.BayesianKernel = kernel
-		scanOpts.HourlyObs = idx
+	if loadErr := loadModelInputs(&scanOpts, modelInputPaths{
+		truthDir:        *truthDir,
+		mosPath:         *mosPath,
+		climateDir:      *climateDir,
+		bayesKernelPath: *bayesKernelPath,
+		hourlyObsDir:    *hourlyObsDir,
+	}); loadErr != nil {
+		fmt.Fprintln(os.Stderr, "edge-scan:", loadErr)
+		os.Exit(1)
 	}
 
 	res, err := edge.Scan(scanOpts)
@@ -176,38 +137,70 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Printf("# edge-scan %s..%s\n", *startStr, *endStr)
-	fmt.Printf("fee mode:           %s\n", res.FeeMode)
-	if res.EntryFilterName != "" {
-		fmt.Printf("entry filter:       %s\n", res.EntryFilterName)
-	}
-	fmt.Printf("frames seen:        %d\n", res.TotalFrames)
-	fmt.Printf("trade frames:       %d\n", res.TradeFrames)
-	fmt.Printf("weather trades:     %d\n", res.WeatherTrades)
-	fmt.Printf("paired trades:      %d  (%.1f%% of weather)\n",
-		res.PairedTrades, pct(res.PairedTrades, res.WeatherTrades))
-	if res.MOSEnabled {
-		fmt.Printf("MOS-calibrated:     %d  (%.1f%% of paired; rest fell back to naive)\n",
-			res.MOSApplied, pct(res.MOSApplied, res.PairedTrades))
-	}
-	if res.ClimateEnabled {
-		fmt.Printf("climate-shrunk:     %d  (%.1f%% of paired)\n",
-			res.ClimateApplied, pct(res.ClimateApplied, res.PairedTrades))
-	}
-	if res.BayesEnabled {
-		fmt.Printf("Bayesian-updated:   %d  (%.1f%% of paired; rest fell back to MOS/naive)\n",
-			res.BayesApplied, pct(res.BayesApplied, res.PairedTrades))
-	}
-	if res.BacktestEnabled {
-		fmt.Printf("\n# realized-PnL backtest (entry threshold = %d¢ post-fee)\n", *edgeThresh)
-		fmt.Printf("trades entered:     %d  (%.1f%% of paired)\n",
-			res.TradesEntered, pct(res.TradesEntered, res.PairedTrades))
-		fmt.Printf("trades won:         %d  (%.1f%% win rate)\n",
-			res.TradesWon, pct(res.TradesWon, res.TradesEntered))
-		fmt.Printf("total realized PnL: %+d¢  ($%+.2f)\n",
-			res.TotalPnLCents, float64(res.TotalPnLCents)/100)
-	}
+	printStdoutReport(*startStr, *endStr, res)
 	fmt.Printf("\noutputs:\n  %s\n  %s\n", csvPath, mdPath)
+}
+
+// modelInputPaths carries the optional calibration-artifact flags into
+// loadModelInputs.
+type modelInputPaths struct {
+	truthDir        string
+	mosPath         string
+	climateDir      string
+	bayesKernelPath string
+	hourlyObsDir    string
+}
+
+// loadModelInputs loads whichever optional model inputs the operator
+// requested (truth index, MOS coefficients, climate history, Bayesian
+// kernel + hourly obs) into opts, logging a one-line provenance note to
+// stderr per loaded artifact.
+func loadModelInputs(opts *edge.ScanOptions, in modelInputPaths) error {
+	if in.truthDir != "" {
+		truth, err := edge.LoadTruth(in.truthDir)
+		if err != nil {
+			return fmt.Errorf("load truth: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "loaded truth: %d (station,date) rows from %s\n", truth.Len(), in.truthDir)
+		opts.Truth = truth
+	}
+	if in.mosPath != "" {
+		coeffs, err := mos.LoadCoefficients(in.mosPath)
+		if err != nil {
+			return fmt.Errorf("load mos: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "loaded MOS coefficients: %d bins from %s (fitted %s)\n",
+			len(coeffs.Bins), in.mosPath, coeffs.FittedAt.Format(time.RFC3339))
+		opts.MOS = &coeffs
+	}
+	if in.climateDir != "" {
+		clim := climate.New()
+		if err := clim.Load(in.climateDir, market.AllStationCodes()); err != nil {
+			return fmt.Errorf("load climate: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "loaded climate observations from %s\n", in.climateDir)
+		opts.Climate = clim
+	}
+	if in.bayesKernelPath != "" {
+		kernel, err := bayesian.LoadKernel(in.bayesKernelPath)
+		if err != nil {
+			return fmt.Errorf("load bayesian kernel: %w", err)
+		}
+		idx, err := bayesian.LoadHourlyIndex(in.hourlyObsDir)
+		if err != nil {
+			return fmt.Errorf("load hourly obs: %w", err)
+		}
+		nBins := 0
+		for _, bin := range kernel.Entries {
+			nBins += len(bin)
+		}
+		fmt.Fprintf(os.Stderr, "loaded Bayesian kernel: %d bins (window=%s) from %s\n",
+			nBins, kernel.FitWindow, in.bayesKernelPath)
+		fmt.Fprintf(os.Stderr, "loaded hourly obs index from %s\n", in.hourlyObsDir)
+		opts.BayesianKernel = kernel
+		opts.HourlyObs = idx
+	}
+	return nil
 }
 
 func writeCSV(path string, rows []edge.EdgeRow) error {
@@ -292,14 +285,77 @@ func writeCSV(path string, rows []edge.EdgeRow) error {
 	return f.Close()
 }
 
-func writeSummary(path, startStr, endStr string, edgeThresholdCents int, res *edge.Result) error {
-	f, err := os.Create(path)
+// printStdoutReport mirrors the summary's header + counts + backtest
+// totals on stdout via the same section helpers the markdown file uses,
+// so the two never drift.
+func printStdoutReport(startStr, endStr string, res *edge.Result) {
+	w := &summaryWriter{w: os.Stdout}
+	w.printf("# edge-scan %s..%s\n", startStr, endStr)
+	w.printf("fee mode:           %s\n", res.FeeMode)
+	if res.EntryFilterName != "" {
+		w.printf("entry filter:       %s\n", res.EntryFilterName)
+	}
+	writeCounts(w, "", res)
+	if res.BacktestEnabled {
+		w.printf("\n# realized-PnL backtest (entry threshold = %d¢ post-fee)\n", res.EdgeThresholdCents)
+		w.printf("trades entered:     %d  (%.1f%% of paired)\n",
+			res.TradesEntered, pct(res.TradesEntered, res.PairedTrades))
+		w.printf("trades won:         %d  (%.1f%% win rate)\n",
+			res.TradesWon, pct(res.TradesWon, res.TradesEntered))
+		w.printf("total realized PnL: %+d¢  ($%+.2f)\n",
+			res.TotalPnLCents, float64(res.TotalPnLCents)/100)
+	}
+}
+
+// writeCounts emits the frame/trade/pairing counters plus the per-model
+// applied counts. prefix is "" for the stdout report and "- " for the
+// markdown summary's bullet list — the format strings stay identical so
+// the two reports can't drift apart.
+func writeCounts(w *summaryWriter, prefix string, res *edge.Result) {
+	w.printf("%sframes seen:        %d\n", prefix, res.TotalFrames)
+	w.printf("%strade frames:       %d\n", prefix, res.TradeFrames)
+	w.printf("%sweather trades:     %d\n", prefix, res.WeatherTrades)
+	w.printf("%spaired trades:      %d  (%.1f%% of weather)\n",
+		prefix, res.PairedTrades, pct(res.PairedTrades, res.WeatherTrades))
+	if res.MOSEnabled {
+		w.printf("%sMOS-calibrated:     %d  (%.1f%% of paired; rest fell back to naive)\n",
+			prefix, res.MOSApplied, pct(res.MOSApplied, res.PairedTrades))
+	}
+	if res.ClimateEnabled {
+		w.printf("%sclimate-shrunk:     %d  (%.1f%% of paired)\n",
+			prefix, res.ClimateApplied, pct(res.ClimateApplied, res.PairedTrades))
+	}
+	if res.BayesEnabled {
+		w.printf("%sBayesian-updated:   %d  (%.1f%% of paired; rest fell back to MOS/naive)\n",
+			prefix, res.BayesApplied, pct(res.BayesApplied, res.PairedTrades))
+	}
+}
+
+func writeSummary(path, startStr, endStr string, res *edge.Result) error {
+	f, err := os.Create(path) //nolint:gosec // path is operator-supplied output flag
 	if err != nil {
 		return err
 	}
 
 	w := &summaryWriter{w: f}
 	w.printf("# edge-scan summary — %s..%s\n\n", startStr, endStr)
+	writeRunConfig(w, res)
+	w.printf("\n## Counts\n\n")
+	writeCounts(w, "- ", res)
+	if res.BacktestEnabled {
+		writeBacktestSection(w, res)
+	}
+	writeSkippedReasons(w, res)
+	writeEdgeHistogram(w, res)
+	writeTopBrackets(w, res)
+	if w.err != nil {
+		_ = f.Close()
+		return w.err
+	}
+	return f.Close()
+}
+
+func writeRunConfig(w *summaryWriter, res *edge.Result) {
 	w.printf("## Run configuration\n\n")
 	w.printf("- fee mode:           **%s** (`KalshiTakerFeeBPS=0.07` / `KalshiMakerFeeBPS=0.0175`)\n", res.FeeMode)
 	if res.EntryFilterName != "" {
@@ -307,81 +363,70 @@ func writeSummary(path, startStr, endStr string, edgeThresholdCents int, res *ed
 	} else {
 		w.printf("- entry filter:       _none_ (no further restriction beyond edge threshold)\n")
 	}
-	w.printf("\n## Counts\n\n")
-	w.printf("- frames seen:        %d\n", res.TotalFrames)
-	w.printf("- trade frames:       %d\n", res.TradeFrames)
-	w.printf("- weather trades:     %d\n", res.WeatherTrades)
-	w.printf("- paired trades:      %d  (%.1f%% of weather)\n",
-		res.PairedTrades, pct(res.PairedTrades, res.WeatherTrades))
-	if res.MOSEnabled {
-		w.printf("- MOS-calibrated:     %d  (%.1f%% of paired; rest fell back to naive)\n",
-			res.MOSApplied, pct(res.MOSApplied, res.PairedTrades))
-	}
-	if res.ClimateEnabled {
-		w.printf("- climate-shrunk:     %d  (%.1f%% of paired)\n",
-			res.ClimateApplied, pct(res.ClimateApplied, res.PairedTrades))
-	}
-	if res.BayesEnabled {
-		w.printf("- Bayesian-updated:   %d  (%.1f%% of paired; rest fell back to MOS/naive)\n",
-			res.BayesApplied, pct(res.BayesApplied, res.PairedTrades))
-	}
+}
 
-	// Realized PnL section — only present when truth was loaded.
-	if res.BacktestEnabled {
-		w.printf("\n## Realized PnL backtest\n\n")
-		w.printf("- trades entered:    %d\n", res.TradesEntered)
-		w.printf("- trades won:        %d\n", res.TradesWon)
-		if res.TradesEntered > 0 {
-			w.printf("- win rate:          %.1f%%\n", pct(res.TradesWon, res.TradesEntered))
-			w.printf("- total realized:    %+d¢  ($%+.2f)\n",
-				res.TotalPnLCents, float64(res.TotalPnLCents)/100)
-			w.printf("- avg PnL per trade: %+.2f¢\n",
-				float64(res.TotalPnLCents)/float64(res.TradesEntered))
-		} else {
-			w.println("- _no trades cleared the entry threshold — naive p_fair offers no edge band_")
-		}
+func writeBacktestSection(w *summaryWriter, res *edge.Result) {
+	w.printf("\n## Realized PnL backtest\n\n")
+	w.printf("- trades entered:    %d\n", res.TradesEntered)
+	w.printf("- trades won:        %d\n", res.TradesWon)
+	if res.TradesEntered == 0 {
+		w.println("- _no trades cleared the entry threshold — naive p_fair offers no edge band_")
+		return
+	}
+	w.printf("- win rate:          %.1f%%\n", pct(res.TradesWon, res.TradesEntered))
+	w.printf("- total realized:    %+d¢  ($%+.2f)\n",
+		res.TotalPnLCents, float64(res.TotalPnLCents)/100)
+	w.printf("- avg PnL per trade: %+.2f¢\n",
+		float64(res.TotalPnLCents)/float64(res.TradesEntered))
+	writeDailyPnL(w, res.Rows)
+}
 
-		// Daily PnL breakdown.
-		dayPnL := map[string]int{}
-		dayTrades := map[string]int{}
-		dayWins := map[string]int{}
-		for _, r := range res.Rows {
-			if r.OurSide == "" {
-				continue
-			}
-			d := r.ValidDate.Format("2006-01-02")
-			dayPnL[d] += r.OurPnLCents
-			dayTrades[d]++
-			if r.OurPnLCents > 0 {
-				dayWins[d]++
-			}
+func writeDailyPnL(w *summaryWriter, rows []edge.EdgeRow) {
+	dayPnL := map[string]int{}
+	dayTrades := map[string]int{}
+	dayWins := map[string]int{}
+	for _, r := range rows {
+		if r.OurSide == "" {
+			continue
 		}
-		if len(dayPnL) > 0 {
-			w.printf("\n### Daily PnL (by bracket valid_date)\n\n")
-			w.println("| valid_date | trades | wins | win_rate | pnl_cents | pnl_$ |")
-			w.println("|---|---:|---:|---:|---:|---:|")
-			days := make([]string, 0, len(dayPnL))
-			for d := range dayPnL {
-				days = append(days, d)
-			}
-			sort.Strings(days)
-			for _, d := range days {
-				w.printf("| %s | %d | %d | %.1f%% | %+d | $%+.2f |\n",
-					d, dayTrades[d], dayWins[d], pct(dayWins[d], dayTrades[d]),
-					dayPnL[d], float64(dayPnL[d])/100)
-			}
+		d := r.ValidDate.Format("2006-01-02")
+		dayPnL[d] += r.OurPnLCents
+		dayTrades[d]++
+		if r.OurPnLCents > 0 {
+			dayWins[d]++
 		}
 	}
+	if len(dayPnL) == 0 {
+		return
+	}
+	w.printf("\n### Daily PnL (by bracket valid_date)\n\n")
+	w.println("| valid_date | trades | wins | win_rate | pnl_cents | pnl_$ |")
+	w.println("|---|---:|---:|---:|---:|---:|")
+	days := make([]string, 0, len(dayPnL))
+	for d := range dayPnL {
+		days = append(days, d)
+	}
+	sort.Strings(days)
+	for _, d := range days {
+		w.printf("| %s | %d | %d | %.1f%% | %+d | $%+.2f |\n",
+			d, dayTrades[d], dayWins[d], pct(dayWins[d], dayTrades[d]),
+			dayPnL[d], float64(dayPnL[d])/100)
+	}
+}
+
+func writeSkippedReasons(w *summaryWriter, res *edge.Result) {
 	w.printf("\n## Skipped reasons\n\n")
 	if len(res.SkippedReason) == 0 {
 		w.println("_(none — every weather trade was paired)_")
-	} else {
-		for _, r := range sortedKeys(res.SkippedReason) {
-			w.printf("- %-30s  %d\n", r, res.SkippedReason[r])
-		}
+		return
 	}
+	for _, r := range sortedKeys(res.SkippedReason) {
+		w.printf("- %-30s  %d\n", r, res.SkippedReason[r])
+	}
+}
 
-	// Edge histogram in 1¢ buckets.
+// writeEdgeHistogram renders the trade count per 1¢ edge bucket.
+func writeEdgeHistogram(w *summaryWriter, res *edge.Result) {
 	hist := map[int]int{}
 	for _, r := range res.Rows {
 		hist[r.EdgeCents]++
@@ -395,15 +440,20 @@ func writeSummary(path, startStr, endStr string, edgeThresholdCents int, res *ed
 	for _, k := range keys {
 		w.printf("| %4d | %6d |\n", k, hist[k])
 	}
+}
 
-	// Trades with edge ≥ threshold post-fee, by bracket.
+// writeTopBrackets lists the tickers with the most trades at or above
+// the run's entry threshold (echoed on Result — previously hardcoded 5¢,
+// which silently mislabelled runs using -edge-threshold-cents ≠ 5).
+func writeTopBrackets(w *summaryWriter, res *edge.Result) {
+	threshold := res.EdgeThresholdCents
 	type bktTotal struct {
 		key   string
 		count int
 	}
 	bkt := map[string]int{}
 	for _, r := range res.Rows {
-		if r.EdgeCents >= edgeThresholdCents {
+		if r.EdgeCents >= threshold {
 			bkt[r.Ticker]++
 		}
 	}
@@ -412,24 +462,18 @@ func writeSummary(path, startStr, endStr string, edgeThresholdCents int, res *ed
 		bktList = append(bktList, bktTotal{k, v})
 	}
 	sort.Slice(bktList, func(i, j int) bool { return bktList[i].count > bktList[j].count })
-	fmt.Fprintf(f, "\n## Top brackets with edge ≥ %d¢ post-fee\n\n", edgeThresholdCents)
+	w.printf("\n## Top brackets with edge ≥ %d¢ post-fee\n\n", threshold)
 	if len(bktList) == 0 {
-		fmt.Fprintf(f, "_(no trade has positive edge ≥ %d¢ — naive p_fair offers no edge band over fees)_\n",
-			edgeThresholdCents)
-	} else {
-		w.println("| ticker | trades |\n|---|---:|")
-		for i, bt := range bktList {
-			if i >= 30 {
-				break
-			}
-			w.printf("| %s | %d |\n", bt.key, bt.count)
+		w.printf("_(no trade has positive edge ≥ %d¢ — naive p_fair offers no edge band over fees)_\n", threshold)
+		return
+	}
+	w.println("| ticker | trades |\n|---|---:|")
+	for i, bt := range bktList {
+		if i >= 30 {
+			break
 		}
+		w.printf("| %s | %d |\n", bt.key, bt.count)
 	}
-	if w.err != nil {
-		_ = f.Close()
-		return w.err
-	}
-	return f.Close()
 }
 
 type summaryWriter struct {

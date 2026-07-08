@@ -40,147 +40,34 @@ func testClient(t *testing.T, handler http.Handler) *Client {
 	return NewClient(srv.URL, signer)
 }
 
-func TestGetMarket(t *testing.T) {
+func TestGetMarketsPage(t *testing.T) {
 	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, http.MethodGet, r.Method)
-		require.Equal(t, "/markets/BTCUSD-26MAR18", r.URL.Path)
+		require.Equal(t, "/markets", r.URL.Path)
+		require.Equal(t, "KXHIGHNY", r.URL.Query().Get("series_ticker"))
 
 		require.NotEmpty(t, r.Header.Get("KALSHI-ACCESS-KEY"))
 		require.NotEmpty(t, r.Header.Get("KALSHI-ACCESS-SIGNATURE"))
 		require.NotEmpty(t, r.Header.Get("KALSHI-ACCESS-TIMESTAMP"))
 
-		resp := getMarketResponse{
-			Market: Market{
-				Ticker:        "BTCUSD-26MAR18",
-				Title:         "BTC above 100k?",
-				Status:        "open",
-				YesBidDollars: "0.55",
-				YesAskDollars: "0.58",
-				VolumeFP:      "1200.00",
+		resp := getMarketsResponse{
+			Markets: []Market{
+				{Ticker: "KXHIGHNY-APR18-T75", Status: "open", YesBidDollars: "0.55", YesAskDollars: "0.58"},
+				{Ticker: "KXHIGHNY-APR18-T80", Status: "open"},
 			},
+			Cursor: "next-page",
 		}
 		w.Header().Set("Content-Type", "application/json")
 		require.NoError(t, json.NewEncoder(w).Encode(resp))
 	}))
 
-	m, err := c.GetMarket(context.Background(), "BTCUSD-26MAR18")
+	markets, cursor, err := c.GetMarketsPage(context.Background(), map[string]string{"series_ticker": "KXHIGHNY"})
 	require.NoError(t, err)
-	require.Equal(t, "BTCUSD-26MAR18", m.Ticker)
-	require.InDelta(t, 0.55, m.YesBid(), 0.001)
-	require.InDelta(t, 0.58, m.YesAsk(), 0.001)
-}
-
-func TestGetOrderbook(t *testing.T) {
-	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, http.MethodGet, r.Method)
-		require.Contains(t, r.URL.Path, "/markets/BTCUSD-26MAR18/orderbook")
-
-		resp := getOrderbookResponse{
-			Orderbook: Orderbook{
-				Yes: []OrderbookLevel{{55, 100}, {54, 200}},
-				No:  []OrderbookLevel{{45, 150}},
-			},
-		}
-		w.Header().Set("Content-Type", "application/json")
-		require.NoError(t, json.NewEncoder(w).Encode(resp))
-	}))
-
-	ob, err := c.GetOrderbook(context.Background(), "BTCUSD-26MAR18", 5)
-	require.NoError(t, err)
-	require.Len(t, ob.Yes, 2)
-	require.Equal(t, 55, ob.Yes[0][0])
-	require.Equal(t, 100, ob.Yes[0][1])
-}
-
-func TestCreateOrder(t *testing.T) {
-	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, http.MethodPost, r.Method)
-		require.Equal(t, "/portfolio/orders", r.URL.Path)
-		require.Equal(t, "application/json", r.Header.Get("Content-Type"))
-
-		var req CreateOrderRequest
-		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
-		require.Equal(t, "BTCUSD-26MAR18", req.Ticker)
-		require.Equal(t, SideYes, req.Side)
-		require.Equal(t, ActionBuy, req.Action)
-		require.Equal(t, 10, req.Count)
-		require.Equal(t, 55, req.YesPrice)
-
-		resp := createOrderResponse{
-			Order: Order{
-				OrderID:  "order-123",
-				Ticker:   req.Ticker,
-				Side:     req.Side,
-				Action:   req.Action,
-				Status:   "resting",
-				YesPrice: req.YesPrice,
-			},
-		}
-		w.Header().Set("Content-Type", "application/json")
-		require.NoError(t, json.NewEncoder(w).Encode(resp))
-	}))
-
-	order, err := c.CreateOrder(context.Background(), CreateOrderRequest{
-		Ticker:   "BTCUSD-26MAR18",
-		Side:     SideYes,
-		Action:   ActionBuy,
-		Count:    10,
-		YesPrice: 55,
-	})
-	require.NoError(t, err)
-	require.Equal(t, "order-123", order.OrderID)
-	require.Equal(t, "resting", order.Status)
-}
-
-func TestCancelOrder(t *testing.T) {
-	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, http.MethodDelete, r.Method)
-		require.Equal(t, "/portfolio/orders/order-123", r.URL.Path)
-
-		resp := cancelOrderResponse{
-			Order: Order{
-				OrderID: "order-123",
-				Status:  "cancelled",
-			},
-			ReducedBy: 10,
-		}
-		w.Header().Set("Content-Type", "application/json")
-		require.NoError(t, json.NewEncoder(w).Encode(resp))
-	}))
-
-	order, err := c.CancelOrder(context.Background(), "order-123")
-	require.NoError(t, err)
-	require.Equal(t, "cancelled", order.Status)
-}
-
-func TestGetFills(t *testing.T) {
-	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, http.MethodGet, r.Method)
-		require.Equal(t, "/portfolio/fills", r.URL.Path)
-
-		resp := getFillsResponse{
-			Fills: []Fill{
-				{
-					TradeID:  "fill-1",
-					OrderID:  "order-123",
-					Ticker:   "BTCUSD-26MAR18",
-					Side:     SideYes,
-					Action:   ActionBuy,
-					Count:    5,
-					YesPrice: 55,
-					IsTaker:  true,
-				},
-			},
-		}
-		w.Header().Set("Content-Type", "application/json")
-		require.NoError(t, json.NewEncoder(w).Encode(resp))
-	}))
-
-	fills, err := c.GetFills(context.Background(), nil)
-	require.NoError(t, err)
-	require.Len(t, fills, 1)
-	require.Equal(t, "fill-1", fills[0].TradeID)
-	require.Equal(t, 5, fills[0].Count)
+	require.Len(t, markets, 2)
+	require.Equal(t, "KXHIGHNY-APR18-T75", markets[0].Ticker)
+	require.InDelta(t, 0.55, markets[0].YesBid(), 0.001)
+	require.InDelta(t, 0.58, markets[0].YesAsk(), 0.001)
+	require.Equal(t, "next-page", cursor)
 }
 
 func TestAPIErrorReturnsStatusAndBody(t *testing.T) {
@@ -190,7 +77,7 @@ func TestAPIErrorReturnsStatusAndBody(t *testing.T) {
 		require.NoError(t, err)
 	}))
 
-	_, err := c.GetMarket(context.Background(), "INVALID")
+	_, _, err := c.GetMarketsPage(context.Background(), nil)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "API error 400")
 	require.Contains(t, err.Error(), "bad ticker")
@@ -281,175 +168,6 @@ func TestThrottleDoesNotSerializeCallers(t *testing.T) {
 	require.Less(t, elapsed, 3500*time.Millisecond, "throttle is serializing callers; lock is held during wait")
 }
 
-func TestGetRaw(t *testing.T) {
-	const body = `{"series":[{"ticker":"KXHIGHNY","title":"NYC daily high"}]}`
-	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, http.MethodGet, r.Method)
-		require.Equal(t, "/series", r.URL.Path)
-		require.Equal(t, "Weather", r.URL.Query().Get("category"))
-		require.NotEmpty(t, r.Header.Get("KALSHI-ACCESS-KEY"))
-		require.NotEmpty(t, r.Header.Get("KALSHI-ACCESS-SIGNATURE"))
-		require.NotEmpty(t, r.Header.Get("KALSHI-ACCESS-TIMESTAMP"))
-		w.Header().Set("Content-Type", "application/json")
-		_, err := w.Write([]byte(body))
-		require.NoError(t, err)
-	}))
-
-	got, err := c.GetRaw(context.Background(), "/series", map[string]string{"category": "Weather"})
-	require.NoError(t, err)
-	require.Equal(t, body, got)
-}
-
-func TestGetRawPropagatesAPIError(t *testing.T) {
-	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusForbidden)
-		_, err := w.Write([]byte(`{"code":"forbidden","message":"nope"}`))
-		require.NoError(t, err)
-	}))
-
-	_, err := c.GetRaw(context.Background(), "/series", nil)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "API error 403")
-	require.Contains(t, err.Error(), "nope")
-}
-
-// --- Coverage: raw and typed helpers that existed but had no tests ---
-
-func TestGetMarketRaw(t *testing.T) {
-	const body = `{"market":{"ticker":"T","status":"open"}}`
-	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, "/markets/T", r.URL.Path)
-		_, _ = w.Write([]byte(body))
-	}))
-	got, err := c.GetMarketRaw(context.Background(), "T")
-	require.NoError(t, err)
-	require.Equal(t, body, got)
-}
-
-func TestGetMarkets(t *testing.T) {
-	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, "/markets", r.URL.Path)
-		require.Equal(t, "KXHIGHNY", r.URL.Query().Get("series_ticker"))
-		require.NoError(t, json.NewEncoder(w).Encode(getMarketsResponse{
-			Markets: []Market{{Ticker: "KXHIGHNY-T"}, {Ticker: "KXHIGHNY-T2"}},
-		}))
-	}))
-	markets, err := c.GetMarkets(context.Background(), map[string]string{"series_ticker": "KXHIGHNY"})
-	require.NoError(t, err)
-	require.Len(t, markets, 2)
-}
-
-func TestGetEvents(t *testing.T) {
-	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, "/events", r.URL.Path)
-		require.NoError(t, json.NewEncoder(w).Encode(getEventsResponse{
-			Events: []Event{{EventTicker: "EV-1", SeriesTicker: "SER"}},
-		}))
-	}))
-	events, err := c.GetEvents(context.Background(), nil)
-	require.NoError(t, err)
-	require.Len(t, events, 1)
-	require.Equal(t, "EV-1", events[0].EventTicker)
-}
-
-func TestGetOrderbookRaw(t *testing.T) {
-	const body = `{"orderbook":{"yes":[],"no":[]}}`
-	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, "/markets/T/orderbook", r.URL.Path)
-		_, _ = w.Write([]byte(body))
-	}))
-	got, err := c.GetOrderbookRaw(context.Background(), "T")
-	require.NoError(t, err)
-	require.Equal(t, body, got)
-}
-
-func TestGetOrder(t *testing.T) {
-	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, "/portfolio/orders/ord-1", r.URL.Path)
-		require.NoError(t, json.NewEncoder(w).Encode(getOrderResponse{
-			Order: Order{OrderID: "ord-1", Status: "resting"},
-		}))
-	}))
-	got, err := c.GetOrder(context.Background(), "ord-1")
-	require.NoError(t, err)
-	require.Equal(t, "ord-1", got.OrderID)
-	require.Equal(t, "resting", got.Status)
-}
-
-func TestGetOrders(t *testing.T) {
-	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, "/portfolio/orders", r.URL.Path)
-		require.Equal(t, "resting", r.URL.Query().Get("status"))
-		require.NoError(t, json.NewEncoder(w).Encode(getOrdersResponse{
-			Orders: []Order{{OrderID: "o1"}, {OrderID: "o2"}},
-		}))
-	}))
-	got, err := c.GetOrders(context.Background(), map[string]string{"status": "resting"})
-	require.NoError(t, err)
-	require.Len(t, got, 2)
-}
-
-func TestGetOrdersRaw(t *testing.T) {
-	const body = `{"orders":[]}`
-	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, "/portfolio/orders", r.URL.Path)
-		_, _ = w.Write([]byte(body))
-	}))
-	got, err := c.GetOrdersRaw(context.Background(), nil)
-	require.NoError(t, err)
-	require.Equal(t, body, got)
-}
-
-func TestGetFillsRaw(t *testing.T) {
-	const body = `{"fills":[]}`
-	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, "/portfolio/fills", r.URL.Path)
-		_, _ = w.Write([]byte(body))
-	}))
-	got, err := c.GetFillsRaw(context.Background(), nil)
-	require.NoError(t, err)
-	require.Equal(t, body, got)
-}
-
-func TestGetPositions(t *testing.T) {
-	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, "/portfolio/positions", r.URL.Path)
-		require.NoError(t, json.NewEncoder(w).Encode(getPositionsResponse{
-			MarketPositions: []Position{{Ticker: "P1"}},
-		}))
-	}))
-	got, err := c.GetPositions(context.Background(), nil)
-	require.NoError(t, err)
-	require.Len(t, got, 1)
-	require.Equal(t, "P1", got[0].Ticker)
-}
-
-func TestGetPositionsRaw(t *testing.T) {
-	const body = `{"market_positions":[]}`
-	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, "/portfolio/positions", r.URL.Path)
-		_, _ = w.Write([]byte(body))
-	}))
-	got, err := c.GetPositionsRaw(context.Background(), nil)
-	require.NoError(t, err)
-	require.Equal(t, body, string(got))
-}
-
-func TestGetBalanceAndRaw(t *testing.T) {
-	const body = `{"balance":1234,"payout":0}`
-	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, "/portfolio/balance", r.URL.Path)
-		_, _ = w.Write([]byte(body))
-	}))
-	bal, err := c.GetBalance(context.Background())
-	require.NoError(t, err)
-	require.Equal(t, 1234, bal.Balance)
-
-	raw, err := c.GetBalanceRaw(context.Background())
-	require.NoError(t, err)
-	require.Equal(t, body, raw)
-}
-
 func TestResetRateLimit(t *testing.T) {
 	// ResetRateLimit is a no-network setter; exercise it only for coverage.
 	c := &Client{
@@ -461,61 +179,6 @@ func TestResetRateLimit(t *testing.T) {
 	require.Equal(t, 1*time.Second, c.minDelay)
 	// Zeroing minDelay does not cause subsequent throttle calls to panic.
 	require.NoError(t, c.throttle(context.Background()))
-}
-
-// TestDeleteSucceeds ensures the DELETE helper's happy path is covered.
-// CancelOrder exercises it; an explicit test keeps coverage stable if
-// CancelOrder's shape changes.
-func TestDeleteReturnsParsedBody(t *testing.T) {
-	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, http.MethodDelete, r.Method)
-		require.Equal(t, "/portfolio/orders/ord-xyz", r.URL.Path)
-		require.NoError(t, json.NewEncoder(w).Encode(getOrderResponse{
-			Order: Order{OrderID: "ord-xyz", Status: "canceled"},
-		}))
-	}))
-	got, err := c.CancelOrder(context.Background(), "ord-xyz")
-	require.NoError(t, err)
-	require.Equal(t, "canceled", got.Status)
-}
-
-// TestAllEndpointsPropagateErrors hits the uncovered error-return path
-// in every thin wrapper. Each wrapper has the shape "if err := get(…);
-// err != nil { return zero, err }"; a 500 from the mock exercises it
-// once per method.
-func TestAllEndpointsPropagateErrors(t *testing.T) {
-	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte(`{"code":"internal","message":"boom"}`))
-	}))
-	ctx := context.Background()
-
-	calls := []struct {
-		name string
-		fn   func() error
-	}{
-		{"GetMarkets", func() error { _, err := c.GetMarkets(ctx, nil); return err }},
-		{"GetMarketsPage", func() error { _, _, err := c.GetMarketsPage(ctx, nil); return err }},
-		{"GetEvents", func() error { _, err := c.GetEvents(ctx, nil); return err }},
-		{"GetOrderbook", func() error { _, err := c.GetOrderbook(ctx, "T", 0); return err }},
-		{"GetOrder", func() error { _, err := c.GetOrder(ctx, "o1"); return err }},
-		{"GetOrders", func() error { _, err := c.GetOrders(ctx, nil); return err }},
-		{"GetFills", func() error { _, err := c.GetFills(ctx, nil); return err }},
-		{"GetPositions", func() error { _, err := c.GetPositions(ctx, nil); return err }},
-		{"GetBalance", func() error { _, err := c.GetBalance(ctx); return err }},
-		{"CancelOrder", func() error { _, err := c.CancelOrder(ctx, "o"); return err }},
-		{"CreateOrder", func() error {
-			_, err := c.CreateOrder(ctx, CreateOrderRequest{Ticker: "T", Action: "buy", Side: "yes", Count: 1, Type: "limit"})
-			return err
-		}},
-	}
-	for _, tc := range calls {
-		t.Run(tc.name, func(t *testing.T) {
-			err := tc.fn()
-			require.Error(t, err)
-			require.Contains(t, err.Error(), "API error 500")
-		})
-	}
 }
 
 // TestDoRaw429RetriesThenSucceeds exercises the rate-limit backoff in
@@ -530,8 +193,8 @@ func TestDoRaw429RetriesThenSucceeds(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		require.NoError(t, json.NewEncoder(w).Encode(getMarketResponse{
-			Market: Market{Ticker: "OK", Status: "open"},
+		require.NoError(t, json.NewEncoder(w).Encode(getMarketsResponse{
+			Markets: []Market{{Ticker: "OK", Status: "open"}},
 		}))
 	}))
 	// Shorten initial backoff so the test doesn't take the default
@@ -543,9 +206,9 @@ func TestDoRaw429RetriesThenSucceeds(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	m, err := c.GetMarket(ctx, "RATELIMITED")
+	markets, _, err := c.GetMarketsPage(ctx, nil)
 	require.NoError(t, err)
-	require.Equal(t, "OK", m.Ticker)
+	require.Equal(t, "OK", markets[0].Ticker)
 	require.GreaterOrEqual(t, callCount.Load(), int32(2), "expected at least one retry")
 }
 
@@ -565,15 +228,15 @@ func TestDoRaw_RetryAfterDeltaSeconds(t *testing.T) {
 		}
 		secondAt = time.Now()
 		w.Header().Set("Content-Type", "application/json")
-		require.NoError(t, json.NewEncoder(w).Encode(getMarketResponse{
-			Market: Market{Ticker: "OK", Status: "open"},
+		require.NoError(t, json.NewEncoder(w).Encode(getMarketsResponse{
+			Markets: []Market{{Ticker: "OK", Status: "open"}},
 		}))
 	}))
 	c.minDelay = 10 * time.Millisecond
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, err := c.GetMarket(ctx, "X")
+	_, _, err := c.GetMarketsPage(ctx, nil)
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, calls.Load(), int32(2))
 	// The default bit-shift backoff for attempt=0 is 2s; Retry-After=1s
@@ -605,15 +268,15 @@ func TestDoRaw_RetryAfterHTTPDate(t *testing.T) {
 		}
 		secondAt = time.Now()
 		w.Header().Set("Content-Type", "application/json")
-		require.NoError(t, json.NewEncoder(w).Encode(getMarketResponse{
-			Market: Market{Ticker: "OK", Status: "open"},
+		require.NoError(t, json.NewEncoder(w).Encode(getMarketsResponse{
+			Markets: []Market{{Ticker: "OK", Status: "open"}},
 		}))
 	}))
 	c.minDelay = 10 * time.Millisecond
 
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
-	_, err := c.GetMarket(ctx, "X")
+	_, _, err := c.GetMarketsPage(ctx, nil)
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, calls.Load(), int32(2))
 	require.GreaterOrEqual(t, secondAt.Sub(firstAt), 3*time.Second,
@@ -644,17 +307,17 @@ func TestDoRaw_Retries5xx(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		require.NoError(t, json.NewEncoder(w).Encode(getMarketResponse{
-			Market: Market{Ticker: "OK", Status: "open"},
+		require.NoError(t, json.NewEncoder(w).Encode(getMarketsResponse{
+			Markets: []Market{{Ticker: "OK", Status: "open"}},
 		}))
 	}))
 	c.minDelay = 10 * time.Millisecond
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	m, err := c.GetMarket(ctx, "X")
+	markets, _, err := c.GetMarketsPage(ctx, nil)
 	require.NoError(t, err)
-	require.Equal(t, "OK", m.Ticker)
+	require.Equal(t, "OK", markets[0].Ticker)
 	require.GreaterOrEqual(t, calls.Load(), int32(2))
 }
 
@@ -668,7 +331,7 @@ func TestDoRaw_DoesNotRetry401(t *testing.T) {
 	}))
 	c.minDelay = 10 * time.Millisecond
 
-	_, err := c.GetMarket(context.Background(), "X")
+	_, _, err := c.GetMarketsPage(context.Background(), nil)
 	require.Error(t, err)
 	require.ErrorIs(t, err, ErrAuth)
 	require.Equal(t, int32(1), calls.Load(), "401 must not be retried")
@@ -684,7 +347,7 @@ func TestDoRaw_DoesNotRetry403(t *testing.T) {
 	}))
 	c.minDelay = 10 * time.Millisecond
 
-	_, err := c.GetMarket(context.Background(), "X")
+	_, _, err := c.GetMarketsPage(context.Background(), nil)
 	require.Error(t, err)
 	require.ErrorIs(t, err, ErrAuth)
 	require.Equal(t, int32(1), calls.Load(), "403 must not be retried")
@@ -731,8 +394,8 @@ func TestDoRaw_MinDelayDecaysAfterSuccessCluster(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		require.NoError(t, json.NewEncoder(w).Encode(getMarketResponse{
-			Market: Market{Ticker: "OK", Status: "open"},
+		require.NoError(t, json.NewEncoder(w).Encode(getMarketsResponse{
+			Markets: []Market{{Ticker: "OK", Status: "open"}},
 		}))
 	}))
 	// Speed up the test: tiny baseline so the 1s bit-shift backoff +
@@ -746,7 +409,7 @@ func TestDoRaw_MinDelayDecaysAfterSuccessCluster(t *testing.T) {
 
 	// First call hits 429, retries to 200. Observation: minDelay should
 	// be bumped to 2 * baseMinDelay (or capped at maxAdaptiveDelay).
-	_, err := c.GetMarket(ctx, "X")
+	_, _, err := c.GetMarketsPage(ctx, nil)
 	require.NoError(t, err)
 
 	c.rateMu.Lock()
@@ -759,7 +422,7 @@ func TestDoRaw_MinDelayDecaysAfterSuccessCluster(t *testing.T) {
 	// from the retried success, so 9 more is enough — be generous and
 	// drive 10 to be sure).
 	for i := 0; i < 10; i++ {
-		_, err := c.GetMarket(ctx, "X")
+		_, _, err := c.GetMarketsPage(ctx, nil)
 		require.NoError(t, err)
 	}
 

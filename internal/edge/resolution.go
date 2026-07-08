@@ -25,6 +25,33 @@ func (r Resolution) Contains(tempF float64) bool {
 	return tempF >= r.Lo && tempF < r.Hi
 }
 
+// resolveUnknownBranchTotal counts the number of times Spec.Resolve()
+// was invoked on a Spec whose Kind is neither BracketBetween nor
+// BracketThreshold (i.e. BracketUnknown or any future-added kind that
+// hasn't been wired into the switch). All ParseTicker code paths that
+// would produce such a Spec already return a non-nil error, so the
+// only way to reach this branch is via programmatic Spec construction
+// — which is fine in tests but a bug in production. The counter is
+// exported via ResolveUnknownBranchTotal() so future tooling
+// (cmd/analyze, scrape jobs, metrics exporters) can read it.
+var resolveUnknownBranchTotal atomic.Uint64
+
+// resolveUnknownWarnOnce gates the first-hit warn log per process, so
+// a misuse doesn't flood the log. Pointer-typed so tests can swap it
+// out for a fresh Once between cases without copying lock state.
+var resolveUnknownWarnOnce = &sync.Once{}
+
+// resolveUnknownLogger is overridable in tests; default is package log.
+var resolveUnknownLogger = log.Printf
+
+// ResolveUnknownBranchTotal returns the running count of unresolved-kind
+// Spec.Resolve() invocations. Zero in healthy operation. Safe to call
+// concurrently. Intended consumers: cmd/analyze post-run summary,
+// regression tests, future metrics exporters.
+func ResolveUnknownBranchTotal() uint64 {
+	return resolveUnknownBranchTotal.Load()
+}
+
 // Resolve maps a Spec to its YES-condition temperature range.
 //
 // Bracket convention (locked in; was previously marked FIXME — now
@@ -69,8 +96,8 @@ func (r Resolution) Contains(tempF float64) bool {
 // branch is defensive — no production caller can reach it because
 // ParseTicker only produces Spec values with Kind ∈ {BracketBetween,
 // BracketThreshold}. Programmatic constructions (e.g. tests) that hit
-// it get a NaN-bounded Resolution (Contains() always returns false,
-// Width() returns NaN), the counter increments, and a one-time warn
+// it get a NaN-bounded Resolution (Contains() always returns false),
+// the counter increments, and a one-time warn
 // log fires per process so any future regression is observable.
 func (s Spec) Resolve() Resolution {
 	switch s.Kind {
@@ -115,8 +142,7 @@ func ResolveWithSiblings(spec Spec, siblings []Spec) Resolution {
 	if spec.Kind != BracketThreshold {
 		return spec.Resolve()
 	}
-	// Find min B-bracket key among siblings in the same series and
-	// valid_date, excluding spec itself by ticker identity.
+	// Find the minimum B-bracket key among siblings (excluding spec itself).
 	minB := math.Inf(+1)
 	for _, sib := range siblings {
 		if sib.Kind != BracketBetween {

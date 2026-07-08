@@ -935,6 +935,152 @@ func TestEnvelope_NewWritesHaveV1(t *testing.T) {
 		"EnvelopeSchemaVersion constant must remain isobar.journal/v1 — bump requires reader migration policy decision")
 }
 
+// TestSizeRotateReopenFailureExitsWriterCleanly is the F03 regression:
+// when the re-open after a size rotate fails, the writer goroutine must
+// exit cleanly (via the run() return path) instead of looping forever
+// with bw==nil and nil-deref-panicking on the next dequeued frame.
+//
+// We force the failure by chmod-ing the date-stamped subdirectory to
+// 0000 after the journal has opened its first file: MkdirAll on the
+// existing dir still succeeds, but os.OpenFile inside a mode-0000
+// directory fails, so open() returns an error at re-open time. Tiny
+// MaxFileBytes guarantees the first burst trips a size rotate.
+func TestSizeRotateReopenFailureExitsWriterCleanly(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("chmod 0000 does not restrict root; test is meaningless as root")
+	}
+
+	dir := t.TempDir()
+	logs := &syncBuf{}
+	j, err := Open(Options{
+		Dir:          dir,
+		Source:       "test",
+		MaxFileBytes: 256, // trip a size rotate quickly
+		MaxFileAge:   time.Hour,
+		QueueSize:    1024,
+		FlushEvery:   5 * time.Millisecond,
+		OnDropAlarm:  NoopAlarmHook,
+	}, slog.New(slog.NewTextHandler(logs, nil)))
+	require.NoError(t, err)
+
+	// Write one frame and let the writer create+flush the first file so
+	// the date-stamped subdirectory exists, then lock that directory.
+	j.Write(Frame{Source: "test", Kind: "x", Payload: json.RawMessage(`"seed"`)})
+	var dated string
+	require.Eventually(t, func() bool {
+		entries, e := os.ReadDir(dir)
+		if e != nil || len(entries) != 1 || !entries[0].IsDir() {
+			return false
+		}
+		dated = filepath.Join(dir, entries[0].Name())
+		return len(walkExt(t, dir, ".jsonl")) >= 1
+	}, 2*time.Second, 5*time.Millisecond, "first journal file must appear")
+
+	require.NoError(t, os.Chmod(dated, 0o000))
+	t.Cleanup(func() { _ = os.Chmod(dated, 0o750) }) //nolint:gosec // test-only: restore t.TempDir perms so cleanup succeeds
+
+	// Push enough bytes to force a size rotate; the re-open will fail
+	// because the dated dir is now unwritable. The writer must not panic
+	// and must exit — Close() (which waits on j.done) returns instead of
+	// hanging, and Wait observes the goroutine exit.
+	big := json.RawMessage(`"` + strings.Repeat("y", 300) + `"`)
+	for i := 0; i < 50; i++ {
+		j.Write(Frame{Source: "test", Kind: "x", Payload: big})
+	}
+
+	// The writer goroutine should terminate on its own after the failed
+	// re-open. Wait proves it exited without a panic taking down the
+	// process; Close is idempotent and returns cleanly.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	j.Wait(ctx)
+	require.NoError(t, ctx.Err(), "writer goroutine must exit after failed size-rotate re-open")
+	require.NoError(t, j.Close())
+
+	require.Contains(t, logs.String(), "re-open after size rotate failed",
+		"the failed re-open must be logged before the writer exits")
+}
+
+// TestWriteErrorCounterIncrementsAndHookFires is the F04 regression:
+// a persistent failure on the write path (here, the underlying file's
+// directory made unwritable so flush/fsync fail) must bump the separate
+// WriteErrorsTotal() counter and fire the optional OnWriteError hook —
+// NOT the drop counter or OnDropAlarm, whose accounting is reserved for
+// queue-full drops.
+func TestWriteErrorCounterIncrementsAndHookFires(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("chmod cannot restrict root; write path would not fail")
+	}
+
+	dir := t.TempDir()
+
+	var hookMu sync.Mutex
+	var hookCalls int
+	var lastErr error
+
+	j, err := Open(Options{
+		Dir:          dir,
+		Source:       "test",
+		MaxFileBytes: 256, // small so a burst trips a size rotate
+		MaxFileAge:   time.Hour,
+		QueueSize:    1024,
+		FlushEvery:   5 * time.Millisecond,
+		OnDropAlarm:  NoopAlarmHook,
+		OnWriteError: func(src string, writeErrors uint64, e error) {
+			hookMu.Lock()
+			defer hookMu.Unlock()
+			hookCalls++
+			lastErr = e
+		},
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = j.Close() })
+
+	// Let the first file open so the date-stamped subdirectory exists,
+	// then chmod it read-only. An unlinked-but-open fd keeps flushing
+	// fine, so the durable trigger is a size rotate whose re-open must
+	// create a NEW file in the now-unwritable directory: os.OpenFile
+	// fails, bw stays nil, and every subsequent dequeued frame routes
+	// through writeOne's nil-bw guard into recordWriteError.
+	j.Write(Frame{Source: "test", Kind: "x", Payload: json.RawMessage(`"seed"`)})
+	var dated string
+	require.Eventually(t, func() bool {
+		entries, e := os.ReadDir(dir)
+		if e != nil || len(entries) != 1 || !entries[0].IsDir() {
+			return false
+		}
+		dated = filepath.Join(dir, entries[0].Name())
+		return len(walkExt(t, dir, ".jsonl")) >= 1
+	}, 2*time.Second, 5*time.Millisecond)
+
+	require.NoError(t, os.Chmod(dated, 0o500))       //nolint:gosec // test-only: read+exec so the rotate re-open fails
+	t.Cleanup(func() { _ = os.Chmod(dated, 0o750) }) //nolint:gosec // test-only: restore t.TempDir perms so cleanup succeeds
+
+	// Drive a burst large enough to force a size rotate; the post-rotate
+	// re-open fails against the read-only directory and the write-error
+	// path takes over.
+	big := json.RawMessage(`"` + strings.Repeat("z", 300) + `"`)
+	for i := 0; i < 200; i++ {
+		j.Write(Frame{Source: "test", Kind: "x", Payload: big})
+	}
+
+	require.Eventually(t, func() bool {
+		return j.WriteErrorsTotal() > 0
+	}, 3*time.Second, 10*time.Millisecond,
+		"a persistent write-path failure must increment WriteErrorsTotal")
+
+	hookMu.Lock()
+	calls := hookCalls
+	gotErr := lastErr
+	hookMu.Unlock()
+	require.Positive(t, calls, "OnWriteError hook must fire on a write-path failure")
+	require.Error(t, gotErr, "OnWriteError must carry the underlying error")
+
+	// The write-error path must NOT contaminate the queue-drop accounting.
+	require.Zero(t, j.Dropped(),
+		"write-path failures must not bump the queue-drop counter (ADR-0011 seam kept separate)")
+}
+
 func walkExt(t *testing.T, dir, suffix string) []string {
 	t.Helper()
 	var out []string

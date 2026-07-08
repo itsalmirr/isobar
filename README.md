@@ -280,7 +280,7 @@ internal/kalshi                 RSA-signed REST + authenticated WS subscriber
 - **Multi-model ensemble decoder (GFS + ECMWF).** The poll parser in
   `internal/edge.ParsePoll` recognises Open-Meteo's multi-model field
   names and tags each member with its source model
-  (`gfs:NN` / `ecmwf:NN`). The scanner's `pollModelSet` derives the
+  (`gfs:NN` / `ecmwf:NN`). The scanner's `pollModelSetFromMembers` derives the
   observed model set and compares it against `Coefficients.FitModelSet`,
   refusing to apply GFS-only-trained MOS to a GFS+ECMWF poll. Parse +
   guard are shipped; the recorder is still GFS-only by default — flip

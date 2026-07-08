@@ -1,69 +1,52 @@
 package edge
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
-// TestTradeMsg_PriceDollars locks in the contract documented on
-// priceDollars(): it always returns the executed YES-price, whichever
-// wire shape carried the trade and whichever side the taker was on.
-func TestTradeMsg_PriceDollars(t *testing.T) {
+// TestTradeMsgPriceDollars pins the three wire shapes priceDollars must
+// keep decoding: v2-docs int cents, recorded-WS dollar strings, and the
+// legacy bare price_dollars string. The e2e Scan tests only exercise the
+// happy path; this table is the contract for the fallback order and the
+// (0,1)-exclusive validity band.
+func TestTradeMsgPriceDollars(t *testing.T) {
 	tests := []struct {
 		name string
 		msg  tradeMsg
 		want float64
 	}{
-		{
-			name: "int shape, yes-side taker",
-			msg:  tradeMsg{YesPrice: 45, NoPrice: 55, Side: "yes"},
-			want: 0.45,
-		},
-		{
-			// Regression: the int path used to return the raw NO price
-			// (0.55 here) for no-side takers, inverting the YES price.
-			name: "int shape, no-side taker still yields the YES price",
-			msg:  tradeMsg{YesPrice: 45, NoPrice: 55, Side: "no"},
-			want: 0.45,
-		},
-		{
-			name: "int shape, yes-side with only no_price present",
-			msg:  tradeMsg{NoPrice: 55, Side: "yes"},
-			want: 0.45,
-		},
-		{
-			name: "int shape, no-side with only no_price present",
-			msg:  tradeMsg{NoPrice: 55, Side: "no"},
-			want: 0.45,
-		},
-		{
-			name: "int shape, unknown side is rejected",
-			msg:  tradeMsg{YesPrice: 45, NoPrice: 55},
-			want: -1,
-		},
-		{
-			name: "recorded WS shape, yes_price_dollars",
-			msg:  tradeMsg{YesPriceDollars: "0.3800", TakerSide: "yes"},
-			want: 0.38,
-		},
-		{
-			name: "recorded WS shape, no_price_dollars converts to YES price",
-			msg:  tradeMsg{NoPriceDollars: "0.6200", TakerSide: "no"},
-			want: 0.38,
-		},
-		{
-			name: "taker_side wins over side",
-			msg:  tradeMsg{YesPrice: 45, NoPrice: 55, Side: "bogus", TakerSide: "no"},
-			want: 0.45,
-		},
-		{
-			name: "no usable fields",
-			msg:  tradeMsg{Side: "yes"},
-			want: -1,
-		},
+		// v2 int-cents shape.
+		{"yes side int price", tradeMsg{YesPrice: 40, TakerSide: "yes"}, 0.40},
+		{"no side int price", tradeMsg{NoPrice: 30, TakerSide: "no"}, 0.30},
+		{"yes side reconstructed from no", tradeMsg{NoPrice: 30, TakerSide: "yes"}, 0.70},
+		{"no side reconstructed from yes", tradeMsg{YesPrice: 40, TakerSide: "no"}, 0.60},
+		{"legacy side field fallback", tradeMsg{YesPrice: 25, Side: "yes"}, 0.25},
+		{"int price missing side", tradeMsg{YesPrice: 40}, -1},
+		{"int price out of band", tradeMsg{YesPrice: 100, TakerSide: "yes"}, -1},
+
+		// Recorded-WS dollar-string shape.
+		{"yes dollars string", tradeMsg{YesPriceDollars: "0.4"}, 0.40},
+		{"no dollars string complements", tradeMsg{NoPriceDollars: "0.3"}, 0.70},
+		{"yes dollars preferred over no", tradeMsg{YesPriceDollars: "0.4", NoPriceDollars: "0.3"}, 0.40},
+		{"dollars zero rejected", tradeMsg{YesPriceDollars: "0"}, -1},
+		{"dollars one rejected", tradeMsg{YesPriceDollars: "1"}, -1},
+		{"dollars junk rejected", tradeMsg{YesPriceDollars: "x"}, -1},
+
+		// Legacy bare price_dollars raw-JSON string.
+		{"legacy price_dollars", tradeMsg{PriceDollars: json.RawMessage(`"0.55"`)}, 0.55},
+		{"legacy price_dollars non-string", tradeMsg{PriceDollars: json.RawMessage(`0.55`)}, -1},
+
+		// Int shape wins over strings when both present.
+		{"int shape preferred", tradeMsg{YesPrice: 40, TakerSide: "yes", YesPriceDollars: "0.9"}, 0.40},
+
+		{"nothing derivable", tradeMsg{}, -1},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := tt.msg.priceDollars()
-			if diff := got - tt.want; diff > 1e-9 || diff < -1e-9 {
-				t.Errorf("priceDollars() = %v, want %v", got, tt.want)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.msg.priceDollars()
+			if diff := got - tc.want; diff > 1e-9 || diff < -1e-9 {
+				t.Errorf("priceDollars() = %v, want %v", got, tc.want)
 			}
 		})
 	}

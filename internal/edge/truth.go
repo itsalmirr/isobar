@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/wh0o0pz/isobar/internal/calibration/obscsv"
 )
 
 // DailyTruth is the ground-truth TMAX/TMIN (°F, integer) reported by
@@ -17,7 +19,6 @@ import (
 // Kalshi resolves on; the calibrate-parse-cli pipeline produces these
 // per-station CSVs.
 type DailyTruth struct {
-	Date  time.Time // UTC midnight on the civil date
 	TMaxF int
 	TMinF int
 }
@@ -110,60 +111,32 @@ func stationFromTruthFilename(name string) (string, bool) {
 }
 
 func loadTruthFile(idx *TruthIndex, station, path string) error {
-	f, err := os.Open(path) //nolint:gosec // path is discovered from operator-supplied truth directory
+	// Truth is the sole input to the realized-PnL backtest, so this is the
+	// best-effort/lenient side of the shared reader: ragged rows are skipped
+	// rather than rejected, but a mid-file csv.ParseError still fails loudly
+	// (obscsv fail-loud contract) — a malformed byte must not silently
+	// truncate the tail of a season and skew every PnL/win-rate number
+	// downstream.
+	rows, err := obscsv.ReadFile(path, obscsv.Options{
+		Alias:   obscsv.EdgeAliases,
+		Require: []string{obscsv.ColDate, obscsv.ColTmax, obscsv.ColTmin},
+	})
 	if err != nil {
-		return err
+		return fmt.Errorf("%s: %w", path, err)
 	}
-	defer f.Close()
-
-	r := csv.NewReader(f)
-	r.FieldsPerRecord = -1 // tolerate trailing columns
-
-	header, err := r.Read()
-	if err != nil {
-		return fmt.Errorf("read header: %w", err)
-	}
-	dateCol, maxCol, minCol := -1, -1, -1
-	for i, h := range header {
-		switch strings.ToLower(strings.TrimSpace(h)) {
-		case "valid_date", "date":
-			dateCol = i
-		case "tmax_f", "tmax":
-			maxCol = i
-		case "tmin_f", "tmin":
-			minCol = i
-		}
-	}
-	if dateCol < 0 || maxCol < 0 || minCol < 0 {
-		return fmt.Errorf("missing required columns in %s (header=%v)", path, header)
-	}
-
-	for lineNo := 2; ; lineNo++ {
-		row, err := r.Read()
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			// Surface any non-EOF read failure (malformed quoting,
-			// inconsistent column counts under FieldsPerRecord != -1, etc.)
-			// — silently truncating truth produces stealthy "missing
-			// outcomes" downstream and is worse than failing the load.
-			return fmt.Errorf("%s line %d: %w", path, lineNo, err)
-		}
-		date, err := time.Parse("2006-01-02", strings.TrimSpace(row[dateCol]))
+	for _, row := range rows {
+		// DailyTruth carries integer temps and rejects non-integer cells
+		// (Atoi refuses "70.0") — Kalshi resolves on integer TMAX/TMIN, so a
+		// decimal truth cell is a corpus error we skip rather than round.
+		tmax, err := strconv.Atoi(row.TmaxRaw)
 		if err != nil {
 			continue
 		}
-		tmax, err := strconv.Atoi(strings.TrimSpace(row[maxCol]))
+		tmin, err := strconv.Atoi(row.TminRaw)
 		if err != nil {
 			continue
 		}
-		tmin, err := strconv.Atoi(strings.TrimSpace(row[minCol]))
-		if err != nil {
-			continue
-		}
-		idx.byKey[truthKey(station, date)] = DailyTruth{
-			Date:  date.UTC(),
+		idx.byKey[truthKey(station, row.Date)] = DailyTruth{
 			TMaxF: tmax,
 			TMinF: tmin,
 		}

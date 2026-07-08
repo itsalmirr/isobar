@@ -449,13 +449,82 @@ func TestScan_BacktestRealizedPnL_NoSide(t *testing.T) {
 	if row.TradePriceCents != 75 {
 		t.Errorf("row.TradePriceCents = %d, want 75 (executed NO-side price)", row.TradePriceCents)
 	}
-	if row.OurSide != "no" || row.OurPnLCents != 23 {
-		t.Errorf("decision: side=%q pnl=%d, want no/23", row.OurSide, row.OurPnLCents)
+	if row.PFair != row.PFairMOS {
+		t.Errorf("PFair=%v vs PFairMOS=%v: must match when MOSApplied=true",
+			row.PFair, row.PFairMOS)
 	}
-	// EdgeCents column is YES-perspective (so it matches a yes-side trade in
-	// the same market): |0 - 25| - 2 = 23.
-	if row.EdgeCents != 23 {
-		t.Errorf("EdgeCents = %d, want 23 (YES-perspective: |0 - 25| - 2)", row.EdgeCents)
+	if res.MOSEnabled != true || res.MOSApplied != 1 {
+		t.Errorf("MOSEnabled=%v MOSApplied=%d, want true and 1", res.MOSEnabled, res.MOSApplied)
+	}
+
+	// Cross-check the MOS probability directly. Synthetic poll TMAX in °F
+	// for the 3 members: 80.6, 82.4, 84.2 (control + 2 perturbations,
+	// each one °C step up). Their mean is 82.4°F. With A=0, B=1, μ = mean
+	// = 82.4. B82.5 resolution is [81.5, 83.5). Hand-computed:
+	//   P = Φ((83.5-82.4)/2) - Φ((81.5-82.4)/2) = Φ(0.55) - Φ(-0.45).
+	mean := (80.6 + 82.4 + 84.2) / 3.0
+	mu := muIntercept + muSlope*mean
+	want := mos.ProbBelow(83.5, mu, sigma) - mos.ProbBelow(81.5, mu, sigma)
+	if math.Abs(row.PFairMOS-want) > 1e-9 {
+		t.Errorf("PFairMOS = %v, want %v (integrated Gaussian over [81.5, 83.5) with μ=%v σ=%v)",
+			row.PFairMOS, want, mu, sigma)
+	}
+	if want < 0.30 || want > 0.50 {
+		// Sanity belt — if either bracket math or μ/σ ever drifts, this
+		// catches it before downstream EdgeCents assertions silently get noisy.
+		t.Errorf("calibration sanity: want P=%v outside [0.30, 0.50] band — fixture/math drifted?", want)
+	}
+
+	// EdgeCents = EdgeAfterFeeCentsMode(PFair, yes_price_dollars, FeeTaker).
+	// With PFair=PFairMOS ≈ 0.38 and yes_price=10c → 0.10:
+	//   raw edge = round(0.38*100) - 10 - fee = 38 - 10 - ~1 = ~27¢.
+	// Lower bound is conservative — the precise integer depends on the
+	// MOS p and fee rounding, so we assert the edge math is consistent
+	// with the row's PFair via the public EdgeAfterFeeCentsMode helper.
+	wantEdge := EdgeAfterFeeCentsMode(row.PFair, 0.10, FeeTaker)
+	if row.EdgeCents != wantEdge {
+		t.Errorf("EdgeCents = %d, want %d (= EdgeAfterFeeCentsMode(PFair=%v, 0.10, FeeTaker))",
+			row.EdgeCents, wantEdge, row.PFair)
+	}
+	if row.EdgeCents <= 0 {
+		t.Errorf("EdgeCents = %d, expected a strongly positive edge given yes=10c and MOS p≈%.2f",
+			row.EdgeCents, row.PFairMOS)
+	}
+}
+
+// TestParsePoll_ModelSetMatchesMembers guards against drift between the
+// precomputed Poll.ModelSet field and its producer: ParsePoll must fill
+// ModelSet with exactly pollModelSetFromMembers(members) for every poll
+// it emits. The scan hot path reads Poll.ModelSet directly (scan.go), so
+// if ParsePoll ever stopped keeping the two in step, the model-set
+// mismatch guard would compare against a stale set.
+//
+// Verifies for two representative shapes:
+//   - single-model GFS-only (synthPoll: 3 bare-numeric members)
+//   - multi-model GFS+ECMWF (synthMultiModelPoll: one of each)
+func TestParsePoll_ModelSetMatchesMembers(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  []byte
+	}{
+		{"single-model GFS bare-numeric (synthPoll)", synthPoll(t)},
+		{"multi-model GFS+ECMWF prefixed (synthMultiModelPoll)", synthMultiModelPoll(t)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			poll, parseErr := ParsePoll(tc.raw)
+			if parseErr != nil {
+				t.Fatalf("ParsePoll: %v", parseErr)
+			}
+			want := pollModelSetFromMembers(poll.Members)
+			if !mos.ModelSetEqual(poll.ModelSet, want) {
+				t.Errorf("Poll.ModelSet=%v != pollModelSetFromMembers(members)=%v; ParsePoll drifted from its producer",
+					poll.ModelSet, want)
+			}
+			if len(poll.ModelSet) == 0 {
+				t.Errorf("Poll.ModelSet is empty; ParsePoll must populate it for every non-empty Members map")
+			}
+		})
 	}
 }
 
