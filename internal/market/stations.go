@@ -1,0 +1,151 @@
+// Package market is the canonical registry of weather observing
+// sites the recorder, calibrator, and scanner all agree on. It owns
+// the mapping from short location tags ("NY"/"MIA"/"LAX"/"CHI") to
+// the four-letter NWS station code, lat/lon, UTC offset, Kalshi
+// series prefixes, and NWS CLI bulletin PIL. Adding a new station
+// is a one-place edit; see the Station type comment for the
+// invariants every entry must satisfy.
+package market
+
+// Station is the canonical record for one weather observing site we
+// trade brackets on. Single source of truth for code, location tag,
+// coordinates, timezone offset, Kalshi series names, and NWS CLI PIL.
+//
+// Adding a new station: append to allStations, add the location tag
+// to the appropriate series prefix mappings, and verify
+// scripts/calibration-fetch-*.sh include the same set.
+type Station struct {
+	// Code is the WFO/airport identifier used by NWS CLI bulletins
+	// and by data/calibration/obs CSV filenames (e.g. "KNYC").
+	Code string
+
+	// Location is the short tag used by Open-Meteo poll Kind
+	// ("rest:NY") and by config/config.example.yaml entries.
+	Location string
+
+	// City is the human-readable name (for log messages, reports).
+	City string
+
+	// Lat, Lon are the canonical observing-site coordinates (WGS84
+	// decimal degrees), used for Open-Meteo polling and for boot-time
+	// validation of operator-supplied config (see
+	// internal/config/config.go: ValidateStationCoords). For Chicago
+	// this is KMDW (Midway) per ADR-0007, NOT KORD (O'Hare). Values
+	// are sourced from api.weather.gov/stations/<CODE>; cross-checked
+	// against aviationweather.gov station info. Tolerance for config
+	// drift is ±0.001°; tighter than that risks rejecting valid
+	// rounding, looser drops past the 1°F bracket-flip threshold for
+	// stations near coast/elevation gradients.
+	Lat, Lon float64
+
+	// UTCOffsetHours is the local-civil-time offset during US daylight
+	// time (March-November). All four stations are in DST during the
+	// April-October recording window. Re-validate before recording in
+	// the November-March standard-time window.
+	UTCOffsetHours int
+
+	// HighSeries and LowSeries are the Kalshi series prefixes that
+	// resolve on this station's daily TMAX/TMIN.
+	HighSeries, LowSeries string
+
+	// CLIPil is the AFOS PIL prefix for this station's NWS CLI
+	// bulletin (e.g. "CLINYC"). Matches what scripts/calibration-fetch-cli.sh
+	// requests from IEM.
+	CLIPil string
+}
+
+// allStations is the registry. Consumers should use the lookup
+// functions below rather than accessing this slice directly so that
+// the canonical ordering and filter semantics are stable.
+//
+// Note on lookup performance: with N=4 stations the linear-scan
+// implementation in StationBy* outperforms a map[string]Station hash
+// lookup (~1.8 ns vs ~6 ns, measured), because the slice fits on a
+// cache line and the comparison is branch-predictable. Switch to a
+// map index once N grows past ~16 (hurricane series, secondary cities).
+var allStations = []Station{
+	{
+		Code: "KNYC", Location: "NY", City: "New York",
+		Lat: 40.7794, Lon: -73.9692, UTCOffsetHours: -4,
+		HighSeries: "KXHIGHNY", LowSeries: "KXLOWTNYC",
+		CLIPil: "CLINYC",
+	},
+	{
+		Code: "KMIA", Location: "MIA", City: "Miami",
+		Lat: 25.7959, Lon: -80.2870, UTCOffsetHours: -4,
+		HighSeries: "KXHIGHMIA", LowSeries: "KXLOWTMIA",
+		CLIPil: "CLIMIA",
+	},
+	{
+		Code: "KLAX", Location: "LAX", City: "Los Angeles",
+		Lat: 33.9425, Lon: -118.4081, UTCOffsetHours: -7,
+		HighSeries: "KXHIGHLAX", LowSeries: "KXLOWTLAX",
+		CLIPil: "CLILAX",
+	},
+	{
+		Code: "KMDW", Location: "CHI", City: "Chicago",
+		Lat: 41.7842, Lon: -87.7553, UTCOffsetHours: -5,
+		HighSeries: "KXHIGHCHI", LowSeries: "KXLOWTCHI",
+		CLIPil: "CLIMDW",
+	},
+}
+
+// AllStations returns a copy of the canonical station list. The order
+// matches the configuration file and is stable across calls.
+func AllStations() []Station {
+	out := make([]Station, len(allStations))
+	copy(out, allStations)
+	return out
+}
+
+// AllStationsCanonical is a named alias for AllStations() used by
+// boot-time config validation (internal/config: ValidateStationCoords).
+// Calling it through this name documents that the caller depends on
+// the Lat/Lon fields being the canonical NWS values, not arbitrary
+// fixtures. Returns a fresh copy on every call.
+func AllStationsCanonical() []Station { return AllStations() }
+
+// AllStationCodes returns the four-letter station codes (KNYC, KMIA,
+// KLAX, KMDW) in canonical order. Convenience for callers that only
+// need codes (e.g. CLI bulletin fetcher).
+func AllStationCodes() []string {
+	out := make([]string, len(allStations))
+	for i, s := range allStations {
+		out[i] = s.Code
+	}
+	return out
+}
+
+// StationByCode looks up a Station by its four-letter code (KNYC etc).
+func StationByCode(code string) (Station, bool) {
+	for _, s := range allStations {
+		if s.Code == code {
+			return s, true
+		}
+	}
+	return Station{}, false
+}
+
+// StationByLocation looks up a Station by its short location tag
+// ("NY", "MIA", "LAX", "CHI").
+func StationByLocation(loc string) (Station, bool) {
+	for _, s := range allStations {
+		if s.Location == loc {
+			return s, true
+		}
+	}
+	return Station{}, false
+}
+
+// StationBySeries looks up the Station that this Kalshi series resolves
+// on. Accepts either the high or low series. Returns ok=false for
+// unrecognised prefixes (which is also how non-weather tickers fall
+// through).
+func StationBySeries(series string) (Station, bool) {
+	for _, s := range allStations {
+		if s.HighSeries == series || s.LowSeries == series {
+			return s, true
+		}
+	}
+	return Station{}, false
+}

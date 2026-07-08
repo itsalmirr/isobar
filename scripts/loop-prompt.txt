@@ -1,0 +1,29 @@
+Check the isobar Phase 0 recorder on isobar-prod (Tailscale, key auth).
+
+Run these via SSH and capture all output:
+1. ssh root@isobar-prod 'systemctl is-active isobar-tape; systemctl show isobar-tape -p NRestarts -p ActiveEnterTimestamp'
+2. ssh root@isobar-prod 'sudo -u isobar /opt/isobar/bin/analyze -data /opt/isobar/data'
+3. ssh root@isobar-prod 'sudo -u isobar /opt/isobar/scripts/tape-health.sh --data /opt/isobar/data --log /opt/isobar/logs/tape.log'
+4. ssh root@isobar-prod 'df -h /opt/isobar/data; timedatectl show -p NTPSynchronized --value'
+
+Compare metrics against /tmp/isobar-loop-state.json if it exists, then overwrite
+that file with current metrics (frame counts per source, NRestarts, disk used,
+top-3 markets, last log timestamp).
+
+Produce a structured breakdown in this shape:
+- VERDICT: GREEN / YELLOW / RED (lead with this)
+- Uptime, NRestarts (must be 0), NTP sync status
+- Frame counts per source — current + delta since last check + frames/sec
+- Inter-frame gap p50/p95/p99/max from analyze
+- Top 3 active markets and whether they changed since last check
+- Errors / warnings / drop events / reconnects (new since last)
+- Disk used (% and GB) + projected fill date at current rate
+- Anomalies (drops > 0, restarts > 0, freshness fail, NTP no, gap p99 > 1s)
+
+Verdict rules:
+- RED if any of: restarts increased since last check, drops > 0,
+  tape-health.sh exit != 0, NTP unsynced, no new frames since last check
+- YELLOW if any of: gap p99 > 1s, reconnects > 5 in window, disk > 70%
+- GREEN otherwise
+
+Keep the breakdown under 30 lines. Lead with the verdict.

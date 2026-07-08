@@ -78,7 +78,7 @@ GET  /stream/portfolio          SSE: positions + PnL, 1 Hz
 POST /control/source/:name      body: {enabled: bool}
 POST /control/strategy/:name    body: {enabled: bool}
 POST /control/recorder/:action  action in {start, stop}
-POST /control/bot/:action       same; gated by ISOBAR_LIVE_ALLOW=1
+POST /control/bot/:action       same; live-trade gating mechanism TBD in the ADR that lands cmd/bot
 ```
 
 ## Four-week roadmap with gates
@@ -86,7 +86,7 @@ POST /control/bot/:action       same; gated by ISOBAR_LIVE_ALLOW=1
 - **W1 — Read-only skeleton.** `internal/busevents` pub/sub; `internal/dashboard/server.go` with `/` and `/stream/events`; htmx + SSE wired; first tile: "coinbase WS: connected Xs ago, Y msgs/s". *Gate: browser shows live tick counters for 10 min, no reload.*
 - **W2 — Charts.** Lightweight Charts hydrated from `/stream/chart/:bracket`; server batches at 10 Hz; overlay Kalshi yes-bid/ask vs ensemble `p`. *Gate: 6-hour session, smooth chart, flat memory (pprof).*
 - **W3 — Control plane + SQLite.** `internal/controlstore` with WAL, `state(key,value,updated_at)` table; `/control/*` endpoints write SQLite; bot polls the table every 500 ms; bearer-token middleware. *Gate: toggle Coinbase off from browser → journal stops ≤1s → toggle back → reconnect event visible. Never reboots the process.*
-- **W4 — Portfolio + hardening.** `/stream/portfolio` tile: positions, open orders, daily PnL; two-phase confirm on `/control/bot/*` (second POST with `confirm=<random_token_shown_in_UI>`) — prevents reload-replay from starting live trade; `ISOBAR_LIVE_ALLOW=1` env gate; Tailscale Serve config. *Gate: `make all` green, coverage ≥70%, binary size <20 MB.*
+- **W4 — Portfolio + hardening.** `/stream/portfolio` tile: positions, open orders, daily PnL; two-phase confirm on `/control/bot/*` (second POST with `confirm=<random_token_shown_in_UI>`) — prevents reload-replay from starting live trade; live-trade gating mechanism (env / file / token composition) defined in the ADR that lands `cmd/bot`; Tailscale Serve config. *Gate: `make all` green, coverage ≥70%, binary size <20 MB.*
 
 ## Interview narrative (verbatim worth preserving)
 

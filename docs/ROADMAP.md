@@ -4,6 +4,19 @@
 > Each phase ends with a written decision — build, iterate, or kill — so capital
 > is never committed on hope.
 
+> **2026-06-09 — structure-first pivot
+> ([ADR-0014](./decisions/0014-structure-first-pivot.md)).** The
+> directional-weather track below (Phases 0.5 → 3) failed its forward gate
+> (week 1: −$30.24 at 22.3% win rate) and is demoted to a time-boxed side
+> track (one MOS refit, one fair v5 forward test, close on failure). The
+> flagship is now the structure-first scanner with pre-registered gates
+> **G-A** (data plane: 14 days, ≥95% uptime, ≥300 markets) → **G-B**
+> (opportunity existence on ≥14 days of wide tape; unmet → publish the
+> negative and stop) → **G-C** ($50 live canary, taker/IOC, operator
+> sign-off required) — frozen numbers in the ADR. The phases below are
+> preserved as the historical record; day-to-day state lives in
+> [BUILDLOG.md](./BUILDLOG.md).
+
 ## Guiding principles
 
 1. **Evidence before commitment.** Every phase produces a written artifact
@@ -23,7 +36,7 @@
 
 ---
 
-## Phase 0 — Data collection *(current, scope reduced)*
+## Phase 0 — Data collection *(complete)*
 
 **Goal.** Record synchronized market data from two sources (Kalshi WS +
 Open-Meteo REST) so Phase 0.5 can measure edges empirically.
@@ -32,70 +45,102 @@ Open-Meteo REST) so Phase 0.5 can measure edges empirically.
 determined BTC-hourly lead-lag is dead alpha at REST-from-cloud
 latency (see `docs/research/SYNTHESIS.md`).
 
-**Deliverables.**
-- [x] `cmd/tape` orchestrator with one goroutine per source.
-- [x] Crash-safe rotating JSONL journal (`internal/journal`).
-- [x] Kalshi REST client + authenticated WS subscriber.
-- [x] Open-Meteo ensemble REST poller (GEFS).
-- [ ] Open-Meteo ECMWF endpoint added (51-member IFS blend).
-- [x] Paired (wall, monotonic) timestamping for cross-source alignment.
-- [ ] Continuous 48h recording with ≤0.1% dropped frames per source.
+**Deliverables — shipped.**
+- [x] `cmd/tape` orchestrator with one goroutine per source
+- [x] Crash-safe rotating JSONL journal (`internal/journal`)
+- [x] Kalshi REST client + authenticated WS subscriber
+- [x] Open-Meteo 31-member GFS ensemble REST poller
+- [x] Paired (wall, monotonic) timestamping for cross-source alignment
+- [x] Rolling ticker re-discovery (4h cycle) — fixed the "tape dies
+      after settlement" failure mode after Apr 29-30 capture went dead
+- [x] Continuous capture verified: 5 full bracket lifecycles caught
+      May 2-6 with `NRestarts=0` and zero dropped frames
 
-**Exit criteria.**
-- ≥48h of uninterrupted data for each enabled source.
-- Zero journal data loss after graceful shutdown (verified by shutdown test).
-- All in-scope markets for configured series present for the full window.
-
-**Risks & mitigations.**
-- *Kalshi WS drops during overnight weather-bracket expiry:* reconnect with
-  jittered backoff; subscribe to `ticker_v2` as a liveness canary.
-- *Disk fills:* gzip-on-rotate + daily `du -sh data/` in the runbook.
-- *Open-Meteo rate limits:* min `poll_interval` enforced (1m) in config
-  validation; default is 30m.
+**Open carry-overs.**
+- [ ] ECMWF IFS endpoint added to live polling (51-member ENS now
+      free on AWS; ADR-0009 trigger)
+- [ ] Recorder integration test (Pass 3 §1.c)
+- [ ] Prometheus-ish metrics + watchdog (Pass 3 §1.b)
 
 ---
 
-## Phase 0.5 — Decision-gate report
+## Phase 0.5 — Decision-gate report *(closed: 0-for-4 directional gates; fwd wk1 −$30.24 → ADR-0014 pivot)*
 
-**Goal.** Produce a written decision-gate report proving that at least
-one **calibrated** signal survives real fees on real data.
+**Status.** Three iterations of the gate report shipped. Current
+verdict is in the v2 report at
+[`reports/phase0.5/2026-05-05-floor-estimate-v2.md`](../reports/phase0.5/2026-05-05-floor-estimate-v2.md):
+**MOS calibration does not beat Kalshi market mid in the tradeable
+[35,65)¢ zone**, with statistically significant Brier deltas on n=299
+verifiable bracket outcomes.
 
-**Deliverables.**
-- `cmd/calibrate` — fits NGR/EMOS per (station, season, lead) bin on
-  ≥2 years of paired GEFS + ECMWF archive vs NWS-CLI. Writes
-  reliability diagrams and Brier-skill vs market-implied to
-  `reports/calibration/<station>/`.
-- `internal/calibration/` — NGR, conformal intervals, EVT/POT,
-  T−3h Bayesian update, Lyapunov-horizon gate.
-- `cmd/analyze` — replays recordings, reconstructs orderbook from
-  `orderbook_delta`, computes per-signal edge counts with
-  **fee-aware edge floor** (`edge > 0.07·2P(1-P) + 1¢` per side),
-  simulated maker PnL, lead-lag distributions.
-- `internal/signal/weather` implementation using the full calibration
-  pipeline.
-- `internal/signal/hurricane` implementation (W6–8 of the 12-week plan,
-  timed for June 1 season start).
+**Goal (originally).** Produce a written decision-gate report proving
+that at least one **calibrated** signal survives real fees on real data.
 
-**Exit criteria (the decision gate).**
+**Deliverables — shipped.**
+- [x] `cmd/calibrate-fit` — OLS-fit MOS coefficients per (station,
+      season, variable) bin → JSON output
+- [x] `cmd/calibrate-parse-cli` — NWS CLI bulletin zip → daily TMAX/TMIN
+      CSV (canonical y-target per ADR-0007)
+- [x] `cmd/edge-scan` — joins recorded book state to ensemble polls,
+      applies all probability models (naive, MOS, climate-shrunk,
+      market), emits per-bracket edge with full provenance columns
+- [x] `internal/calibration/cliparse` — NWS CLI bulletin parser
+- [x] `internal/calibration/mos` — OLS bias correction + Φ-based
+      bracket probability
+- [x] `internal/calibration/climate` — historical-frequency baseline
+      with seasonal window + ShrinkP helper
+- [x] Three Phase 0.5 reports (original retracted, interim, v2 current
+      — see `reports/INDEX.md`)
 
-Hard gate to Phase 1:
+**Exit criteria — current verdict: NOT MET.**
+
+The hard gate from ADR-0001 was:
 > `>10 events/day with >5% calibrated edge after fees` on **at least one**
 > signal, AND calibrated Brier-skill > market-implied on held-out
 > 90-day OOS data.
 
-Signal-specific kill gates:
-- **weather-calibrated:** calibrated Brier must beat market-implied on
-  OOS; reliability diagram within ±5 pp of diagonal.
-- **hurricane-landfall:** on 2020–2025 season replay, model must beat
-  NHC cone by ≥5% Brier on landfall-zone brackets.
+The v2 report (n=299, bootstrap 95% CIs in tradeable zone):
 
-If **neither** passes, stop — record the negative result in
-`docs/decisions/` and reconsider.
+| Comparison | Brier delta | CI95 | Verdict |
+|---|---:|---|---|
+| MOS vs naive | +0.060 | [+0.008, +0.113] | MOS wins |
+| MOS vs shrunk | −0.011 | [−0.056, +0.035] | tied |
+| MOS vs market | **−0.100** | [−0.188, −0.013] | **MOS LOSES** |
 
-**Artifacts that must exist before sign-off.**
-- `reports/phase0.5/<date>/report.md` — narrative + charts.
-- `reports/phase0.5/<date>/brackets.csv` — per-bracket edge rows, reproducible.
-- Checked-in replay test that turns the CSV into the PnL summary.
+Calibrated Brier-skill is *not* > market-implied in the tradeable
+midrange. Mean post-fee MOS edge in tradeable zone is negative.
+
+**What ADR-0008's canary requires now.** Per ADR-0008's "Canary"
+section: if MOS doesn't beat the gate, file ADR-0009 to add ensemble
+spread (or escalate to ECMWF blend / T−3h Bayesian). ADR-0009 is the
+next document on the queue.
+
+**Phase 0.5 next iteration — what could change the verdict.**
+- ECMWF IFS blend (free since Oct 2025; ADR-0001 named this; 1-2 days)
+- T−3h Bayesian update with hourly ASOS observations — targets the
+  near-settlement bucket where the market currently wins (Pass 3 §2.g)
+- Full NGR via NOAA GEFS GRIB historical backfill (ADR-0009 trigger,
+  larger engineering investment)
+- Larger sample (n=600+) at continuous-capture quality from the
+  May-onward Vultr tape
+
+**Decision tree.**
+- If T−3h Bayesian or ECMWF blend close the tradeable-zone gap → re-run
+  the gate, write v3 report, possibly proceed to Phase 1
+- If they don't close the gap → log the negative result via a new ADR;
+  pivot project framing to "forecasting research artifact with
+  documented failed trading gate" per Pass 3 §3 W11-W12; do not commit
+  capital
+- Either way: **no $50 deployment until a future report shows the gate
+  is met**
+
+**Artifacts that exist now.**
+- [x] `reports/phase0.5/2026-05-05-floor-estimate-v2.md` — current verdict
+- [x] `reports/phase0.5/2026-05-02-pipeline-validation.md` — interim status
+- [x] `reports/phase0.5/2026-05-02-floor-estimate_RETRACTED.md` — original
+- [x] `reports/INDEX.md` — chain of supersedes
+- [x] `data/edge-scan-v2.csv` — 407 rows of underlying brackets
+- [x] `data/calibration/mos-coefficients.json` — fitted coefficients
 
 ---
 

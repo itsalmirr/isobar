@@ -27,6 +27,22 @@ type Config struct {
 	InitialBackoff time.Duration
 	MaxBackoff     time.Duration
 	MaxAttempts    int // 0 = unlimited
+
+	// ResetAfter, when > 0, treats any attempt that ran at least this
+	// long before failing as evidence the operation was healthy (e.g. a
+	// WS connection that streamed for an hour, then dropped). Backoff
+	// and the attempt counter reset, so the next retry waits
+	// InitialBackoff instead of whatever earlier flapping accumulated,
+	// and MaxAttempts bounds consecutive short-lived failures rather
+	// than total failures over the loop's lifetime. Without this, a
+	// long-running consumer that ever reached MaxBackoff stays at
+	// MaxBackoff forever (observed in the 2026-05 recorder outage:
+	// every reconnect paid the full 30s cap for days).
+	ResetAfter time.Duration
+
+	// Now is the clock seam used to measure attempt duration for
+	// ResetAfter (ADR-0012 convention #2). Zero uses time.Now.
+	Now func() time.Time
 }
 
 // Jitter returns d + a uniform random in [0, d/4]. Returns 0 for d<=0.
@@ -57,26 +73,38 @@ func Next(prev, max time.Duration) time.Duration {
 // logger may be nil; when non-nil, a Warn is emitted between attempts
 // with (err, wait, attempt) so operators see the backoff in the log.
 func Do(ctx context.Context, cfg Config, logger *slog.Logger, fn func(attempt int) error) error {
-	backoff := cfg.InitialBackoff
-	if backoff <= 0 {
-		backoff = 500 * time.Millisecond
+	initial := cfg.InitialBackoff
+	if initial <= 0 {
+		initial = 500 * time.Millisecond
 	}
+	backoff := initial
 	maxBackoff := cfg.MaxBackoff
 	if maxBackoff <= 0 {
 		maxBackoff = 30 * time.Second
+	}
+	now := cfg.Now
+	if now == nil {
+		now = time.Now
 	}
 
 	attempt := 0
 	for {
 		if ctx.Err() != nil {
-			return nil
+			return nil //nolint:nilerr // ctx cancel is clean shutdown per godoc
 		}
+		started := now()
 		err := fn(attempt)
 		if err == nil {
 			return nil
 		}
 		if ctx.Err() != nil {
-			return nil
+			return nil //nolint:nilerr // ctx cancel is clean shutdown per godoc
+		}
+		if cfg.ResetAfter > 0 && now().Sub(started) >= cfg.ResetAfter {
+			// Long-lived attempt: the old backoff ramp no longer
+			// describes the current failure; start the ladder over.
+			attempt = 0
+			backoff = initial
 		}
 		attempt++
 		if cfg.MaxAttempts > 0 && attempt >= cfg.MaxAttempts {

@@ -254,13 +254,14 @@ func TestDiscoverOpenTickersHandlesEmptyPageWithCursor(t *testing.T) {
 }
 
 func TestThrottleDoesNotSerializeCallers(t *testing.T) {
-	// If throttle held the mutex across its sleep, 4 concurrent callers
+	// If throttle held the mutex across its wait, 4 concurrent callers
 	// would each wait 1s back-to-back. The fix reserves slots under the
-	// lock and sleeps outside, so total wall time is ~3s for 4 callers
+	// lock and waits outside, so total wall time is ~3s for 4 callers
 	// (first goes immediately, then 1s * 3 for the queue). We keep the
 	// assertion loose so it's not flaky: wall time must be substantially
 	// less than the buggy serialization worst case of ~4s.
-	c := &Client{minDelay: 1000 * time.Millisecond}
+	c := &Client{minDelay: 1000 * time.Millisecond, now: time.Now}
+	ctx := context.Background()
 
 	var wg sync.WaitGroup
 	start := time.Now()
@@ -268,7 +269,7 @@ func TestThrottleDoesNotSerializeCallers(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			c.throttle()
+			_ = c.throttle(ctx)
 		}()
 	}
 	wg.Wait()
@@ -277,5 +278,528 @@ func TestThrottleDoesNotSerializeCallers(t *testing.T) {
 	// Bug-case would be ~4s (each caller sleeps 1s in series). Fixed
 	// case is ~3s (one slot per second, reserved under the lock). Leave
 	// margin to keep the test reliable under CI load.
-	require.Less(t, elapsed, 3500*time.Millisecond, "throttle is serializing callers; lock is held during sleep")
+	require.Less(t, elapsed, 3500*time.Millisecond, "throttle is serializing callers; lock is held during wait")
+}
+
+func TestGetRaw(t *testing.T) {
+	const body = `{"series":[{"ticker":"KXHIGHNY","title":"NYC daily high"}]}`
+	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodGet, r.Method)
+		require.Equal(t, "/series", r.URL.Path)
+		require.Equal(t, "Weather", r.URL.Query().Get("category"))
+		require.NotEmpty(t, r.Header.Get("KALSHI-ACCESS-KEY"))
+		require.NotEmpty(t, r.Header.Get("KALSHI-ACCESS-SIGNATURE"))
+		require.NotEmpty(t, r.Header.Get("KALSHI-ACCESS-TIMESTAMP"))
+		w.Header().Set("Content-Type", "application/json")
+		_, err := w.Write([]byte(body))
+		require.NoError(t, err)
+	}))
+
+	got, err := c.GetRaw(context.Background(), "/series", map[string]string{"category": "Weather"})
+	require.NoError(t, err)
+	require.Equal(t, body, got)
+}
+
+func TestGetRawPropagatesAPIError(t *testing.T) {
+	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, err := w.Write([]byte(`{"code":"forbidden","message":"nope"}`))
+		require.NoError(t, err)
+	}))
+
+	_, err := c.GetRaw(context.Background(), "/series", nil)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "API error 403")
+	require.Contains(t, err.Error(), "nope")
+}
+
+// --- Coverage: raw and typed helpers that existed but had no tests ---
+
+func TestGetMarketRaw(t *testing.T) {
+	const body = `{"market":{"ticker":"T","status":"open"}}`
+	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/markets/T", r.URL.Path)
+		_, _ = w.Write([]byte(body))
+	}))
+	got, err := c.GetMarketRaw(context.Background(), "T")
+	require.NoError(t, err)
+	require.Equal(t, body, got)
+}
+
+func TestGetMarkets(t *testing.T) {
+	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/markets", r.URL.Path)
+		require.Equal(t, "KXHIGHNY", r.URL.Query().Get("series_ticker"))
+		require.NoError(t, json.NewEncoder(w).Encode(getMarketsResponse{
+			Markets: []Market{{Ticker: "KXHIGHNY-T"}, {Ticker: "KXHIGHNY-T2"}},
+		}))
+	}))
+	markets, err := c.GetMarkets(context.Background(), map[string]string{"series_ticker": "KXHIGHNY"})
+	require.NoError(t, err)
+	require.Len(t, markets, 2)
+}
+
+func TestGetEvents(t *testing.T) {
+	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/events", r.URL.Path)
+		require.NoError(t, json.NewEncoder(w).Encode(getEventsResponse{
+			Events: []Event{{EventTicker: "EV-1", SeriesTicker: "SER"}},
+		}))
+	}))
+	events, err := c.GetEvents(context.Background(), nil)
+	require.NoError(t, err)
+	require.Len(t, events, 1)
+	require.Equal(t, "EV-1", events[0].EventTicker)
+}
+
+func TestGetOrderbookRaw(t *testing.T) {
+	const body = `{"orderbook":{"yes":[],"no":[]}}`
+	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/markets/T/orderbook", r.URL.Path)
+		_, _ = w.Write([]byte(body))
+	}))
+	got, err := c.GetOrderbookRaw(context.Background(), "T")
+	require.NoError(t, err)
+	require.Equal(t, body, got)
+}
+
+func TestGetOrder(t *testing.T) {
+	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/portfolio/orders/ord-1", r.URL.Path)
+		require.NoError(t, json.NewEncoder(w).Encode(getOrderResponse{
+			Order: Order{OrderID: "ord-1", Status: "resting"},
+		}))
+	}))
+	got, err := c.GetOrder(context.Background(), "ord-1")
+	require.NoError(t, err)
+	require.Equal(t, "ord-1", got.OrderID)
+	require.Equal(t, "resting", got.Status)
+}
+
+func TestGetOrders(t *testing.T) {
+	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/portfolio/orders", r.URL.Path)
+		require.Equal(t, "resting", r.URL.Query().Get("status"))
+		require.NoError(t, json.NewEncoder(w).Encode(getOrdersResponse{
+			Orders: []Order{{OrderID: "o1"}, {OrderID: "o2"}},
+		}))
+	}))
+	got, err := c.GetOrders(context.Background(), map[string]string{"status": "resting"})
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+}
+
+func TestGetOrdersRaw(t *testing.T) {
+	const body = `{"orders":[]}`
+	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/portfolio/orders", r.URL.Path)
+		_, _ = w.Write([]byte(body))
+	}))
+	got, err := c.GetOrdersRaw(context.Background(), nil)
+	require.NoError(t, err)
+	require.Equal(t, body, got)
+}
+
+func TestGetFillsRaw(t *testing.T) {
+	const body = `{"fills":[]}`
+	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/portfolio/fills", r.URL.Path)
+		_, _ = w.Write([]byte(body))
+	}))
+	got, err := c.GetFillsRaw(context.Background(), nil)
+	require.NoError(t, err)
+	require.Equal(t, body, got)
+}
+
+func TestGetPositions(t *testing.T) {
+	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/portfolio/positions", r.URL.Path)
+		require.NoError(t, json.NewEncoder(w).Encode(getPositionsResponse{
+			MarketPositions: []Position{{Ticker: "P1"}},
+		}))
+	}))
+	got, err := c.GetPositions(context.Background(), nil)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.Equal(t, "P1", got[0].Ticker)
+}
+
+func TestGetPositionsRaw(t *testing.T) {
+	const body = `{"market_positions":[]}`
+	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/portfolio/positions", r.URL.Path)
+		_, _ = w.Write([]byte(body))
+	}))
+	got, err := c.GetPositionsRaw(context.Background(), nil)
+	require.NoError(t, err)
+	require.Equal(t, body, string(got))
+}
+
+func TestGetBalanceAndRaw(t *testing.T) {
+	const body = `{"balance":1234,"payout":0}`
+	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/portfolio/balance", r.URL.Path)
+		_, _ = w.Write([]byte(body))
+	}))
+	bal, err := c.GetBalance(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 1234, bal.Balance)
+
+	raw, err := c.GetBalanceRaw(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, body, raw)
+}
+
+func TestResetRateLimit(t *testing.T) {
+	// ResetRateLimit is a no-network setter; exercise it only for coverage.
+	c := &Client{
+		minDelay:     2 * time.Second,
+		baseMinDelay: 1 * time.Second,
+		now:          time.Now,
+	}
+	c.ResetRateLimit()
+	require.Equal(t, 1*time.Second, c.minDelay)
+	// Zeroing minDelay does not cause subsequent throttle calls to panic.
+	require.NoError(t, c.throttle(context.Background()))
+}
+
+// TestDeleteSucceeds ensures the DELETE helper's happy path is covered.
+// CancelOrder exercises it; an explicit test keeps coverage stable if
+// CancelOrder's shape changes.
+func TestDeleteReturnsParsedBody(t *testing.T) {
+	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodDelete, r.Method)
+		require.Equal(t, "/portfolio/orders/ord-xyz", r.URL.Path)
+		require.NoError(t, json.NewEncoder(w).Encode(getOrderResponse{
+			Order: Order{OrderID: "ord-xyz", Status: "canceled"},
+		}))
+	}))
+	got, err := c.CancelOrder(context.Background(), "ord-xyz")
+	require.NoError(t, err)
+	require.Equal(t, "canceled", got.Status)
+}
+
+// TestAllEndpointsPropagateErrors hits the uncovered error-return path
+// in every thin wrapper. Each wrapper has the shape "if err := get(…);
+// err != nil { return zero, err }"; a 500 from the mock exercises it
+// once per method.
+func TestAllEndpointsPropagateErrors(t *testing.T) {
+	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"code":"internal","message":"boom"}`))
+	}))
+	ctx := context.Background()
+
+	calls := []struct {
+		name string
+		fn   func() error
+	}{
+		{"GetMarkets", func() error { _, err := c.GetMarkets(ctx, nil); return err }},
+		{"GetMarketsPage", func() error { _, _, err := c.GetMarketsPage(ctx, nil); return err }},
+		{"GetEvents", func() error { _, err := c.GetEvents(ctx, nil); return err }},
+		{"GetOrderbook", func() error { _, err := c.GetOrderbook(ctx, "T", 0); return err }},
+		{"GetOrder", func() error { _, err := c.GetOrder(ctx, "o1"); return err }},
+		{"GetOrders", func() error { _, err := c.GetOrders(ctx, nil); return err }},
+		{"GetFills", func() error { _, err := c.GetFills(ctx, nil); return err }},
+		{"GetPositions", func() error { _, err := c.GetPositions(ctx, nil); return err }},
+		{"GetBalance", func() error { _, err := c.GetBalance(ctx); return err }},
+		{"CancelOrder", func() error { _, err := c.CancelOrder(ctx, "o"); return err }},
+		{"CreateOrder", func() error {
+			_, err := c.CreateOrder(ctx, CreateOrderRequest{Ticker: "T", Action: "buy", Side: "yes", Count: 1, Type: "limit"})
+			return err
+		}},
+	}
+	for _, tc := range calls {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.fn()
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "API error 500")
+		})
+	}
+}
+
+// TestDoRaw429RetriesThenSucceeds exercises the rate-limit backoff in
+// doRaw. The mock server returns 429 on the first call and 200 on the
+// second; the client should backoff and retry, returning the body.
+func TestDoRaw429RetriesThenSucceeds(t *testing.T) {
+	var callCount atomic.Int32
+	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if callCount.Add(1) == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"code":"rate_limited","message":"slow down"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(getMarketResponse{
+			Market: Market{Ticker: "OK", Status: "open"},
+		}))
+	}))
+	// Shorten initial backoff so the test doesn't take the default
+	// 2s+ — we only care that the retry path runs.
+	c.minDelay = 10 * time.Millisecond
+
+	// Use a context deadline that lets the first 2s backoff elapse but
+	// bounds the test runtime.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	m, err := c.GetMarket(ctx, "RATELIMITED")
+	require.NoError(t, err)
+	require.Equal(t, "OK", m.Ticker)
+	require.GreaterOrEqual(t, callCount.Load(), int32(2), "expected at least one retry")
+}
+
+// TestDoRaw_RetryAfterDeltaSeconds verifies the client honors a
+// numeric Retry-After header as a floor (≥5s in this case).
+func TestDoRaw_RetryAfterDeltaSeconds(t *testing.T) {
+	var calls atomic.Int32
+	var firstAt, secondAt time.Time
+	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := calls.Add(1)
+		if n == 1 {
+			firstAt = time.Now()
+			w.Header().Set("Retry-After", "1") // keep test fast
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"code":"rate_limited"}`))
+			return
+		}
+		secondAt = time.Now()
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(getMarketResponse{
+			Market: Market{Ticker: "OK", Status: "open"},
+		}))
+	}))
+	c.minDelay = 10 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := c.GetMarket(ctx, "X")
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, calls.Load(), int32(2))
+	// The default bit-shift backoff for attempt=0 is 2s; Retry-After=1s
+	// should NOT shorten it (Retry-After is a floor, not an override).
+	// So the actual gap should be ≥ 2s.
+	require.GreaterOrEqual(t, secondAt.Sub(firstAt), 1900*time.Millisecond,
+		"second request should not happen before the bit-shift backoff (2s)")
+}
+
+// TestDoRaw_RetryAfterHTTPDate verifies that an HTTP-date Retry-After is
+// parsed and applied as the floor when larger than the default backoff.
+// We use a 4-second HTTP-date so the test asserts ≥3s with margin for
+// the IMF-fixdate format's 1-second granularity plus transit time.
+func TestDoRaw_RetryAfterHTTPDate(t *testing.T) {
+	var calls atomic.Int32
+	var firstAt, secondAt time.Time
+	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := calls.Add(1)
+		if n == 1 {
+			firstAt = time.Now()
+			// 4 seconds from now in HTTP-date form (whole-second truncation
+			// may eat up to 1s of the gap; default bit-shift backoff is 2s
+			// at attempt=0, so we want a clear ≥3s assertion floor).
+			when := time.Now().UTC().Add(4 * time.Second).Format(http.TimeFormat)
+			w.Header().Set("Retry-After", when)
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"code":"rate_limited"}`))
+			return
+		}
+		secondAt = time.Now()
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(getMarketResponse{
+			Market: Market{Ticker: "OK", Status: "open"},
+		}))
+	}))
+	c.minDelay = 10 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	_, err := c.GetMarket(ctx, "X")
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, calls.Load(), int32(2))
+	require.GreaterOrEqual(t, secondAt.Sub(firstAt), 3*time.Second,
+		"client should wait ~4s per Retry-After HTTP-date")
+}
+
+// TestDoRaw_RetryAfterCapped verifies that a misbehaving Retry-After
+// (3600s) is capped at retryAfterCap (60s). We can't wait 60s in the
+// test, so we drive the parser directly instead.
+func TestDoRaw_RetryAfterCapped(t *testing.T) {
+	// Unit-level check of the parser plus the cap policy.
+	d, ok := parseRetryAfter("3600", time.Now())
+	require.True(t, ok)
+	require.Equal(t, 3600*time.Second, d)
+	// The cap is applied in doRaw; assert the constant so a regression
+	// in the policy is caught loudly.
+	require.Equal(t, 60*time.Second, retryAfterCap)
+}
+
+// TestDoRaw_Retries5xx verifies that 502 from the server triggers a
+// retry on GET, succeeding on the second attempt.
+func TestDoRaw_Retries5xx(t *testing.T) {
+	var calls atomic.Int32
+	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`bad gateway`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(getMarketResponse{
+			Market: Market{Ticker: "OK", Status: "open"},
+		}))
+	}))
+	c.minDelay = 10 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	m, err := c.GetMarket(ctx, "X")
+	require.NoError(t, err)
+	require.Equal(t, "OK", m.Ticker)
+	require.GreaterOrEqual(t, calls.Load(), int32(2))
+}
+
+// TestDoRaw_DoesNotRetry401 verifies 401 returns ErrAuth and no retry.
+func TestDoRaw_DoesNotRetry401(t *testing.T) {
+	var calls atomic.Int32
+	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"code":"unauthorized"}`))
+	}))
+	c.minDelay = 10 * time.Millisecond
+
+	_, err := c.GetMarket(context.Background(), "X")
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrAuth)
+	require.Equal(t, int32(1), calls.Load(), "401 must not be retried")
+}
+
+// TestDoRaw_DoesNotRetry403 verifies 403 also maps to ErrAuth.
+func TestDoRaw_DoesNotRetry403(t *testing.T) {
+	var calls atomic.Int32
+	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"code":"forbidden"}`))
+	}))
+	c.minDelay = 10 * time.Millisecond
+
+	_, err := c.GetMarket(context.Background(), "X")
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrAuth)
+	require.Equal(t, int32(1), calls.Load(), "403 must not be retried")
+}
+
+// TestThrottle_HonorsCtxCancellation verifies the throttle wait can be
+// cancelled mid-flight by ctx. Before the fix this was a non-cancellable
+// time.Sleep that could pin a caller for up to 2s after the parent
+// context already wanted them gone.
+func TestThrottle_HonorsCtxCancellation(t *testing.T) {
+	c := &Client{
+		minDelay: 2 * time.Second,
+		now:      time.Now,
+		// Pretend a recent call already happened so throttle has to wait.
+		lastCall: time.Now(),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- c.throttle(ctx)
+	}()
+	// Sleep a hair so throttle has entered its wait, then cancel.
+	time.Sleep(10 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("throttle did not return within 50ms of cancel")
+	}
+}
+
+// TestDoRaw_MinDelayDecaysAfterSuccessCluster verifies the
+// success-counter decay restores minDelay to baseline after a 429
+// cluster. Without this, a transient rate-limit storm would leave the
+// client throttled at maxAdaptiveDelay (2s) for process lifetime.
+func TestDoRaw_MinDelayDecaysAfterSuccessCluster(t *testing.T) {
+	var calls atomic.Int32
+	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := calls.Add(1)
+		if n == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"code":"rate_limited"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(getMarketResponse{
+			Market: Market{Ticker: "OK", Status: "open"},
+		}))
+	}))
+	// Speed up the test: tiny baseline so the 1s bit-shift backoff +
+	// 11 calls doesn't blow our timeout. Also tiny baseMinDelay so the
+	// decay floor matches.
+	c.baseMinDelay = 1 * time.Millisecond
+	c.minDelay = 1 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// First call hits 429, retries to 200. Observation: minDelay should
+	// be bumped to 2 * baseMinDelay (or capped at maxAdaptiveDelay).
+	_, err := c.GetMarket(ctx, "X")
+	require.NoError(t, err)
+
+	c.rateMu.Lock()
+	bumped := c.minDelay
+	c.rateMu.Unlock()
+	require.Greater(t, bumped, c.baseMinDelay, "429 must bump minDelay")
+
+	// Now drive 10 more successful 200s; minDelay should decay back to
+	// baseMinDelay after the 10th success (consecutive2x already has 1
+	// from the retried success, so 9 more is enough — be generous and
+	// drive 10 to be sure).
+	for i := 0; i < 10; i++ {
+		_, err := c.GetMarket(ctx, "X")
+		require.NoError(t, err)
+	}
+
+	c.rateMu.Lock()
+	final := c.minDelay
+	c.rateMu.Unlock()
+	require.Equal(t, c.baseMinDelay, final,
+		"minDelay should decay back to baseMinDelay after a success cluster")
+}
+
+// TestParseRetryAfter exercises the RFC 9110 parser in isolation.
+func TestParseRetryAfter(t *testing.T) {
+	now := time.Date(2026, 5, 13, 12, 0, 0, 0, time.UTC)
+	t.Run("delta seconds", func(t *testing.T) {
+		d, ok := parseRetryAfter("5", now)
+		require.True(t, ok)
+		require.Equal(t, 5*time.Second, d)
+	})
+	t.Run("HTTP-date", func(t *testing.T) {
+		when := now.Add(7 * time.Second).Format(http.TimeFormat)
+		d, ok := parseRetryAfter(when, now)
+		require.True(t, ok)
+		require.Equal(t, 7*time.Second, d)
+	})
+	t.Run("past HTTP-date clamps to zero", func(t *testing.T) {
+		when := now.Add(-5 * time.Second).Format(http.TimeFormat)
+		d, ok := parseRetryAfter(when, now)
+		require.True(t, ok)
+		require.Equal(t, time.Duration(0), d)
+	})
+	t.Run("empty header", func(t *testing.T) {
+		_, ok := parseRetryAfter("", now)
+		require.False(t, ok)
+	})
+	t.Run("garbage header", func(t *testing.T) {
+		_, ok := parseRetryAfter("not-a-thing", now)
+		require.False(t, ok)
+	})
+	t.Run("negative seconds rejected", func(t *testing.T) {
+		_, ok := parseRetryAfter("-5", now)
+		require.False(t, ok)
+	})
 }

@@ -1,0 +1,396 @@
+// Package mos implements Model Output Statistics calibration for daily
+// temperature forecasts. Same shape as NGR (Gneiting et al. 2005) but uses
+// per-bin residual variance rather than ensemble spread for σ.
+//
+// One-line summary: replace raw forecast f with calibrated gaussian
+// (μ = a + b·f, σ = stdev_of_residuals_in_bin) and price brackets via
+// the standard-normal CDF.
+//
+// Theory: Glahn & Lowry (1972), "The Use of Model Output Statistics in
+// Objective Weather Forecasting". The shipping decision to use MOS over
+// full NGR for first-pass calibration is documented in ADR-0008.
+package mos
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"math"
+	"os"
+	"sort"
+	"time"
+
+	"github.com/wh0o0pz/isobar/internal/clock"
+)
+
+// ModelGFS / ModelECMWF are the canonical short tags for the forecast
+// models we deal with. FitModelSet stores these in sorted order so
+// downstream comparisons can be a simple string-slice equality check
+// after both sides are canonicalized.
+const (
+	ModelGFS   = "gfs"
+	ModelECMWF = "ecmwf"
+)
+
+// Pair is one training/eval datum: a forecast for (station, valid_date,
+// variable) and the observed truth for the same key.
+type Pair struct {
+	Station   string    // "KNYC", "KMIA", "KLAX", "KMDW"
+	ValidDate time.Time // station-local civil date, midnight UTC
+	Variable  string    // "tmax" | "tmin"
+	Forecast  float64   // °F
+	Observed  float64   // °F
+}
+
+// BinCoeffs are the fitted parameters for one (station, season, variable) bin.
+type BinCoeffs struct {
+	A        float64 `json:"a"`         // intercept (°F)
+	B        float64 `json:"b"`         // slope (dimensionless)
+	Sigma    float64 `json:"sigma"`     // residual stdev (°F)
+	NTrain   int     `json:"n_train"`   // training pair count
+	NHoldout int     `json:"n_holdout"` // holdout pair count (held out from fit, used for σ when ≥ MinHoldoutForSigma)
+	// SigmaSource records whether σ came from the OOS holdout residuals
+	// ("holdout") or from the training residuals as a fallback when the
+	// holdout was too small ("training-fallback"). In-sample residual σ
+	// underestimates predictive uncertainty (over-confident gaussian),
+	// which inflates downstream MOS probabilities and tail-bracket edges.
+	// Loaders that read older coefficients with no SigmaSource field get
+	// an empty string — interpret as training-fallback for back-compat.
+	SigmaSource string `json:"sigma_source,omitempty"`
+}
+
+// MinHoldoutForSigma is the smallest holdout sample we'll trust to
+// estimate σ. Below this the bin keeps the training-residual σ and
+// records SigmaSource = "training-fallback" so downstream code can flag
+// the over-confidence risk. 30 is the conventional rule-of-thumb for
+// stdev estimation; the literature supports 20-50 as a reasonable band.
+const MinHoldoutForSigma = 30
+
+// SigmaSourceHoldout / SigmaSourceTrainingFallback are the canonical
+// values of BinCoeffs.SigmaSource.
+const (
+	SigmaSourceHoldout          = "holdout"
+	SigmaSourceTrainingFallback = "training-fallback"
+)
+
+// CoefficientsSchemaVersion identifies the on-disk shape of a
+// Coefficients JSON. Bump on any change to bin-key format, BinCoeffs
+// fields, or the math interpretation of the fitted parameters.
+// Loaders should refuse mismatched versions rather than silently
+// reading old files into new code.
+const CoefficientsSchemaVersion = "isobar.mos/v1"
+
+// Coefficients is the full fitted model: one BinCoeffs per
+// (station, season, variable) bin keyed as "STA|SEASON|VAR".
+type Coefficients struct {
+	SchemaVersion      string    `json:"schema_version"`
+	FittedAt           time.Time `json:"fitted_at"`
+	TrainingWindowEnd  string    `json:"training_window_end"`  // YYYY-MM-DD inclusive
+	HoldoutWindowStart string    `json:"holdout_window_start"` // YYYY-MM-DD inclusive
+	// FitModelSet is the sorted, canonical set of forecast model names
+	// the coefficients were fit against (e.g. ["gfs"] or ["ecmwf","gfs"]).
+	// At scan-time, the scanner checks the observed poll's model set
+	// against this — applying GFS-only-trained MOS to an ECMWF+GFS poll
+	// would silently feed the regression a different μ scale than it was
+	// fit on, producing biased calibrated probabilities. Empty in legacy
+	// files (pre-FitModelSet) is treated by [LoadCoefficients] as
+	// ["gfs"] for back-compat.
+	FitModelSet []string             `json:"fit_model_set,omitempty"`
+	Bins        map[string]BinCoeffs `json:"bins"`
+}
+
+// MinTrainPerBin is the smallest number of training pairs we'll fit a
+// linear model on. Below this we drop the bin and Predict returns ok=false
+// rather than producing a noisy estimate that downstream code will trust.
+const MinTrainPerBin = 10
+
+// Fit produces Coefficients from a list of paired observations. Pairs are
+// split into train/holdout by valid_date: pairs with valid_date in the
+// final `holdoutDays` of the input window are holdout; the rest are train.
+//
+// Bins with fewer than MinTrainPerBin training pairs are dropped from the
+// output (Predict returns ok=false for missing bins).
+//
+// The provided clk is the wall-time source stamped into FittedAt. Passing
+// a deterministic [clock.Fake] makes the entire output byte-identical
+// across runs with the same pairs and holdoutDays — that's the property
+// downstream backtest reproducibility and golden-file artifact diffing
+// depend on (see ADR-0012). Production callers pass [clock.Wall].
+//
+// Passing a nil clock panics rather than silently defaulting to time.Now;
+// the explicit-parameter discipline is the point.
+func Fit(pairs []Pair, holdoutDays int, clk clock.Clock) (Coefficients, error) {
+	if clk == nil {
+		panic("mos.Fit: nil clock; pass clock.Wall() in production or clock.Fake(t) in tests")
+	}
+	if len(pairs) == 0 {
+		return Coefficients{}, errors.New("mos: no pairs to fit")
+	}
+	if holdoutDays < 0 {
+		return Coefficients{}, fmt.Errorf("mos: negative holdoutDays %d", holdoutDays)
+	}
+
+	maxDate := pairs[0].ValidDate
+	for _, p := range pairs[1:] {
+		if p.ValidDate.After(maxDate) {
+			maxDate = p.ValidDate
+		}
+	}
+	holdoutStart := maxDate.Add(-time.Duration(holdoutDays) * 24 * time.Hour)
+	trainEnd := holdoutStart.Add(-24 * time.Hour)
+
+	// Group pairs by bin into train/holdout.
+	type bucket struct {
+		train, holdout []Pair
+	}
+	buckets := make(map[string]*bucket)
+	for _, p := range pairs {
+		key := binKey(p.Station, season(p.ValidDate), p.Variable)
+		b, ok := buckets[key]
+		if !ok {
+			b = &bucket{}
+			buckets[key] = b
+		}
+		if !p.ValidDate.Before(holdoutStart) {
+			b.holdout = append(b.holdout, p)
+		} else {
+			b.train = append(b.train, p)
+		}
+	}
+
+	out := Coefficients{
+		SchemaVersion:      CoefficientsSchemaVersion,
+		FittedAt:           clk.Now().UTC(),
+		TrainingWindowEnd:  trainEnd.Format("2006-01-02"),
+		HoldoutWindowStart: holdoutStart.Format("2006-01-02"),
+		Bins:               make(map[string]BinCoeffs, len(buckets)),
+	}
+
+	for key, b := range buckets {
+		if len(b.train) < MinTrainPerBin {
+			continue
+		}
+		c, ok := fitOLS(b.train)
+		if !ok {
+			continue
+		}
+		c.NTrain = len(b.train)
+		c.NHoldout = len(b.holdout)
+		// σ from OOS holdout when we have enough samples; otherwise the
+		// in-sample training σ (already in c.Sigma) is kept and labelled.
+		// Holdout σ is the more honest predictive-uncertainty estimate —
+		// training σ understates it because the fitted a, b were chosen
+		// to minimise the same residuals.
+		if len(b.holdout) >= MinHoldoutForSigma {
+			if sig, ok := holdoutSigma(b.holdout, c.A, c.B); ok {
+				c.Sigma = sig
+				c.SigmaSource = SigmaSourceHoldout
+			} else {
+				c.SigmaSource = SigmaSourceTrainingFallback
+			}
+		} else {
+			c.SigmaSource = SigmaSourceTrainingFallback
+		}
+		out.Bins[key] = c
+	}
+
+	if len(out.Bins) == 0 {
+		return Coefficients{}, fmt.Errorf("mos: no bin had at least %d training pairs", MinTrainPerBin)
+	}
+	return out, nil
+}
+
+// fitOLS performs closed-form ordinary least squares on the (forecast,
+// observed) pairs and returns slope, intercept, and residual stdev.
+// Returns ok=false when the design matrix is degenerate (e.g., constant
+// forecast values yield zero variance).
+func fitOLS(pairs []Pair) (BinCoeffs, bool) {
+	n := len(pairs)
+	if n < 2 {
+		return BinCoeffs{}, false
+	}
+
+	var sumX, sumY, sumXX, sumXY float64
+	for _, p := range pairs {
+		sumX += p.Forecast
+		sumY += p.Observed
+		sumXX += p.Forecast * p.Forecast
+		sumXY += p.Forecast * p.Observed
+	}
+	nf := float64(n)
+	meanX := sumX / nf
+	meanY := sumY / nf
+	denom := sumXX - nf*meanX*meanX
+	if denom <= 0 {
+		return BinCoeffs{}, false
+	}
+	b := (sumXY - nf*meanX*meanY) / denom
+	a := meanY - b*meanX
+
+	// Residual stdev (sample, n-1 denominator).
+	var ss float64
+	for _, p := range pairs {
+		r := p.Observed - (a + b*p.Forecast)
+		ss += r * r
+	}
+	sigma := math.Sqrt(ss / float64(n-1))
+	if sigma == 0 || math.IsNaN(sigma) || math.IsInf(sigma, 0) {
+		return BinCoeffs{}, false
+	}
+	return BinCoeffs{A: a, B: b, Sigma: sigma}, true
+}
+
+// holdoutSigma computes the sample stdev (n−1 denominator) of residuals
+// observed − (a + b·forecast) on the holdout pairs, using the already-fit
+// (a, b). This is the OOS predictive-uncertainty estimate. Returns
+// ok=false on degenerate σ (zero, NaN, Inf, or fewer than 2 pairs).
+func holdoutSigma(holdout []Pair, a, b float64) (float64, bool) {
+	n := len(holdout)
+	if n < 2 {
+		return 0, false
+	}
+	var ss float64
+	for _, p := range holdout {
+		r := p.Observed - (a + b*p.Forecast)
+		ss += r * r
+	}
+	sigma := math.Sqrt(ss / float64(n-1))
+	if sigma == 0 || math.IsNaN(sigma) || math.IsInf(sigma, 0) {
+		return 0, false
+	}
+	return sigma, true
+}
+
+// Predict returns the calibrated (μ, σ) for a forecast at a given station
+// and date, plus ok=true if a fitted bin exists. Variable must be "tmax"
+// or "tmin". Returns (0, 0, false) when the bin wasn't fit (insufficient
+// training data, unknown station, etc.).
+func (c Coefficients) Predict(station string, validDate time.Time, variable string, forecast float64) (mu, sigma float64, ok bool) {
+	key := binKey(station, season(validDate), variable)
+	bc, ok := c.Bins[key]
+	if !ok {
+		return 0, 0, false
+	}
+	return bc.A + bc.B*forecast, bc.Sigma, true
+}
+
+// ProbBelow returns Φ((threshold − μ) / σ), the probability under a
+// normal(μ, σ²) that the realised value is at or below threshold. Used
+// for "below" brackets.
+func ProbBelow(threshold, mu, sigma float64) float64 {
+	if sigma <= 0 {
+		// Degenerate: σ=0 means deterministic prediction. Fall back to
+		// indicator: P=1 if μ<=threshold, else 0.
+		if mu <= threshold {
+			return 1
+		}
+		return 0
+	}
+	z := (threshold - mu) / sigma
+	return 0.5 * (1 + math.Erf(z/math.Sqrt2))
+}
+
+// ProbAbove is 1 − ProbBelow.
+func ProbAbove(threshold, mu, sigma float64) float64 {
+	return 1 - ProbBelow(threshold, mu, sigma)
+}
+
+// season returns "DJF", "MAM", "JJA", "SON" for the meteorological season
+// containing the date's month. Northern Hemisphere convention (we trade
+// US weather brackets only).
+func season(t time.Time) string {
+	switch t.Month() {
+	case time.December, time.January, time.February:
+		return "DJF"
+	case time.March, time.April, time.May:
+		return "MAM"
+	case time.June, time.July, time.August:
+		return "JJA"
+	default:
+		return "SON"
+	}
+}
+
+// binKey is the canonical map-key form: "STATION|SEASON|VARIABLE".
+func binKey(station, season, variable string) string {
+	return station + "|" + season + "|" + variable
+}
+
+// LoadCoefficients reads a Coefficients JSON file produced by calibrate-fit
+// and refuses any file whose schema_version doesn't match
+// CoefficientsSchemaVersion. The schema check is the read-side enforcement
+// of the "bump on math change" rule documented on the constant.
+//
+// Legacy files written before FitModelSet existed load with an empty
+// FitModelSet; in that case a warning is emitted via stdlib log.Printf
+// and the field is defaulted to ["gfs"] (the only model the project
+// trained on before this field was added). The on-disk file is left
+// untouched — re-fit to remove the warning.
+func LoadCoefficients(path string) (Coefficients, error) {
+	b, err := os.ReadFile(path) //nolint:gosec // path is operator-supplied CLI/config input
+	if err != nil {
+		return Coefficients{}, fmt.Errorf("mos: read %s: %w", path, err)
+	}
+	var c Coefficients
+	if err := json.Unmarshal(b, &c); err != nil {
+		return Coefficients{}, fmt.Errorf("mos: decode %s: %w", path, err)
+	}
+	if c.SchemaVersion != CoefficientsSchemaVersion {
+		return Coefficients{}, fmt.Errorf("mos: %s has schema_version=%q, want %q",
+			path, c.SchemaVersion, CoefficientsSchemaVersion)
+	}
+	if len(c.Bins) == 0 {
+		return Coefficients{}, fmt.Errorf("mos: %s has no fitted bins", path)
+	}
+	if len(c.FitModelSet) == 0 {
+		log.Printf("mos: %s has no fit_model_set; defaulting to [%q] for back-compat — re-fit recommended",
+			path, ModelGFS)
+		c.FitModelSet = []string{ModelGFS}
+	}
+	c.FitModelSet = CanonicalModelSet(c.FitModelSet)
+	return c, nil
+}
+
+// CanonicalModelSet returns a sorted, deduplicated copy of models so two
+// sets can be compared by simple slice equality. Empty strings are
+// dropped. The returned slice is always non-nil and may be empty.
+func CanonicalModelSet(models []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(models))
+	for _, m := range models {
+		if m == "" || seen[m] {
+			continue
+		}
+		seen[m] = true
+		out = append(out, m)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ModelSetEqual reports whether two canonical model sets contain the
+// same elements. Both inputs should already be canonicalized (see
+// [CanonicalModelSet]); the function does not re-canonicalize.
+func ModelSetEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// SortedBinKeys returns the bin keys in deterministic order. Useful for
+// stable summary output and diffable JSON.
+func (c Coefficients) SortedBinKeys() []string {
+	keys := make([]string, 0, len(c.Bins))
+	for k := range c.Bins {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}

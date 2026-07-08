@@ -7,11 +7,14 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/wh0o0pz/isobar/internal/market"
 )
 
 // Config is the top-level runtime configuration.
@@ -46,6 +49,11 @@ type Kalshi struct {
 	Series    []string  `yaml:"series"`
 	Channels  []string  `yaml:"channels"`
 	Reconnect Reconnect `yaml:"reconnect"`
+	// RediscoverInterval is how often the recorder re-runs DiscoverOpenTickers
+	// to pick up newly-opened markets (e.g. tomorrow's brackets that opened
+	// while we were recording today's). 0 disables (recorder dies after first
+	// settlement, as observed in the Apr 29-30 tape). Default: 4h.
+	RediscoverInterval time.Duration `yaml:"rediscover_interval"`
 
 	// Credentials are filled from env vars; not in YAML.
 	// Provide PrivateKey (inline PEM) OR PrivateKeyPath (file). At least one
@@ -94,6 +102,7 @@ func Defaults() Config {
 				InitialBackoff: 500 * time.Millisecond,
 				MaxBackoff:     30 * time.Second,
 			},
+			RediscoverInterval: 4 * time.Hour,
 		},
 		OpenMeteo: OpenMeteo{
 			BaseURL:      "https://ensemble-api.open-meteo.com/v1/ensemble",
@@ -110,7 +119,7 @@ func Load(path string) (Config, error) {
 	cfg := Defaults()
 
 	if path != "" {
-		data, err := os.ReadFile(path)
+		data, err := os.ReadFile(path) //nolint:gosec // path is operator-supplied config flag, not user input
 		if err != nil {
 			return Config{}, fmt.Errorf("config: read %s: %w", path, err)
 		}
@@ -124,7 +133,62 @@ func Load(path string) (Config, error) {
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
+	if cfg.OpenMeteo.Enabled {
+		if err := validateStationCoords(cfg.OpenMeteo.Locations); err != nil {
+			return Config{}, err
+		}
+	}
 	return cfg, nil
+}
+
+// stationCoordTolerance is the maximum lat/lon delta (decimal degrees)
+// between an operator's config and the canonical NWS coordinates in
+// internal/market.AllStationsCanonical. 0.001° is ~110 m of latitude
+// drift and slightly less in longitude — well inside the precision
+// implied by the four-decimal-place form we publish, but loose enough
+// to absorb honest rounding (NWS publishes 5dp; we round to 4dp).
+const stationCoordTolerance = 0.001
+
+// validateStationCoords cross-checks each openmeteo.locations entry
+// against internal/market.AllStationsCanonical. The location's Name
+// (e.g. "CHI") must match a Station.Location, and the configured
+// Lat/Lon must agree with the canonical NWS values within
+// stationCoordTolerance. Returns the first mismatch found.
+//
+// This is a hard fail: a tape recorded against the wrong station is
+// near-unrecoverable corpus damage (see audit/chi-blast-radius.md for
+// the 21% poisoned-frame post-mortem), so we refuse to boot rather
+// than continue with a drifted config.
+func validateStationCoords(locs []OpenMeteoLocation) error {
+	canon := market.AllStationsCanonical()
+	byLoc := make(map[string]market.Station, len(canon))
+	for _, s := range canon {
+		byLoc[s.Location] = s
+	}
+	for _, l := range locs {
+		want, ok := byLoc[l.Name]
+		if !ok {
+			// Unknown locations skip canonical-coord validation —
+			// the registry only covers the four production weather
+			// stations. New series (hurricane, secondary cities)
+			// can be polled with caller-supplied coords until they
+			// are added to AllStations.
+			continue
+		}
+		dLat := math.Abs(l.Lat - want.Lat)
+		dLon := math.Abs(l.Lon - want.Lon)
+		if dLat > stationCoordTolerance || dLon > stationCoordTolerance {
+			return fmt.Errorf(
+				"config: openmeteo.locations[%s] coords drift from canonical %s — "+
+					"configured (%.4f, %.4f), canonical (%.4f, %.4f), "+
+					"Δlat=%.4f Δlon=%.4f, tolerance=%.4f",
+				l.Name, want.Code,
+				l.Lat, l.Lon, want.Lat, want.Lon,
+				dLat, dLon, stationCoordTolerance,
+			)
+		}
+	}
+	return nil
 }
 
 // overlayEnv applies environment variables to cfg in place. Both bare
@@ -138,7 +202,10 @@ func overlayEnv(cfg *Config) {
 	if v := firstNonEmpty("ISOBAR_KALSHI_PRIVATE_KEY_PATH", "KALSHI_PRIVATE_KEY_PATH"); v != "" {
 		cfg.Kalshi.PrivateKeyPath = v
 	}
-	if v := firstNonEmpty("ISOBAR_KALSHI_PRIVATE_KEY", "KALSHI_API_KEY"); v != "" {
+	// KALSHI_PRIVATE_KEY is the current name; KALSHI_API_KEY is kept for
+	// back-compat with earlier arbhunter-style configs (the name was
+	// historically misleading — it's a PEM, not an opaque token).
+	if v := firstNonEmpty("ISOBAR_KALSHI_PRIVATE_KEY", "KALSHI_PRIVATE_KEY", "KALSHI_API_KEY"); v != "" {
 		cfg.Kalshi.PrivateKey = v
 	}
 	if v := os.Getenv("ISOBAR_DATA_DIR"); v != "" {
@@ -176,7 +243,7 @@ func (c Config) Validate() error {
 			return errors.New("config: KALSHI_API_KEY_ID (or ISOBAR_KALSHI_API_KEY_ID) required when kalshi.enabled")
 		}
 		if c.Kalshi.PrivateKey == "" && c.Kalshi.PrivateKeyPath == "" {
-			return errors.New("config: set KALSHI_API_KEY (inline PEM) or KALSHI_PRIVATE_KEY_PATH (file path) when kalshi.enabled")
+			return errors.New("config: set KALSHI_PRIVATE_KEY (inline PEM) or KALSHI_PRIVATE_KEY_PATH (file path) when kalshi.enabled")
 		}
 		if len(c.Kalshi.Series) == 0 {
 			return errors.New("config: kalshi.series must list at least one series prefix")
