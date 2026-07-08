@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/wh0o0pz/isobar/internal/calibration/mos"
+	"github.com/wh0o0pz/isobar/internal/clock"
 	"github.com/wh0o0pz/isobar/internal/market"
 	"github.com/wh0o0pz/isobar/internal/obs"
 )
@@ -51,11 +52,16 @@ func main() {
 	}
 	logger.Info("loaded pairs", "n", len(pairs))
 
-	coeffs, err := mos.Fit(pairs, *holdoutDays)
+	coeffs, err := mos.Fit(pairs, *holdoutDays, clock.Wall())
 	if err != nil {
 		logger.Error("fit", "err", err)
 		os.Exit(1)
 	}
+	// Current calibration sources GFS deterministic forecasts only (see
+	// readForecastCSV: it reads gfs_tmax_f / gfs_tmin_f columns). Stamp
+	// the model set so the scanner can refuse to apply these coefficients
+	// to a multi-model poll without us having to remember.
+	coeffs.FitModelSet = []string{mos.ModelGFS}
 
 	if err := writeJSON(*outPath, coeffs); err != nil {
 		logger.Error("write", "err", err)

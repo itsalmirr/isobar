@@ -18,11 +18,19 @@ import (
 // control / deterministic forecast is keyed as "00" (Open-Meteo serves
 // it without a `_member` suffix); the 30 perturbations are "01" through
 // "30". Phase 0 expects 31 members for gfs_seamless ensemble.
+//
+// ModelSet is the canonical sorted model-tag set derived from Members
+// at parse time (see [pollModelSet] and [memberModelTag] in scan.go for
+// the derivation). It is invariant per *Poll — the underlying member
+// IDs don't change — so the edge scanner reads it directly instead of
+// recomputing per trade. Empty if the Poll was constructed without
+// going through [ParsePoll] (test-only).
 type Poll struct {
 	Latitude    float64
 	Longitude   float64
 	HourlyTimes []time.Time          // UTC, parallel to each Members value
 	Members     map[string][]float64 // memberID ("00" + "01".."30") → hourly °C
+	ModelSet    []string             // canonical sorted model tags (e.g. ["ecmwf", "gfs"]); see ParsePoll
 }
 
 // MemberCount returns the number of members successfully decoded.
@@ -108,24 +116,67 @@ func ParsePoll(raw []byte) (*Poll, error) {
 		Longitude:   om.Longitude,
 		HourlyTimes: times,
 		Members:     members,
+		ModelSet:    pollModelSetFromMembers(members),
 	}, nil
 }
 
 // matchTemperatureMember returns the member ID for an Open-Meteo hourly
 // field name, or false if the field isn't a temperature_2m series we care
-// about. "temperature_2m" → "00" (control), "temperature_2m_memberNN" → "NN".
+// about.
 //
-// Other variables (precipitation, etc.) return false.
+// Single-model responses (e.g. ?models=gfs_seamless alone):
+//
+//	"temperature_2m"               → "00"   (control)
+//	"temperature_2m_memberNN"      → "NN"   (perturbations 01..N)
+//
+// Multi-model responses (e.g. ?models=gfs_seamless,ecmwf_ifs025) suffix
+// every series with the model tag, and we prefix the model into the
+// member ID so members from different models don't collide:
+//
+//	"temperature_2m_ncep_gefs_seamless"          → "ncep_gefs_seamless:00"
+//	"temperature_2m_memberNN_ncep_gefs_seamless" → "ncep_gefs_seamless:NN"
+//	"temperature_2m_ecmwf_ifs025_ensemble"        → "ecmwf_ifs025_ensemble:00"
+//	"temperature_2m_memberNN_ecmwf_ifs025_ensemble" → "ecmwf_ifs025_ensemble:NN"
+//
+// Aggregators ("temperature_2m_max", "_min", and their member/model
+// variants) and other variables (precipitation, etc.) return false.
 func matchTemperatureMember(field string) (string, bool) {
-	if field == "temperature_2m" {
+	const base = "temperature_2m"
+	if !strings.HasPrefix(field, base) {
+		return "", false
+	}
+	rest := field[len(base):]
+
+	// Reject aggregators before pattern-matching members.
+	if strings.HasPrefix(rest, "_max") || strings.HasPrefix(rest, "_min") {
+		return "", false
+	}
+
+	// Single-model control.
+	if rest == "" {
 		return "00", true
 	}
-	const prefix = "temperature_2m_member"
-	if strings.HasPrefix(field, prefix) {
-		suffix := field[len(prefix):]
-		if len(suffix) == 2 && isAllDigits(suffix) {
-			return suffix, true
+
+	// Member: "_memberNN" optionally followed by "_<model>".
+	if strings.HasPrefix(rest, "_member") {
+		mr := rest[len("_member"):]
+		if len(mr) < 2 || !isAllDigits(mr[:2]) {
+			return "", false
 		}
+		num := mr[:2]
+		tail := mr[2:]
+		if tail == "" {
+			return num, true
+		}
+		if !strings.HasPrefix(tail, "_") {
+			return "", false
+		}
+		return tail[1:] + ":" + num, true
+	}
+
+	// Multi-model control: "_<model>".
+	if strings.HasPrefix(rest, "_") {
+		return rest[1:] + ":00", true
 	}
 	return "", false
 }
@@ -146,6 +197,13 @@ func parseHourlyTime(s string) (time.Time, error) {
 	return time.ParseInLocation("2006-01-02T15:04", s, time.UTC)
 }
 
+// MinHourlySamplesPerMember is the minimum number of in-window hourly
+// samples a member needs for its daily extremes to be reliable. At the
+// 6h/12h forecast horizon, individual members can be partially missing
+// even when the poll as a whole is healthy. 12 (half a day) is the
+// floor below which TMAX/TMIN are too noisy to feed downstream.
+const MinHourlySamplesPerMember = 12
+
 // DailyExtremesF returns the per-member {TMAX, TMIN} in °F for a
 // station-local civil date.
 //
@@ -154,14 +212,41 @@ func parseHourlyTime(s string) (time.Time, error) {
 // the station (e.g. America/New_York for KNYC). The window is
 // [civilDate 00:00 loc, civilDate 24:00 loc) — half-open right.
 //
-// Returns ErrInsufficientCoverage if fewer than 12 hourly samples fall
-// inside the window for any one member (rare but possible right at the
-// edges of the recorder's forecast horizon).
+// Members with fewer than [MinHourlySamplesPerMember] in-window samples
+// are skipped (and surfaced via the second return of
+// [DailyExtremesFWithSkip]). The scanner uses the surviving member subset
+// as long as ≥1 member remains; previously a single sparse member aborted
+// the entire poll, which silently lost ~30 trades on the partial-coverage
+// edge of the forecast window.
+//
+// Returns ErrInsufficientCoverage only if every member was skipped or
+// the poll has zero members.
 func (p *Poll) DailyExtremesF(civilDate time.Time, loc *time.Location) (
 	map[string]MemberDaily, error,
 ) {
+	out, _, err := p.dailyExtremesFInternal(civilDate, loc)
+	return out, err
+}
+
+// DailyExtremesFWithSkip is the diagnostics-aware variant of
+// DailyExtremesF. The second return value is the number of members
+// dropped for failing the MinHourlySamplesPerMember check; the scanner
+// uses this to surface "members_skipped" in its result counters without
+// changing the per-trade pricing math (which always uses len(out) as
+// nMembers).
+func (p *Poll) DailyExtremesFWithSkip(civilDate time.Time, loc *time.Location) (
+	map[string]MemberDaily, int, error,
+) {
+	return p.dailyExtremesFInternal(civilDate, loc)
+}
+
+// dailyExtremesFInternal is the shared implementation; the second return
+// is the number of members skipped for insufficient coverage.
+func (p *Poll) dailyExtremesFInternal(civilDate time.Time, loc *time.Location) (
+	map[string]MemberDaily, int, error,
+) {
 	if loc == nil {
-		return nil, fmt.Errorf("openmeteo: nil timezone location")
+		return nil, 0, fmt.Errorf("openmeteo: nil timezone location")
 	}
 	startLocal := time.Date(civilDate.Year(), civilDate.Month(), civilDate.Day(),
 		0, 0, 0, 0, loc)
@@ -169,10 +254,11 @@ func (p *Poll) DailyExtremesF(civilDate time.Time, loc *time.Location) (
 	endUTC := startLocal.Add(24 * time.Hour).UTC()
 
 	out := map[string]MemberDaily{}
+	skipped := 0
 	for id, series := range p.Members {
 		var (
-			minC, maxC float64 = math.Inf(+1), math.Inf(-1)
-			n                  = 0
+			minC, maxC = math.Inf(+1), math.Inf(-1)
+			n          = 0
 		)
 		for i, t := range p.HourlyTimes {
 			if t.Before(startUTC) || !t.Before(endUTC) {
@@ -190,9 +276,9 @@ func (p *Poll) DailyExtremesF(civilDate time.Time, loc *time.Location) (
 			}
 			n++
 		}
-		if n < 12 {
-			return nil, fmt.Errorf("%w: member %q has %d in-window samples",
-				ErrInsufficientCoverage, id, n)
+		if n < MinHourlySamplesPerMember {
+			skipped++
+			continue
 		}
 		out[id] = MemberDaily{
 			TMaxF: cToF(maxC),
@@ -200,7 +286,11 @@ func (p *Poll) DailyExtremesF(civilDate time.Time, loc *time.Location) (
 			N:     n,
 		}
 	}
-	return out, nil
+	if len(out) == 0 {
+		return nil, skipped, fmt.Errorf("%w: all %d members below %d in-window samples",
+			ErrInsufficientCoverage, skipped, MinHourlySamplesPerMember)
+	}
+	return out, skipped, nil
 }
 
 // MemberDaily is the per-ensemble-member daily TMAX/TMIN for one civil

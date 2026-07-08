@@ -1,238 +1,395 @@
-# Bot strategy
+# Strategy
 
-> The edge thesis, the execution doctrine, and the failure modes we refuse to
-> have. If a reader disagrees with any of this in writing, stop and resolve
-> the disagreement before committing code to Phase 1.
+> The edge thesis, the gate that the bot has to pass before live
+> trading, and the failure modes we refuse to have. Written
+> 2026-05-13 to reflect the post-canary state (ADR-0009 fired) and
+> the response (ADR-0010 + the planned validation harness in the next
+> ADR slot after 0011). Refreshed same day post-Bucket-A close: see
+> [ADR-0011](./decisions/0011-journal-backpressure.md),
+> [ADR-0012](./decisions/0012-time-source-discipline.md), and
+> [ADR-0013](./decisions/0013-retire-pr9-paper-trader-lineage.md) for
+> the canonical references. The Phase 2 structural decisions
+> (ADR-0014–0020) are **proposed in
+> [audit/02-architecture.md](../audit/02-architecture.md), pending
+> per-decision sign-off** — none are authoritative yet.
 
-## Thesis in one paragraph
+## Current direction — structure-first (2026-06-09)
 
-Kalshi weather-bracket markets price discrete-temperature outcomes
-(`[60,65)°F`, `[65,70)°F`, …) for a location and date. Retail flow
-dominates these books. NOAA's GFS ensemble publishes 31 forecast paths,
-ECMWF IFS publishes 51, and ML models (GenCast, AIFS) publish more —
-but **raw member fractions are uncalibrated probabilities**, systematically
-biased by under-dispersion and by grid-vs-station error. After
-**NGR/EMOS calibration**, **ECMWF blending**, and an **intraday Bayesian
-update at T−3h** that incorporates the observed temperature trajectory,
-our posterior for a bracket can be 5–15 pp tighter than the market's,
-which updates on a 6-hour NWP cadence. That gap is the bot's home.
+**The authoritative plan is now
+[research/09-structure-first-pivot.md](./research/09-structure-first-pivot.md),
+accepted by [ADR-0014](./decisions/0014-structure-first-pivot.md).**
+Directional weather failed its gates (floor v2: −10pp Brier vs market mid,
+significant; forward week 1: −$30.24 realized) and is demoted to a time-boxed
+side track (one MOS refit + one fair forward test against the v5 gate). The
+flagship is a market-agnostic structural scanner — deterministic-settlement
+capture, internal-consistency arbitrage (bracket sums, ladder monotonicity,
+complement pairs), stale-book lag — across all NY-eligible Kalshi markets,
+gated G-A → G-B → G-C with numbers frozen in the ADR. No real-money order
+without G-B passing **and** explicit operator sign-off. Everything below this
+section documents the directional-weather program: retained as the side
+track's scope and as the historical record of why the pivot happened.
 
-Secondary thesis: **hurricane-landfall markets** (`KXHURRICANE*`). NHC
-updates the cone on 3-hour advisories; models contain the signal
-earlier. The cone is the 67th-percentile envelope, so tail brackets
-(extreme landfall zones, Cat-5 intensity) are intrinsically mispriced.
-NDBC-buoy SST nudging drops intensity MAE from 9 mph to ~7.5 mph at 24h.
-Seasonal (June–November); perfect fit for a 6-month runway.
+## In one paragraph
 
-Both theses are *measured* in Phase 0.5, not assumed. Gate:
-**`>10 events/day with >5% calibrated edge after fees` on at least
-one signal**, with **calibrated Brier-skill beating market-implied
-on held-out 90-day OOS data**. If calibration fails the Brier gate,
-the signal is disabled — no negotiation.
+`isobar` is a solo-operator weather-bracket trading bot targeting
+Kalshi's `KXHIGH{CITY}` and `KXLOWT{CITY}` daily-temperature contracts
+for NYC, Miami, Chicago, and LAX, with a $200 starting bankroll and a
+New-York-compliant posture (we only subscribe to series Kalshi serves
+to NY retail). The bot does **not** trade real money today. Phase 0
+records the live tape; Phase 0.5 measured calibration against held-out
+ground truth and found the canary
+([reports/phase0.5/2026-05-05-floor-estimate-v2.md](../reports/phase0.5/2026-05-05-floor-estimate-v2.md)).
+Phase 0.6 builds the response: T−3h Bayesian intraday update
+([ADR-0010](./decisions/0010-t-minus-3h-bayesian-update.md)) plus an
+empirical validation harness (the next ADR slot after the journal
+backpressure ADR-0011, planned as ADR-0012). The bot's success
+criterion is **resume-grade Sharpe over moonshot returns**: the
+strongest outcome is a documented forecasting-research artifact even
+if calibration ultimately cannot beat the Kalshi market mid in the
+tradeable midrange.
 
-**BTC-hourly is killed.** Research (waves 1+2) converged: Coinbase
-integrated Kalshi in Jan 2026, compressing lead-lag to sub-second.
-At REST-from-cloud latency we are 10–50 ms behind serious competitors.
-`internal/coinbase` and the `coinbase` config block are removed.
+## Thesis
 
-## The two signals
+Kalshi's daily-extremes weather brackets price discrete-temperature
+outcomes — for example, "`KXHIGHNY: TMAX in [60, 65)°F`" — for one
+station on one civil date. Retail flow dominates these books.
 
-### `weather-calibrated` — calibrated ensemble vs. bracket YES
+The naive estimator — "fraction of GFS ensemble members whose
+forecast daily extreme lands in the bracket" — has two structural
+biases that a calibrated estimator can correct:
 
-**Pricing model (do NOT use raw fraction — it's miscalibrated by
-10–15 pp at bracket boundaries; see `docs/research/02-weather-thesis-audit.md`).**
+1. **Per-station, per-season forecast bias.** A summer KMIA TMAX
+   forecast is not the same problem as a winter KMDW TMAX forecast;
+   a single global fraction-in-bucket estimator cannot fix that.
+2. **Ensemble underdispersion.** A 31-member GFS control+perturbation
+   ensemble is centred close to the deterministic forecast and has
+   narrower spread than the predictive distribution of the
+   atmosphere. The naive count systematically underweights the tail
+   brackets.
 
-Pipeline:
+MOS-style per-bin linear correction (`μ_cal = a + b · forecast`, σ
+from holdout residuals) addresses both biases in principle. ECMWF IFS
+member blending and an intraday Bayesian update against the day's
+running TMAX or TMIN are the named upgrades when the simplest fit is
+not enough. The reference architecture is laid out in
+[docs/CALIBRATION.md](./CALIBRATION.md).
 
-1. Fetch GEFS (31 members) + ECMWF IFS (51 members) for the target
-   station and date.
-2. Apply **NGR / EMOS** per `(station, season, lead-time)` bin, fit on
-   ≥2 years of paired archive-vs-NWS-CLI observations. Produces a
-   calibrated predictive CDF, not a raw member count.
-3. Blend the two models (inverse-variance weighted).
-4. Apply **EVT / Peaks-Over-Threshold (GPD)** for tail brackets where
-   raw count is 0–1 members — extrapolates tail probability from
-   20y of station history.
-5. At T−3h, perform a **Bayesian update** using observed METAR/ASOS
-   trajectory: `P(finalT | obs) ∝ P(obs | finalT) · P(finalT | ensemble)`.
-   This is the largest single-shot edge (+5–10¢/bracket at settlement).
-6. Wrap the predictor with **conformal prediction intervals**
-   (distribution-free coverage guarantees). Only bet when
-   `bracket width > conformal width + bid-ask`.
+The thesis is empirical, not assumed. The verdict from the v2 floor
+estimate (n = 299 verifiable bracket outcomes, bootstrap 95% CIs):
 
-The resulting `p_fair` is a calibrated posterior probability with
-known coverage, not a raw member fraction.
+| Comparison (tradeable [35, 65)¢ zone, n = 79) | Δ Brier | CI95 | Verdict |
+|---|---:|---|---|
+| MOS over naive | +0.060 | [+0.008, +0.113] | MOS wins |
+| MOS over climate-shrunk-naive | −0.011 | [−0.056, +0.035] | tied |
+| MOS over Kalshi market mid | **−0.100** | [−0.188, −0.013] | **market wins** |
 
-**Edge.**
+Source: `reports/phase0.5/2026-05-05-floor-estimate-v2.md`
+§"Bootstrap 95% CIs on Brier deltas". Same report §"By lead-hours
+bucket" shows the gap concentrates at lead [3, 12)h — the close-to-
+settlement window where intraday observations move the price. The
+T−3h Bayesian update in ADR-0010 directly targets that bucket.
 
-```
-edge_yes = p_fair - (yes_ask + fee_round_trip)
-edge_no  = (1 - p_fair) - (no_ask + fee_round_trip)
-```
+`KXHURRICANE*` was named as a secondary signal in ADR-0004 (two-signal
+scope) and is acknowledged for hurricane season, but no Go package
+under `internal/` implements any hurricane-pricing logic today, and
+it is not part of Phase 0.5 or Phase 0.6. It is treated as future
+work; see [docs/ROADMAP.md](./ROADMAP.md).
 
-`fee_round_trip` is the sum of maker/taker fees actually incurred on
-open + close at the assumed fill prices. Never a flat constant — fees depend
-on price, per Kalshi schedule.
+BTC-hourly was killed by [ADR-0002](./decisions/0002-kill-btc-hourly.md)
+and is not coming back.
 
-**Entry.**
+## Scope
 
-- **Fee-aware edge floor** (do NOT use fixed 8¢):
-  `edge > 0.07 · 2 · P · (1−P) + 1¢` per side. Forces the bot to skip
-  P≈0.5 brackets unless edge is large, because that's where Kalshi's
-  fee curve peaks.
-- **Lyapunov 8-day gate**: no signal emitted for brackets with
-  lead_time > 8 days. Forecast error doubles every ~5 days
-  (λ ≈ 0.2 day⁻¹); beyond 8 days any "edge" is noise.
-- Enter when all gates pass AND the book has `min_size` at the far-touch.
-- Quote maker-only. **Post-only** (`PostOnly: true`) on every order —
-  exchange rejects rather than crosses.
-- Reservation price + half-spread per `docs/research/06-microstructure-math.md`:
-  `σ²_bin(P) = P(1−P)/√t_days` (NOT P(1-P) alone — bounded-payoff
-  correction).
-- One order per `(strategy, market, side)` at a time.
+| Item | Value | Source |
+|---|---|---|
+| Bankroll | $200 starting | memory `project_kalshi_bot.md` |
+| Series subscribed | `KXHIGHNY`, `KXHIGHMIA`, `KXHIGHLAX`, `KXHIGHCHI`, `KXLOWTNYC`, `KXLOWTMIA`, `KXLOWTLAX`, `KXLOWTCHI` | [config/config.yaml:24-32](../config/config.yaml) |
+| Stations polled | `KNYC` (Central Park), `KMIA` (Miami Intl), `KLAX`, `KMDW` (Chicago Midway per ADR-0007 §"Neutral") | [config/config.example.yaml:70](../config/config.example.yaml); active config drift tracked in RISK.md |
+| Forecast horizon | 3 days | [config/config.yaml:62](../config/config.yaml) (`forecast_days: 3`) |
+| Live ensemble | GFS (`gfs_seamless`) + ECMWF IFS (`ecmwf_ifs025`) — combined ~80-member | [config/config.yaml:51](../config/config.yaml); [internal/edge/openmeteo.go:122-128](../internal/edge/openmeteo.go) |
+| Calibration ground truth | NWS CLI daily climate bulletins, latest issuance per civil date | [ADR-0007](./decisions/0007-calibration-ground-truth-cli.md) |
+| Compliance posture | NY-compliant: we only subscribe to series Kalshi serves to NY retail | memory `project_kalshi_bot.md` |
+| Success metric | Resume-grade Sharpe over moonshot returns; documented forecasting-research artifact is an acceptable terminal state | memory `user_working_style.md`; v2 floor estimate §"Concrete next steps" #1 |
 
-**Exit.**
+## Phase timeline
 
-- If `p_fair` migrates back toward market, cancel + re-quote at the new
-  fair.
-- Hold to expiry by default — the edge is realized at resolution, not by
-  round-tripping the book.
-- Stop-loss: if `p_fair` inverts past the market mid (market was right, we
-  were wrong), close at best available price.
+### Phase 0 — Recorder live (accomplished)
 
-**Known caveats.**
+The `cmd/tape` recorder is running on Vultr Chicago, capturing the
+live Kalshi WS (`orderbook_delta`, `trade`) and the multi-model
+Open-Meteo ensemble (`gfs_seamless,ecmwf_ifs025`). Journals are
+JSONL with rotation at 256 MiB or 1 h, gzip on rotate, batched
+fsync. As of 2026-05-13: 798 MB on disk (`audit/00-map.md` §0).
 
-- Member counts ≠ 31 for some GFS variables; always verify N from the
-  response, do not hardcode.
-- Ensemble doesn't model microclimate (shadow, cloud cover anomalies near
-  the official station); edge is weakest for bracket boundaries close to
-  the ensemble median.
-- GFS refreshes on a 00/06/12/18 UTC cadence; around each refresh there's
-  a brief window where member fields may be partially updated. Gate signal
-  emission on "fully-updated" (all expected hours present for the target
-  day).
+Goroutine lifecycle, external integration surface, and storage
+layout are documented in [docs/ARCHITECTURE.md](./ARCHITECTURE.md)
+and `audit/00-map.md` §4–§8. No live execution; the recorder is
+pure outbound.
 
-### `hurricane-landfall` — NHC advisory + models vs. bracket YES
+### Phase 0.5 — Calibration research (gate failed)
 
-**Pricing model.** For a landfall-zone bracket (or category-at-landfall
-bracket) with advisory time `T`:
+The v2 floor estimate measured the original Phase 0.5 gate from
+[ADR-0001](./decisions/0001-research-driven-pivot.md):
 
-1. Pull NHC ATCF a-deck (deterministic forecast) + b-deck (best-track
-   analysis) for the active storm.
-2. Ingest GEFS 30-member tropical ensemble + HAFS-A/B + HWRF via
-   NOAA NOMADS (all free).
-3. Run SST-nudged intensity ML model trained on 10y NOAA archive with
-   NDBC-buoy real-time heat content. Drops intensity MAE from 9 mph
-   to ~7.5 mph at 24h.
-4. **EVT/POT** for Cat-5 tail pricing (extreme brackets).
-5. Regime-switch **HMM** over weakening/strengthening/steady-state for
-   the storm's current intensity phase.
+> "calibrated Brier-skill > market-implied on held-out 90-day OOS data"
 
-**Why the edge exists.** NHC's cone is the 67th-percentile envelope
-by construction — tails are structurally under-weighted by retail
-reading the cone. NHC reprices on 3-hour advisory cadence (2-hour near
-landfall); models reprice on 6-hour model cadence; realized-observation
-signal (SST, METAR near the target coast) is continuous. The gap
-between these three cadences is the edge.
+MOS on deterministic-GFS does not clear that gate in the tradeable
+[35, 65)¢ midrange (Brier 0.401 vs market 0.255). The canary set in
+ADR-0008 §"Canary" fired; [ADR-0009](./decisions/0009-mos-canary-fired-escalate-calibration.md)
+named two parallel response tracks.
 
-**Entry.** Same gates as weather-calibrated (fee-aware floor,
-Lyapunov-horizon adapted to hurricane predictability), plus:
-- Only emit signals during active NHC advisories (AL or EP basin).
-- Skip when HMM state is "uncertain" (transition probabilities
-  within 15 pp of each other).
+### Phase 0.6 — Calibration v2 (in flight)
 
-**Seasonality.** Atlantic season June 1 – November 30. 6–12 tradable
-storms per year historically. Off-season is used for backtest /
-calibration work against the 2020–2025 archive.
+**Track A — ECMWF IFS blend.** Live recorder already ingests both
+models per [config/config.yaml:51](../config/config.yaml). The
+calibration corpus is still GFS-only (ADR-0008 used deterministic
+GFS as the x-side); the planned upgrade fits MOS on the combined
+member set or per-source blend. Estimated effort 1–2 days
+(ADR-0009 §"Track A").
 
-## Execution doctrine
+**Track B — T−3h Bayesian update.** Foundation lands in
+`internal/calibration/bayesian/` (math + loader, schema-versioned
+JSON kernel) plus a scaffold `cmd/calibrate-bayesian` whose fitter
+body is the next commit. Math is the standard precision-weighted
+Gaussian update of the MOS prior by an "observation forecast"
+constructed from the day's running max or min plus an empirical
+residual kernel. See [ADR-0010 §"Decision"](./decisions/0010-t-minus-3h-bayesian-update.md)
+for the math and edge cases.
 
-1. **Maker-only by default.** Taking flow from retail in bracket books
-   destroys the edge via fees. We sit on the book and wait.
-2. **Post-only flag set on every order** (`PostOnly: true`). An order that
-   would cross is rejected, not crossed silently.
-3. **One live order per `(strategy, market, side)` at a time.** No
-   stack-of-orders — too much to reconcile after a disconnect.
-4. **Cancel-before-replace.** Price/size changes go via
-   `CancelOrder` → wait for confirmation → `CreateOrder`. No "modify" API
-   on Kalshi; emulating it loses audit traceability.
-5. **Client order IDs are deterministic** —
-   `<strategy>-<ticker>-<ensemble_run>-<side>` — so retries after
-   network blips don't accidentally double-submit.
-6. **Fee-aware pricing.** Every entry/exit quote has fees subtracted from
-   the computed edge. Taker fees are treated as worst-case on any cross.
+**Validation harness — next ADR slot (planned ADR-0012).** A
+held-out evaluation tool that:
 
-## Sizing
+- Sweeps the corpus by `(station, variable, lead_bucket, mid_bucket)`.
+- Reports bootstrap 95% CIs on Brier deltas.
+- Has a CLI gate that returns nonzero if any gate criterion fails.
 
-Position sizing is a separate concern from signal. Sizing lives in
-`internal/risk`, not in the `Signal` implementations.
+Until that tool runs and clears its primary gate, the T−3h Bayesian
+update is not wired into the live scan path. The package compiles
+and its tests pass; integration is gated.
 
-Default rule (Phase 1): Kelly-fraction of bankroll, capped at per-ticker
-and per-portfolio notional limits. Kelly numerator is `edge_after_fees`;
-denominator is the implied variance of the bracket outcome.
+**Bucket A boundary event — PR#9 paper-trader lineage retired.**
+The Bucket A close force-pushed `main` to drop 11 commits of
+`cmd/paper-trader` + `cmd/fillability` + `cmd/score` + `cmd/settle` +
+`cmd/backfill-score` + `internal/papertrade` work merged via PRs
+#7–#9 ahead of the audit (out of scope for Phase 1's "no new
+capability" framing; binaries no longer compiled against the
+post-Bucket-A `internal/edge` API). Nothing is lost:
+[ADR-0013](./decisions/0013-retire-pr9-paper-trader-lineage.md)
+catalogues commit SHAs, PR refs, and audit backup branches
+(`audit/2026-05-13` + `audit/2026-05-13-post-bucket-a`) for
+cherry-pick + migration when the `cmd/bot` ADR unblocks the
+live-money path.
 
-**Explicit caps, enforced pre-order:**
+### Decision gate (before any real-money order)
 
-| cap                          | default (Phase 3 launch) |
-| ---------------------------- | ------------------------ |
-| max notional per ticker      | $10                      |
-| max notional per series      | $25                      |
-| max notional portfolio-wide  | $50 (scales with bankroll) |
-| max contracts per order      | 100                      |
-| max daily drawdown before halt | 10% of bankroll         |
+The bot does not place a real-money order until **all four** of
+these hold on a single held-out evaluation report:
 
-Every cap is a constant in `config.yaml`, not a magic number in code.
+1. **MOS+Bayesian beats Kalshi market mid by ≥ 3 pp Brier** in the
+   tradeable [35, 65)¢ + lead [3, 12)h cell, with bootstrap 95% CI
+   lower bound > 0. (ADR-0010 §"Gate criteria" primary.)
+2. **MOS+Bayesian beats MOS-alone by ≥ 2 pp Brier** in the same
+   cell, with bootstrap 95% CI lower bound > 0. If this fails, the
+   Bayesian upgrade is cosmetic and the prior is doing the work.
+   (ADR-0010 §"Gate criteria" secondary.)
+3. **At least 90 days of held-out CLI ground-truth coverage** in
+   that cell (n ≈ 600+ rows across the four stations × two
+   variables). (Phase 0.5 v2 §"Concrete next steps" #4.)
+4. **No regression on cells MOS already wins** (lead [12, 24)h and
+   [24, 48)h, mid < 15¢). The `prior-only` fallback in the Bayesian
+   package must fire correctly when the kernel has insufficient
+   data. (ADR-0010 §"Gate criteria" sanity.)
+
+If all four pass: write the v3 floor estimate report, then proceed
+to Phase 1 scope review (execution code, risk gates wired, paper
+period). If any fail: file the next ADR after ADR-0012 escalating
+to ADR-0009 Track C (NOAA GEFS GRIB backfill for full-ensemble
+NGR) or, per the v2 report's recommendation, pivot the project
+framing to "forecasting research artifact" without further
+calibration spend.
+
+## Pipeline summary
+
+The probability flow lives in `internal/edge/scan.go` and is
+documented in detail in [docs/CALIBRATION.md](./CALIBRATION.md). One
+sentence per stage:
+
+1. **Live recorder** (`cmd/tape`) streams Kalshi `orderbook_delta` +
+   `trade` and polls Open-Meteo every 30 minutes for the GFS+ECMWF
+   ensemble across the four stations.
+2. **Replay** (`internal/replay`) reconstructs the orderbook per
+   bracket per snapshot time.
+3. **Probability models in `internal/edge/scan.go`** emit four
+   probabilities per row: `naive` (fraction of members in bracket),
+   `MOS` (per-bin linear correction; [internal/calibration/mos](../internal/calibration/mos)),
+   `climate-shrunk` (`p = 0.2 · climate + 0.8 · naive`;
+   [internal/calibration/climate](../internal/calibration/climate)),
+   and `market` (Kalshi mid). MOS uses `FitModelSet` stamping so the
+   scan refuses to apply a GFS-only fit to a multi-model poll.
+4. **Bayesian update** (`internal/calibration/bayesian`) updates the
+   MOS prior at trade time by precision-weighted Gaussian
+   conjugation against the day's running extremum. *Foundation only
+   today*; integration into scan is gated on the validation harness
+   above.
+5. **Edge** (`internal/edge/scan.go` `edge_yes`, `edge_no` columns)
+   subtracts the round-trip Kalshi fee and emits per-bracket rows
+   for the v2 report's stratifications.
+
+## Entry rules (Phase 1+ design)
+
+The bot does not have execution code today. The rules below are
+the design constraints that Phase 1 will wire into
+`internal/exec` (and that the v2 floor estimate already filters
+against at the analysis layer).
+
+- **Fee-aware edge floor.** `edge > 0.07 · 2 · P · (1 − P) + 1¢`
+  per side. Cited in ADR-0001 §"Phase 0.5 gate revision"; this is
+  not a fixed 8¢ floor. The shape rewards quoting away from the
+  steep fee region around P ≈ 0.5.
+- **Lyapunov horizon ceiling.** No signal on brackets with
+  `lead_time > 8` days. The live recorder fetches `forecast_days:
+  3` ([config/config.yaml:62](../config/config.yaml)), so the
+  ceiling does not bind in Phase 0, but the constant is encoded in
+  RISK.md L1 §`max_lead_time_days: 8`.
+- **Maker-only by default.** Every order is `PostOnly: true`.
+  Crossing rejects.
+- **One live order per `(strategy, market, side)`.** No order
+  stacks; reconciliation after disconnect is the expensive part of
+  exec, and stacks make it worse.
+- **Cancel-before-replace.** Kalshi has no modify API; emulating
+  one across a network blip loses audit traceability.
+- **Deterministic `ClientOrderID`.** `<strategy>-<ticker>-<run>-<side>`
+  so retries reuse the same ID and Kalshi de-dupes.
+- **Hold-to-expiry default.** The Phase 0.5 measurement uses
+  realized-PnL at settlement; round-tripping the book is not the
+  edge.
+
+## Sizing (Phase 1+ design)
+
+Position sizing is separate from signal emission. It will live in
+`internal/risk` (does not exist today). Default rule:
+fractional Kelly (0.5 ×) on `edge_after_fees`, denominator the
+implied variance of the bracket outcome, with the mutually-
+exclusive-bracket correlation correction `ρ_ij = −1/(K−1)`
+mandatory for any KXHIGH/KXLOWT portfolio (otherwise Kelly
+oversizes on correlated bets — see RISK.md L1).
+
+| Cap | Default at Phase 1 launch | Source |
+|---|---:|---|
+| Max notional per ticker | $10 | RISK.md L1; sized for $200 bankroll |
+| Max notional per series | $25 | RISK.md L1 |
+| Max notional portfolio-wide | $50 | RISK.md L1; scales with bankroll |
+| Max contracts per order | 100 | RISK.md L1 |
+| Max daily drawdown before halt | 10% of bankroll ($20 today) | RISK.md L4 |
+
+Each cap will live in `config.yaml`, not in code constants.
 
 ## Failure modes we refuse to have
 
-These are the bugs that blow up trading accounts. We design them out, not
-around.
+Cross-linked with [docs/RISK.md](./RISK.md). Quick list:
 
-1. **Stale state.** After reconnect, the bot must not place new orders
-   until it has reconciled open orders + positions from Kalshi REST. This
-   is a hard-wired barrier in the exec loop, not a nice-to-have.
-2. **Double-sends.** Every outbound order carries a
-   `ClientOrderID`. Retries reuse the same ID; Kalshi de-dupes.
-3. **Silent fill loss.** Fills observed on the WS feed are written to
-   SQLite *before* the position is updated. If the process dies between,
-   warm-start replays the fill from disk.
-4. **Clock drift.** Signed requests fail if local clock drifts > ~1min
-   from Kalshi server time. We monitor drift every minute against a
-   REST health endpoint; drift > 250ms logs a warn, > 1s halts trading.
-5. **Schema changes on Kalshi.** Payloads are journaled raw; decoders are
-   versioned; unknown fields are preserved (`json.RawMessage` passthrough
-   where possible). A schema bump in Kalshi's API should cause a decode
-   warning, not a silent misprice.
-6. **Kill-switch missing.** `./halt` file present ⇒ no orders leave the
-   process. Checked both at tick-start and immediately before every order
-   placement (TOCTOU gap acceptable here — worst case is one extra order).
-7. **Unbounded retries.** Every network call has a context deadline. No
-   `time.After` + `for {}` loops without a break condition.
+1. **Stale state.** After reconnect, no new orders until the bot
+   has reconciled open orders + positions from Kalshi REST. Hard
+   wired into the exec loop (Phase 1+).
+2. **Double sends.** Every order carries a `ClientOrderID`; retries
+   reuse it; Kalshi de-dupes.
+3. **Silent fill loss.** Fills observed on WS are persisted to disk
+   *before* in-memory position state updates. The recorder's
+   journal-write path is non-blocking and drops on a full queue;
+   [ADR-0011](./decisions/0011-journal-backpressure.md) is now
+   accepted and Bucket A1+A2 shipped the per-source counter +
+   sampled debug log + alarm hook + boot-time tripwire test
+   (`cmd/tape/main_test.go::TestProdJournalHasAlarmHookWired`).
+   The exec path will not adopt the non-blocking pattern — it
+   will choose blocking-with-deadline once `cmd/bot` lands.
+4. **Clock drift.** Signed requests fail if local clock drifts > 1
+   min from Kalshi server time. Drift > 250 ms warns; > 1 s halts
+   trading (RISK.md L4).
+5. **Schema changes on Kalshi.** Recorder journals raw payloads;
+   decoders are versioned; unknown fields are preserved. A schema
+   bump should produce a decode warning, not a silent misprice.
+6. **Kill switch.** `./halt` file present ⇒ no orders leave the
+   process (RISK.md L0).
+7. **`ISOBAR_LIVE_ALLOW`.** Previously documented as a live-trade
+   gate in ADR-0003; the audit found the variable was unread by any
+   Go file. The reference is now stripped from mutable docs per
+   [audit/live-allow-trace.md](../audit/live-allow-trace.md); ADR-0003
+   retains the historical Decision text (immutable per project
+   policy) with a forward-note appendix. The live-trade gating
+   mechanism is deferred to the dedicated ADR that lands `cmd/bot`
+   + `internal/exec`; today the only operator-facing gate is the
+   `./halt` file convention (L0), which is sufficient because no
+   live-order code exists.
 
-## What we will *not* do
+## What we will not do
 
-- **Not** place market orders. Ever, in any strategy.
-- **Not** chase. If the quote gets filled adversely, we accept, log, and
-  wait for the next signal. Revenge trading is how $50 becomes $0.
-- **Not** run multiple strategies against the same market without a
-  coordinator that enforces the per-ticker cap across strategies.
-- **Not** trade a market whose resolution criteria we have not read in
-  full and linked in code comments. Weather brackets occasionally have
-  edge cases ("observed at which station at which time") that rewrite the
-  payoff.
-- **Not** add new strategies without first measuring the edge in Phase 0.5
-  style analysis. Code-first strategies without measurement gates are
-  how blown-up accounts get written.
+- **Not** place market orders. Ever.
+- **Not** chase fills. If a quote fills adversely, we accept, log,
+  and wait. Revenge trading is how $200 becomes $0.
+- **Not** run multiple strategies against the same market without
+  a coordinator that enforces per-ticker caps across them.
+- **Not** trade a market whose resolution criteria we have not
+  read in full and linked in code. ADR-0007 §"Neutral" already
+  caught one such case (KXLOWTCHI resolves on KMDW, not KORD);
+  see RISK.md "station-coordinate drift".
+- **Not** promote a calibration upgrade past the integration flag
+  without the validation harness clearing its primary gate. The
+  v2 report's recommendation is that this discipline matters more
+  than the final P/L.
 
 ## Decision log
 
-Every strategy-level decision (add/remove a strategy, change a cap, switch
-a pricing model) is recorded in `docs/decisions/<date>-<slug>.md` with:
+Every strategy-level change goes into `docs/decisions/<NNNN>-<slug>.md`
+with **Context / Decision / Alternatives / Consequences / Reversal
+cost** sections. Current canon for the post-Phase-0 calibration arc:
 
-- **Context.** What did we know before?
-- **Decision.** What did we change?
-- **Alternatives considered.** What did we *not* do and why?
-- **Reversal cost.** If this turns out to be wrong, how hard is it to back out?
+- [ADR-0001](./decisions/0001-research-driven-pivot.md) — original
+  two-signal scope and Phase 0.5 gate
+- [ADR-0004](./decisions/0004-two-signal-scope.md) — weather +
+  hurricane scope; hurricane is paper-only today
+- [ADR-0007](./decisions/0007-calibration-ground-truth-cli.md) —
+  NWS CLI bulletins as the canonical y-target
+- [ADR-0008](./decisions/0008-deterministic-historical-forecast.md)
+  — deterministic GFS as the first-pass x-side; with the canary
+- [ADR-0009](./decisions/0009-mos-canary-fired-escalate-calibration.md)
+  — canary fired; escalate via ECMWF blend (Track A) and T−3h
+  Bayesian (Track B)
+- [ADR-0010](./decisions/0010-t-minus-3h-bayesian-update.md) —
+  T−3h Bayesian update math and gates
+- [ADR-0011](./decisions/0011-journal-backpressure.md) — journal
+  backpressure (accepted; landed via Bucket A1+A2)
+- [ADR-0012](./decisions/0012-time-source-discipline.md) —
+  time-source discipline: Clock interface + clockcheck analyzer
+  (accepted; landed via Bucket A4+A8)
+- [ADR-0013](./decisions/0013-retire-pr9-paper-trader-lineage.md) —
+  retire the PR#9 paper-trader / scoring lineage at the Bucket A
+  force-push; recovery paths catalogued
+- ADR-0014 through ADR-0020 — Phase 2 structural decisions
+  **proposed in [audit/02-architecture.md](../audit/02-architecture.md),
+  pending per-decision sign-off** (error-handling discipline,
+  schema-migration policy, station-registry consolidation,
+  `internal/edge` directional-split deferral, role boundaries,
+  CLI test discipline, `internal/`-only rule). None are accepted yet.
+- Calibration validation harness (still planned; ADR slot pending
+  per the post-Phase-2 sequence) — the primary gate the bot must
+  clear before any real-money trade.
 
-Decisions are never silent. A strategy is a hypothesis; hypotheses deserve
-timestamped evidence.
+Decisions are never silent. A strategy is a hypothesis;
+hypotheses deserve timestamped evidence.
+
+## References
+
+- [ADR-0007](./decisions/0007-calibration-ground-truth-cli.md),
+  [ADR-0008](./decisions/0008-deterministic-historical-forecast.md),
+  [ADR-0009](./decisions/0009-mos-canary-fired-escalate-calibration.md),
+  [ADR-0010](./decisions/0010-t-minus-3h-bayesian-update.md)
+- [Phase 0.5 v2 floor estimate](../reports/phase0.5/2026-05-05-floor-estimate-v2.md)
+  — empirical basis for the canary
+- [docs/CALIBRATION.md](./CALIBRATION.md) — engineer-readable
+  companion to the calibration pipeline
+- [docs/ARCHITECTURE.md](./ARCHITECTURE.md) — package layout +
+  invariants
+- [docs/RISK.md](./RISK.md) — risk register
+- [audit/00-map.md](../audit/00-map.md) — Phase 0 territory map
+- [audit/strategy-risk-reconciliation.md](../audit/strategy-risk-reconciliation.md)
+  — memo backing this rewrite

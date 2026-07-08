@@ -52,14 +52,14 @@ func loadPolls(omRoot string, start, end time.Time) (*pollIndex, error) {
 	}
 	idx := &pollIndex{byStation: map[string]*stationSeries{}}
 
-	err = replay.ForEachFrame(files, func(env replay.Envelope, _ int, _ bool) error {
+	walkErr := replay.ForEachFrame(files, func(env replay.Envelope, _ int, _ bool) error {
 		station, ok := stationFromKind(env.Kind)
 		if !ok {
 			return nil
 		}
-		poll, err := ParsePoll(env.Payload)
-		if err != nil {
-			return nil // skip malformed; already counted at higher level
+		poll, parseErr := ParsePoll(env.Payload)
+		if parseErr != nil {
+			return nil //nolint:nilerr // malformed polls are skipped; scans count missing pairings downstream
 		}
 		ss := idx.byStation[station]
 		if ss == nil {
@@ -95,6 +95,11 @@ func loadPolls(omRoot string, start, end time.Time) (*pollIndex, error) {
 		ss.polls = sortedPolls
 	}
 	return idx, nil
+}
+
+type pollEntry struct {
+	time time.Time
+	poll *Poll
 }
 
 // stationFromKind maps the Open-Meteo Frame.Kind ("rest:NY") to a Kalshi
@@ -151,13 +156,16 @@ func dailyFiles(root string, start, end time.Time) ([]string, error) {
 // Kalshi's v2 WS docs. Some recorded frames may use string price_dollars
 // (legacy) — yesPriceCents() handles both representations.
 type tradeMsg struct {
-	MarketTicker string          `json:"market_ticker"`
-	YesPrice     int             `json:"yes_price"`
-	NoPrice      int             `json:"no_price"`
-	PriceDollars json.RawMessage `json:"price_dollars,omitempty"`
-	Side         string          `json:"side"`
-	Count        int             `json:"count"`
-	TsMs         int64           `json:"ts_ms"`
+	MarketTicker    string          `json:"market_ticker"`
+	YesPrice        int             `json:"yes_price"`
+	NoPrice         int             `json:"no_price"`
+	YesPriceDollars string          `json:"yes_price_dollars,omitempty"`
+	NoPriceDollars  string          `json:"no_price_dollars,omitempty"`
+	PriceDollars    json.RawMessage `json:"price_dollars,omitempty"`
+	Side            string          `json:"side"`
+	TakerSide       string          `json:"taker_side,omitempty"`
+	Count           int             `json:"count"`
+	TSMs            int64           `json:"ts_ms"`
 }
 
 // yesPriceCents returns the canonical YES-side price in integer cents,
@@ -187,6 +195,18 @@ func (m tradeMsg) yesPriceCents() (int, bool) {
 			return 0, false
 		}
 		return c, true
+	}
+	if m.YesPriceDollars != "" {
+		var v float64
+		if _, err := fmt.Sscanf(m.YesPriceDollars, "%f", &v); err == nil && v > 0 && v < 1 {
+			return v
+		}
+	}
+	if m.NoPriceDollars != "" {
+		var v float64
+		if _, err := fmt.Sscanf(m.NoPriceDollars, "%f", &v); err == nil && v > 0 && v < 1 {
+			return 1 - v
+		}
 	}
 	if len(m.PriceDollars) > 0 {
 		var s string

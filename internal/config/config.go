@@ -7,11 +7,14 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/wh0o0pz/isobar/internal/market"
 )
 
 // Config is the top-level runtime configuration.
@@ -130,7 +133,62 @@ func Load(path string) (Config, error) {
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
+	if cfg.OpenMeteo.Enabled {
+		if err := validateStationCoords(cfg.OpenMeteo.Locations); err != nil {
+			return Config{}, err
+		}
+	}
 	return cfg, nil
+}
+
+// stationCoordTolerance is the maximum lat/lon delta (decimal degrees)
+// between an operator's config and the canonical NWS coordinates in
+// internal/market.AllStationsCanonical. 0.001° is ~110 m of latitude
+// drift and slightly less in longitude — well inside the precision
+// implied by the four-decimal-place form we publish, but loose enough
+// to absorb honest rounding (NWS publishes 5dp; we round to 4dp).
+const stationCoordTolerance = 0.001
+
+// validateStationCoords cross-checks each openmeteo.locations entry
+// against internal/market.AllStationsCanonical. The location's Name
+// (e.g. "CHI") must match a Station.Location, and the configured
+// Lat/Lon must agree with the canonical NWS values within
+// stationCoordTolerance. Returns the first mismatch found.
+//
+// This is a hard fail: a tape recorded against the wrong station is
+// near-unrecoverable corpus damage (see audit/chi-blast-radius.md for
+// the 21% poisoned-frame post-mortem), so we refuse to boot rather
+// than continue with a drifted config.
+func validateStationCoords(locs []OpenMeteoLocation) error {
+	canon := market.AllStationsCanonical()
+	byLoc := make(map[string]market.Station, len(canon))
+	for _, s := range canon {
+		byLoc[s.Location] = s
+	}
+	for _, l := range locs {
+		want, ok := byLoc[l.Name]
+		if !ok {
+			// Unknown locations skip canonical-coord validation —
+			// the registry only covers the four production weather
+			// stations. New series (hurricane, secondary cities)
+			// can be polled with caller-supplied coords until they
+			// are added to AllStations.
+			continue
+		}
+		dLat := math.Abs(l.Lat - want.Lat)
+		dLon := math.Abs(l.Lon - want.Lon)
+		if dLat > stationCoordTolerance || dLon > stationCoordTolerance {
+			return fmt.Errorf(
+				"config: openmeteo.locations[%s] coords drift from canonical %s — "+
+					"configured (%.4f, %.4f), canonical (%.4f, %.4f), "+
+					"Δlat=%.4f Δlon=%.4f, tolerance=%.4f",
+				l.Name, want.Code,
+				l.Lat, l.Lon, want.Lat, want.Lon,
+				dLat, dLon, stationCoordTolerance,
+			)
+		}
+	}
+	return nil
 }
 
 // overlayEnv applies environment variables to cfg in place. Both bare

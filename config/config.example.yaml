@@ -53,8 +53,12 @@ kalshi:
 openmeteo:
   enabled: true
   base_url: https://ensemble-api.open-meteo.com/v1/ensemble
-  # GFS gives 31 ensemble members — exactly what we want for tail-bracket pricing.
-  model: gfs_seamless
+  # Comma-separated list. "gfs_seamless,ecmwf_ifs025" gives a combined
+  # 80-member ensemble (30 GFS + 50 ECMWF) — two independent forecast
+  # sources reduce single-model bias risk. The parser in
+  # internal/edge/openmeteo.go discovers per-model member columns via
+  # the *_<model> suffix Open-Meteo emits in multi-model responses.
+  model: gfs_seamless,ecmwf_ifs025
   # Poll cadence. GFS publishes new runs every 6h, but member fields update
   # within the run; 30m polling is enough to catch refreshes without abuse.
   poll_interval: 30m
@@ -63,7 +67,7 @@ openmeteo:
     - { name: NY,  series: [KXHIGHNY,  KXLOWTNYC], lat: 40.7794, lon: -73.9692 }   # Central Park
     - { name: MIA, series: [KXHIGHMIA, KXLOWTMIA], lat: 25.7617, lon: -80.1918 }   # Miami Intl
     - { name: LAX, series: [KXHIGHLAX, KXLOWTLAX], lat: 33.9416, lon: -118.4085 }  # LAX
-    - { name: CHI, series: [KXHIGHCHI, KXLOWTCHI], lat: 41.7861, lon: -87.7522 }   # KMDW (Chicago Midway — Kalshi resolves KXHIGHCHI/KXLOWTCHI here)
+    - { name: CHI, series: [KXHIGHCHI, KXLOWTCHI], lat: 41.7842, lon: -87.7553 }   # KMDW (Chicago Midway — Kalshi resolves KXHIGHCHI/KXLOWTCHI here, NWS-canonical per audit/chi-blast-radius.md)
   variables:
     - temperature_2m
     - temperature_2m_max

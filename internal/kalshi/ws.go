@@ -10,11 +10,23 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/wh0o0pz/isobar/internal/retry"
+)
+
+// Defaults for the WS liveness watchdog. See CLIENT.md for the rationale:
+// Kalshi weather brackets see at least one orderbook frame per minute during
+// market hours, so 60s is the floor below which we treat the feed as dead.
+// Pinging at half the dead-window is the standard pattern.
+const (
+	defaultPingInterval         = 30 * time.Second
+	defaultMaxIdleBetweenFrames = 60 * time.Second
+	defaultRefreshTimeout       = 30 * time.Second
 )
 
 // SubscriberOptions configures a WS subscriber.
@@ -29,6 +41,37 @@ type SubscriberOptions struct {
 	// caller's transport (coder/websocket reuses its read buffer between
 	// Read calls), so OnFrame must either consume synchronously or copy.
 	OnFrame func(raw []byte)
+
+	// RefreshTickers, when non-nil, is called at the start of every
+	// connection attempt (initial connect and every reconnect) and
+	// returns the full ticker list to subscribe with. This makes the
+	// reconnect path self-healing: a watchdog-forced reconnect always
+	// resubscribes with a current market list rather than whatever the
+	// subscriber last held. Without it, a stale in-memory list is fatal
+	// and unrecoverable — in the 2026-05 outage every held ticker had
+	// settled, Kalshi answered each resubscribe with empty snapshot
+	// stubs (market_id="") and no deltas, and the starvation watchdog
+	// looped forever (see docs/OPERATIONS.md, postmortem 2026-06-09).
+	//
+	// Errors and empty results are non-fatal: the subscriber logs and
+	// falls back to the last-known list, preserving pre-hook behavior.
+	RefreshTickers func(ctx context.Context) ([]string, error)
+	// RefreshTimeout bounds each RefreshTickers call so a hung discovery
+	// source cannot park the reconnect loop. Zero uses
+	// defaultRefreshTimeout (30s).
+	RefreshTimeout time.Duration
+
+	// PingInterval is how often the watchdog checks frame age and pings.
+	// Zero uses defaultPingInterval (30s).
+	PingInterval time.Duration
+	// MaxIdleBetweenFrames is the maximum allowed gap between inbound
+	// frames before the watchdog forces a reconnect. Zero uses
+	// defaultMaxIdleBetweenFrames (60s).
+	MaxIdleBetweenFrames time.Duration
+
+	// now is a clock injection point for tests (mirrors Signer.now). Zero
+	// uses time.Now. The watchdog uses this to compute frame age.
+	now func() time.Time
 }
 
 // ReconnectOptions tunes WS reconnect backoff. MaxAttempts == 0 means
@@ -57,6 +100,12 @@ type Subscriber struct {
 	channels []string
 
 	reloadCh chan struct{}
+
+	// lastFrameTime holds the unix-nano timestamp of the most recent frame
+	// observed in runOnce. Updated on every OnFrame invocation and reset
+	// to "now" at the start of each connection so the watchdog doesn't
+	// false-trigger on the first frame gap.
+	lastFrameTime atomic.Int64
 }
 
 // NewSubscriber returns a Subscriber. Call Run to start it.
@@ -72,6 +121,18 @@ func NewSubscriber(opts SubscriberOptions) *Subscriber {
 	}
 	if opts.OnFrame == nil {
 		opts.OnFrame = func([]byte) {}
+	}
+	if opts.PingInterval <= 0 {
+		opts.PingInterval = defaultPingInterval
+	}
+	if opts.MaxIdleBetweenFrames <= 0 {
+		opts.MaxIdleBetweenFrames = defaultMaxIdleBetweenFrames
+	}
+	if opts.RefreshTimeout <= 0 {
+		opts.RefreshTimeout = defaultRefreshTimeout
+	}
+	if opts.now == nil {
+		opts.now = time.Now
 	}
 	return &Subscriber{
 		opts:     opts,
@@ -118,6 +179,11 @@ func (s *Subscriber) Run(ctx context.Context) error {
 		InitialBackoff: s.opts.Reconnect.InitialBackoff,
 		MaxBackoff:     s.opts.Reconnect.MaxBackoff,
 		MaxAttempts:    s.opts.Reconnect.MaxAttempts,
+		// A connection that outlived two idle windows was genuinely
+		// healthy: reset the backoff ladder so its eventual drop
+		// reconnects at InitialBackoff instead of inheriting whatever
+		// cap earlier flapping ratcheted up to.
+		ResetAfter: 2 * s.opts.MaxIdleBetweenFrames,
 	}, s.logger, func(int) error {
 		return s.runOnce(ctx)
 	})
@@ -138,16 +204,9 @@ func (s *Subscriber) runOnce(ctx context.Context) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Watcher: if Reload() fires, cancel runCtx so conn.Read returns and
-	// retry.Do picks up the new ticker list on the next attempt.
-	go func() {
-		select {
-		case <-runCtx.Done():
-		case <-s.reloadCh:
-			s.logger.Info("ws reload requested — cancelling current connection")
-			cancel()
-		}
-	}()
+	// Re-resolve the ticker list before dialing so every (re)connect
+	// subscribes with a current market set. See SubscriberOptions.
+	s.refreshTickers(runCtx)
 
 	header, err := HandshakeHeaders(s.opts.Signer, s.opts.WSURL)
 	if err != nil {
@@ -166,8 +225,8 @@ func (s *Subscriber) runOnce(ctx context.Context) error {
 
 	conn.SetReadLimit(8 << 20) // 8 MiB max single message
 
-	if err := s.subscribe(runCtx, conn); err != nil {
-		return fmt.Errorf("subscribe: %w", err)
+	if subErr := s.subscribe(runCtx, conn); subErr != nil {
+		return fmt.Errorf("subscribe: %w", subErr)
 	}
 	s.mu.RLock()
 	tickerCount := len(s.tickers)
@@ -175,12 +234,134 @@ func (s *Subscriber) runOnce(ctx context.Context) error {
 	s.mu.RUnlock()
 	s.logger.Info("ws connected", "channels", channels, "tickers", tickerCount)
 
-	for {
-		_, data, err := conn.Read(runCtx)
-		if err != nil {
-			return err
+	// Reset the watchdog clock at connect time so a slow first frame
+	// doesn't immediately trip the idle threshold.
+	s.lastFrameTime.Store(s.opts.now().UnixNano())
+
+	// Run the read pump, reload watcher, and liveness watchdog concurrently.
+	// First non-nil error wins and cancels the group; defer cancel() above
+	// ensures conn.Close() runs even on watchdog-triggered shutdown.
+	g, gctx := errgroup.WithContext(runCtx)
+
+	g.Go(func() error {
+		// Reload watcher: if Reload() fires, return a sentinel error to
+		// cancel the group so retry.Do reconnects with the new ticker list.
+		select {
+		case <-gctx.Done():
+			return nil
+		case <-s.reloadCh:
+			s.logger.Info("ws reload requested — cancelling current connection")
+			return errReload
 		}
-		s.opts.OnFrame(data)
+	})
+
+	g.Go(func() error {
+		return s.watchdog(gctx, conn)
+	})
+
+	g.Go(func() error {
+		for {
+			_, data, readErr := conn.Read(gctx)
+			if readErr != nil {
+				return readErr
+			}
+			// Update lastFrameTime before fan-out so OnFrame can never
+			// race with the watchdog seeing a stale value.
+			s.lastFrameTime.Store(s.opts.now().UnixNano())
+			s.opts.OnFrame(data)
+		}
+	})
+
+	err = g.Wait()
+	// Treat reload and clean parent cancellation as non-errors so retry.Do
+	// reconnects cleanly (errReload) or exits cleanly (parent ctx cancel).
+	if errors.Is(err, errReload) {
+		return errReload
+	}
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return ctx.Err()
+	}
+	return err
+}
+
+// errReload is returned by the reload watcher to signal a graceful reconnect.
+// It bubbles up to retry.Do via runOnce's return; retry.Do treats it as a
+// normal failure and re-enters the loop, which is exactly what we want.
+var errReload = errors.New("kalshi-ws: reload requested")
+
+// refreshTickers re-resolves the ticker list via opts.RefreshTickers (when
+// configured) so the connection about to be made subscribes with a current
+// list. Failure is deliberately non-fatal — reconnecting with a
+// possibly-stale list beats not reconnecting at all — but both failure
+// modes are logged so a stuck or empty discovery source is visible next to
+// the starvation/backoff lines it would cause.
+func (s *Subscriber) refreshTickers(ctx context.Context) {
+	if s.opts.RefreshTickers == nil {
+		return
+	}
+	rctx, cancel := context.WithTimeout(ctx, s.opts.RefreshTimeout)
+	defer cancel()
+	fresh, err := s.opts.RefreshTickers(rctx)
+	if err != nil {
+		s.logger.Warn("ws ticker refresh failed — connecting with last-known list",
+			"err", err, "tickers", len(s.Tickers()))
+		return
+	}
+	if len(fresh) == 0 {
+		s.logger.Warn("ws ticker refresh returned no markets — keeping last-known list",
+			"tickers", len(s.Tickers()))
+		return
+	}
+	s.SetTickers(fresh)
+	s.logger.Debug("ws ticker refresh", "tickers", len(fresh))
+}
+
+// watchdog ticks every PingInterval and either:
+//   - detects frame starvation (last frame age > MaxIdleBetweenFrames) and
+//     forces a reconnect by returning an error, or
+//   - pings the peer so dead TCP connections fail fast instead of waiting
+//     for the read deadline.
+//
+// A Ping error is also treated as starvation: the connection is gone, force
+// a reconnect.
+func (s *Subscriber) watchdog(ctx context.Context, conn *websocket.Conn) error {
+	ticker := time.NewTicker(s.opts.PingInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			lastNs := s.lastFrameTime.Load()
+			age := s.opts.now().Sub(time.Unix(0, lastNs))
+			if age > s.opts.MaxIdleBetweenFrames {
+				// Include a ticker sample: Kalshi tickers embed the
+				// bracket date, so a starving subscription to settled
+				// markets is diagnosable from this one line.
+				tickers := s.Tickers()
+				s.logger.Warn(
+					"ws frame starvation — forcing reconnect",
+					"last_frame_age_ms", age.Milliseconds(),
+					"max_idle_ms", s.opts.MaxIdleBetweenFrames.Milliseconds(),
+					"tickers", len(tickers),
+					"tickers_sample", tickers[:min(3, len(tickers))],
+				)
+				return fmt.Errorf("ws watchdog: frame starvation (age=%s)", age)
+			}
+			// Ping the peer; if the TCP path is dead this fails fast.
+			// Bound the ping with PingInterval so a hung peer can't park us.
+			pingCtx, cancel := context.WithTimeout(ctx, s.opts.PingInterval)
+			err := conn.Ping(pingCtx)
+			cancel()
+			if err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				s.logger.Warn("ws ping failed — forcing reconnect", "err", err)
+				return fmt.Errorf("ws watchdog: ping failed: %w", err)
+			}
+		}
 	}
 }
 

@@ -61,10 +61,10 @@ func BenchmarkApplyFrameToBooks(b *testing.B) {
 	}
 	env := Envelope{Wall: 1000}
 	// Prime with the snapshot so deltas have a book.
-	ApplyFrameToBooks(books, walls, env, snapshot)
+	_, _ = ApplyFrameToBooks(books, walls, env, snapshot)
 	b.ResetTimer()
 	for range b.N {
-		ApplyFrameToBooks(books, walls, env, delta)
+		_, _ = ApplyFrameToBooks(books, walls, env, delta)
 	}
 }
 

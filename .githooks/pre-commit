@@ -1,0 +1,9 @@
+#!/bin/sh
+# Refuse a commit if any tracked file matches .gitignore rules.
+set -eu
+VIOLATIONS=$(git ls-files -i -c --exclude-standard || true)
+if [ -n "$VIOLATIONS" ]; then
+  printf 'ERROR: the following files are tracked but match .gitignore rules:\n%s\n' "$VIOLATIONS" >&2
+  printf '\nFix by: git rm --cached -r <file> and committing.\n' >&2
+  exit 1
+fi

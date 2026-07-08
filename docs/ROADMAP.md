@@ -4,6 +4,19 @@
 > Each phase ends with a written decision — build, iterate, or kill — so capital
 > is never committed on hope.
 
+> **2026-06-09 — structure-first pivot
+> ([ADR-0014](./decisions/0014-structure-first-pivot.md)).** The
+> directional-weather track below (Phases 0.5 → 3) failed its forward gate
+> (week 1: −$30.24 at 22.3% win rate) and is demoted to a time-boxed side
+> track (one MOS refit, one fair v5 forward test, close on failure). The
+> flagship is now the structure-first scanner with pre-registered gates
+> **G-A** (data plane: 14 days, ≥95% uptime, ≥300 markets) → **G-B**
+> (opportunity existence on ≥14 days of wide tape; unmet → publish the
+> negative and stop) → **G-C** ($50 live canary, taker/IOC, operator
+> sign-off required) — frozen numbers in the ADR. The phases below are
+> preserved as the historical record; day-to-day state lives in
+> [BUILDLOG.md](./BUILDLOG.md).
+
 ## Guiding principles
 
 1. **Evidence before commitment.** Every phase produces a written artifact
@@ -51,7 +64,7 @@ latency (see `docs/research/SYNTHESIS.md`).
 
 ---
 
-## Phase 0.5 — Decision-gate report *(v2 verdict: NOT MET)*
+## Phase 0.5 — Decision-gate report *(closed: 0-for-4 directional gates; fwd wk1 −$30.24 → ADR-0014 pivot)*
 
 **Status.** Three iterations of the gate report shipped. Current
 verdict is in the v2 report at
