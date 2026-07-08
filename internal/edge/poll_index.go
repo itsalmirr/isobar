@@ -70,21 +70,29 @@ func loadPolls(omRoot string, start, end time.Time) (*pollIndex, error) {
 		ss.polls = append(ss.polls, poll)
 		return nil
 	})
-	if walkErr != nil && !errors.Is(walkErr, io.EOF) {
-		return nil, walkErr
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
 	}
 	for _, ss := range idx.byStation {
 		// Polls were written in time order per source, but across rotated
-		// files we still resort to be safe.
-		entries := make([]pollEntry, len(ss.times))
-		for i := range ss.times {
-			entries[i] = pollEntry{time: ss.times[i], poll: ss.polls[i]}
+		// files we resort to be safe. Sort (time, poll) pairs together so
+		// the two slices stay aligned.
+		n := len(ss.times)
+		idxs := make([]int, n)
+		for i := range idxs {
+			idxs[i] = i
 		}
-		sort.SliceStable(entries, func(i, j int) bool { return entries[i].time.Before(entries[j].time) })
-		for i, entry := range entries {
-			ss.times[i] = entry.time
-			ss.polls[i] = entry.poll
+		sort.SliceStable(idxs, func(a, b int) bool {
+			return ss.times[idxs[a]].Before(ss.times[idxs[b]])
+		})
+		sortedTimes := make([]time.Time, n)
+		sortedPolls := make([]*Poll, n)
+		for k, src := range idxs {
+			sortedTimes[k] = ss.times[src]
+			sortedPolls[k] = ss.polls[src]
 		}
+		ss.times = sortedTimes
+		ss.polls = sortedPolls
 	}
 	return idx, nil
 }
@@ -144,10 +152,9 @@ func dailyFiles(root string, start, end time.Time) ([]string, error) {
 	return out, nil
 }
 
-// tradeMsg is the Kalshi WS trade-message inner shape. Recorded frames use
-// string yes_price_dollars/no_price_dollars and taker_side; older v2 docs
-// describe int yes_price/no_price with side. priceDollars()/side() handle
-// both.
+// tradeMsg is the Kalshi WS trade-message inner shape. Fields match
+// Kalshi's v2 WS docs. Some recorded frames may use string price_dollars
+// (legacy) — yesPriceCents() handles both representations.
 type tradeMsg struct {
 	MarketTicker    string          `json:"market_ticker"`
 	YesPrice        int             `json:"yes_price"`
@@ -194,10 +201,13 @@ func (m tradeMsg) priceDollars() float64 {
 		default:
 			return -1
 		}
+		return c, true
+	case m.NoPrice > 0:
+		c := 100 - m.NoPrice
 		if c <= 0 || c >= 100 {
-			return -1
+			return 0, false
 		}
-		return float64(c) / 100
+		return c, true
 	}
 	if m.YesPriceDollars != "" {
 		var v float64
@@ -216,9 +226,17 @@ func (m tradeMsg) priceDollars() float64 {
 		if err := json.Unmarshal(m.PriceDollars, &s); err == nil {
 			var v float64
 			if _, err := fmt.Sscanf(s, "%f", &v); err == nil && v > 0 && v < 1 {
-				return v
+				c := int(v*100 + 0.5)
+				if m.Side == "no" {
+					c = 100 - c
+				}
+				if c <= 0 || c >= 100 {
+					return 0, false
+				}
+				return c, true
 			}
 		}
 	}
-	return -1
+	return 0, false
 }
+

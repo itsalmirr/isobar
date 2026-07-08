@@ -2,6 +2,7 @@ package edge
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -313,10 +314,6 @@ type MemberDaily struct {
 //
 // The scanner treats this as "skip this trade-poll pairing" rather than a
 // hard failure.
-var ErrInsufficientCoverage = errFmt("openmeteo: insufficient hourly coverage")
-
-type errFmt string
-
-func (e errFmt) Error() string { return string(e) }
+var ErrInsufficientCoverage = errors.New("openmeteo: insufficient hourly coverage")
 
 func cToF(c float64) float64 { return c*9.0/5.0 + 32.0 }

@@ -171,7 +171,7 @@ func main() {
 		os.Exit(1)
 	}
 	mdPath := filepath.Join(*outDir, fmt.Sprintf("summary-%s_%s.md", *startStr, *endStr))
-	if err := writeSummary(mdPath, *startStr, *endStr, res); err != nil {
+	if err := writeSummary(mdPath, *startStr, *endStr, *edgeThresh, res); err != nil {
 		fmt.Fprintln(os.Stderr, "edge-scan: write summary:", err)
 		os.Exit(1)
 	}
@@ -292,8 +292,8 @@ func writeCSV(path string, rows []edge.EdgeRow) error {
 	return f.Close()
 }
 
-func writeSummary(path, startStr, endStr string, res *edge.Result) error {
-	f, err := os.Create(path) //nolint:gosec // path is operator-supplied output flag
+func writeSummary(path, startStr, endStr string, edgeThresholdCents int, res *edge.Result) error {
+	f, err := os.Create(path)
 	if err != nil {
 		return err
 	}
@@ -396,14 +396,14 @@ func writeSummary(path, startStr, endStr string, res *edge.Result) error {
 		w.printf("| %4d | %6d |\n", k, hist[k])
 	}
 
-	// Trades with edge ≥ 5¢ post-fee, by bracket.
+	// Trades with edge ≥ threshold post-fee, by bracket.
 	type bktTotal struct {
 		key   string
 		count int
 	}
 	bkt := map[string]int{}
 	for _, r := range res.Rows {
-		if r.EdgeCents >= 5 {
+		if r.EdgeCents >= edgeThresholdCents {
 			bkt[r.Ticker]++
 		}
 	}
@@ -412,9 +412,10 @@ func writeSummary(path, startStr, endStr string, res *edge.Result) error {
 		bktList = append(bktList, bktTotal{k, v})
 	}
 	sort.Slice(bktList, func(i, j int) bool { return bktList[i].count > bktList[j].count })
-	w.printf("\n## Top brackets with edge ≥ 5¢ post-fee\n\n")
+	fmt.Fprintf(f, "\n## Top brackets with edge ≥ %d¢ post-fee\n\n", edgeThresholdCents)
 	if len(bktList) == 0 {
-		w.println("_(no trade has positive edge ≥ 5¢ — naive p_fair offers no edge band over fees)_")
+		fmt.Fprintf(f, "_(no trade has positive edge ≥ %d¢ — naive p_fair offers no edge band over fees)_\n",
+			edgeThresholdCents)
 	} else {
 		w.println("| ticker | trades |\n|---|---:|")
 		for i, bt := range bktList {
