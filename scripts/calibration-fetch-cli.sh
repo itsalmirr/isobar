@@ -65,11 +65,22 @@ fi
 # bulletin for WINDOW_END, the AFOS query window has to extend one day past it.
 if [ "$(uname -s)" = "Darwin" ]; then
   edate_day=$(date -v+1d -j -f "%Y-%m-%d" "$WINDOW_END" "+%Y-%m-%d")
+  start_epoch=$(date -j -f "%Y-%m-%d" "$WINDOW_START" "+%s")
+  end_epoch=$(date   -j -f "%Y-%m-%d" "$WINDOW_END"   "+%s")
 else
   edate_day=$(date -d "$WINDOW_END + 1 day" "+%Y-%m-%d")
+  start_epoch=$(date -d "$WINDOW_START" "+%s")
+  end_epoch=$(date   -d "$WINDOW_END"   "+%s")
 fi
 sdate="${WINDOW_START}T00:00Z"
 edate="${edate_day}T23:59Z"
+
+# Sanity threshold: ≥1 bulletin per civil day. (CLI is normally issued ~2×/day,
+# so this floor accepts the "preliminary only, no afternoon correction" days
+# while still catching obvious failure modes like an empty/HTML response.)
+window_days=$(( (end_epoch - start_epoch) / 86400 + 1 ))
+[ "$window_days" -lt 1 ] && window_days=1
+MIN_BULLETINS=$window_days
 
 OUT_DIR="${DATA_DIR}/cli"
 mkdir -p "$OUT_DIR"
@@ -118,8 +129,8 @@ for st in "${STATIONS[@]}"; do
   fi
 
   bulletin_count=$(unzip -l "$tmp" 2>/dev/null | awk '/\.txt$/' | wc -l | tr -d ' ')
-  if [ "$bulletin_count" -lt 100 ]; then
-    echo "  ERROR: $pil zip has $bulletin_count bulletins (expected hundreds)" >&2
+  if [ "$bulletin_count" -lt "$MIN_BULLETINS" ]; then
+    echo "  ERROR: $pil zip has $bulletin_count bulletins (expected ≥ $MIN_BULLETINS for $window_days-day window)" >&2
     failures+=("$pil: ${bulletin_count} bulletins")
     rm -f "$tmp"
     continue

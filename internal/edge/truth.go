@@ -2,7 +2,9 @@ package edge
 
 import (
 	"encoding/csv"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -139,7 +141,14 @@ func loadTruthFile(idx *TruthIndex, station, path string) error {
 	for lineNo := 2; ; lineNo++ {
 		row, err := r.Read()
 		if err != nil {
-			break // io.EOF or first parse error — best-effort load
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			// Surface any non-EOF read failure (malformed quoting,
+			// inconsistent column counts under FieldsPerRecord != -1, etc.)
+			// — silently truncating truth produces stealthy "missing
+			// outcomes" downstream and is worse than failing the load.
+			return fmt.Errorf("%s line %d: %w", path, lineNo, err)
 		}
 		date, err := time.Parse("2006-01-02", strings.TrimSpace(row[dateCol]))
 		if err != nil {
