@@ -280,6 +280,27 @@ func TestFitStationVariable_NoTruth_Skips(t *testing.T) {
 	assert.Empty(t, accum.bins)
 }
 
+// TestFitStationVariable_TruthNoObs_NotCountedAsPair: a civil date with
+// truth but zero usable hourly obs contributes no Δ samples, so it
+// must not inflate PairsFit (which the summary reports as "pairs fit").
+func TestFitStationVariable_TruthNoObs_NotCountedAsPair(t *testing.T) {
+	tz, err := time.LoadLocation("America/New_York")
+	require.NoError(t, err)
+
+	truth := map[string]truthRow{"2024-05-01": {Tmax: 70, Tmin: 50}}
+
+	accum := newKernelAccumulator()
+	st := stationSummary{}
+	fitStationVariable("KNYC", "tmax", nil /* no hourly obs at all */, truth, tz,
+		time.Date(2024, 5, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2024, 5, 1, 0, 0, 0, 0, time.UTC),
+		accum, &st)
+
+	assert.Equal(t, 0, st.PairsFit, "no obs → no Δ samples → not a fitted pair")
+	assert.Equal(t, 0, st.SkippedNoTruth)
+	assert.Empty(t, accum.bins)
+}
+
 // TestFitStationVariable_DST_FallBack ensures civil-day reconstruction
 // works across a DST transition where the local day has 25 hours.
 // 2024-11-03 is "fall back" Sunday in America/New_York: 02:00 EDT

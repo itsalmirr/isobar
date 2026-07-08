@@ -200,6 +200,77 @@ func TestDailyExtremesF_AllMembersSparseStillErrors(t *testing.T) {
 	}
 }
 
+// synthPollFrom mirrors synthPoll with a caller-chosen start hour so
+// DST-transition civil days can be exercised. Temperatures are the
+// hour index in °C, monotonically rising, so the in-window max always
+// identifies the *last* hour the window admitted.
+func synthPollFrom(t *testing.T, start string, hours int) *Poll {
+	t.Helper()
+	t0, err := time.Parse("2006-01-02T15:04", start)
+	if err != nil {
+		t.Fatalf("parse start: %v", err)
+	}
+	times := make([]time.Time, hours)
+	vals := make([]float64, hours)
+	for i := range times {
+		times[i] = t0.Add(time.Duration(i) * time.Hour).UTC()
+		vals[i] = float64(i)
+	}
+	return &Poll{HourlyTimes: times, Members: map[string][]float64{"00": vals}}
+}
+
+// TestDailyExtremesF_DSTFallBack pins the 25-hour civil day: US DST
+// ends 2026-11-01 in America/New_York, so the local day runs
+// [Nov 1 04:00Z, Nov 2 05:00Z) — 25 hourly samples (indices 4..28 of a
+// poll starting Nov 1 00:00Z). A 24h-arithmetic window (the old bug)
+// stops at Nov 2 04:00Z, silently dropping the day's final hour and
+// under-reporting TMAX by one rising step.
+func TestDailyExtremesF_DSTFallBack(t *testing.T) {
+	loc, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Skipf("America/New_York unavailable: %v", err)
+	}
+	p := synthPollFrom(t, "2026-11-01T00:00", 72)
+	out, err := p.DailyExtremesF(time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC), loc)
+	if err != nil {
+		t.Fatalf("DailyExtremesF: %v", err)
+	}
+	got := out["00"]
+	if got.N != 25 {
+		t.Errorf("N = %d, want 25 (fall-back day has 25 hours)", got.N)
+	}
+	// Last in-window sample is index 28 → 28°C = 82.4°F.
+	if !approxF(got.TMaxF, 82.4) {
+		t.Errorf("TMaxF = %.2f, want 82.4 (25th hour must be included)", got.TMaxF)
+	}
+}
+
+// TestDailyExtremesF_DSTSpringForward pins the 23-hour civil day: US
+// DST begins 2026-03-08, so the local day runs [Mar 8 05:00Z,
+// Mar 9 04:00Z) — 23 samples (indices 5..27). The old 24h window ran
+// through Mar 9 05:00Z, leaking the next civil day's first hour into
+// this day's TMAX.
+func TestDailyExtremesF_DSTSpringForward(t *testing.T) {
+	loc, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Skipf("America/New_York unavailable: %v", err)
+	}
+	p := synthPollFrom(t, "2026-03-08T00:00", 72)
+	out, err := p.DailyExtremesF(time.Date(2026, 3, 8, 0, 0, 0, 0, time.UTC), loc)
+	if err != nil {
+		t.Fatalf("DailyExtremesF: %v", err)
+	}
+	got := out["00"]
+	if got.N != 23 {
+		t.Errorf("N = %d, want 23 (spring-forward day has 23 hours)", got.N)
+	}
+	// Last in-window sample is index 27 → 27°C = 80.6°F; the old code
+	// included index 28 (Mar 9 00:00 EDT — the NEXT civil day).
+	if !approxF(got.TMaxF, 80.6) {
+		t.Errorf("TMaxF = %.2f, want 80.6 (next civil day's hour must be excluded)", got.TMaxF)
+	}
+}
+
 func TestMatchTemperatureMember(t *testing.T) {
 	cases := map[string]struct {
 		id string
