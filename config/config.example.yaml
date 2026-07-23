@@ -65,8 +65,8 @@ openmeteo:
   # Locations correspond 1:1 with Kalshi weather series above.
   locations:
     - { name: NY,  lat: 40.7794, lon: -73.9692 }   # Central Park
-    - { name: MIA, lat: 25.7617, lon: -80.1918 }   # Miami Intl
-    - { name: LAX, lat: 33.9416, lon: -118.4085 }  # LAX
+    - { name: MIA, lat: 25.7959, lon: -80.2870 }   # KMIA Miami Intl (canonical per internal/market/stations.go)
+    - { name: LAX, lat: 33.9425, lon: -118.4081 }  # KLAX (canonical per internal/market/stations.go)
     - { name: CHI, lat: 41.7842, lon: -87.7553 }   # KMDW (Chicago Midway — Kalshi resolves KXHIGHCHI/KXLOWTCHI here, NWS-canonical per audit/chi-blast-radius.md)
   variables:
     - temperature_2m

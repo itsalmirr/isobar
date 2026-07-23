@@ -453,15 +453,19 @@ func (j *Journal) run() {
 	}
 
 	writeOne := func(e envelope) {
-		// A failed re-open after a size rotate leaves bw==nil while the
-		// run loop keeps draining the queue (see maybeRotateBySize); guard
-		// here so a dequeued frame cannot nil-deref bw.Write and kill the
-		// writer goroutine. Mirrors the same guards in flushAndSync and
-		// rotate. A nil bw means we have no destination, so the frame is a
-		// write loss and is counted as one.
+		// A failed re-open after a rotate leaves bw==nil while the run
+		// loop keeps draining the queue; guard here so a dequeued frame
+		// cannot nil-deref bw.Write and kill the writer goroutine.
+		// Mirrors the same guards in flushAndSync and rotate. Retry the
+		// open lazily per frame so journaling resumes as soon as the
+		// disk is writable again (instead of staying dead until the
+		// next age rotation); frames lost in the meantime are counted
+		// as write errors.
 		if bw == nil {
-			j.recordWriteError(errNoOpenFile)
-			return
+			if err := open(); err != nil {
+				j.recordWriteError(errNoOpenFile)
+				return
+			}
 		}
 		encBuf.Reset()
 		if err := encoder.Encode(&e); err != nil {
@@ -480,25 +484,19 @@ func (j *Journal) run() {
 	}
 
 	// maybeRotateBySize rotates the current file when it has grown past
-	// MaxFileBytes. It returns false when the post-rotate re-open fails —
-	// the caller must then return from run() so the writer goroutine exits
-	// cleanly instead of looping with bw==nil. This mirrors the age-rotate
-	// path's `return` on re-open failure (see the rotateTimer case) rather
-	// than falling through and leaving a nil bufio.Writer behind.
-	maybeRotateBySize := func() (ok bool) {
+	// MaxFileBytes. When the post-rotate re-open fails the writer stays
+	// alive: the failure is counted as a write error (arming the
+	// OnWriteError hook) and writeOne retries the open lazily per
+	// frame, so journaling resumes as soon as the disk is writable
+	// again. Mirrors the age-rotate path (see the rotateTimer case).
+	maybeRotateBySize := func() {
 		if j.opts.MaxFileBytes > 0 && written >= j.opts.MaxFileBytes {
 			rotate()
 			if err := open(); err != nil {
-				j.logger.Error("re-open after size rotate failed; writer exiting", "err", err)
-				// The journal can no longer persist frames — the queue
-				// will drain into a nil file. Count this as a write-path
-				// failure and arm the OnWriteError hook so the operator
-				// sees the outage, not just a silent goroutine exit.
+				j.logger.Error("re-open after size rotate failed; will retry per frame", "err", err)
 				j.recordWriteError(err)
-				return false
 			}
 		}
-		return true
 	}
 
 	if err := open(); err != nil {
@@ -529,9 +527,7 @@ func (j *Journal) run() {
 				select {
 				case e := <-j.in:
 					writeOne(e)
-					if !maybeRotateBySize() {
-						return
-					}
+					maybeRotateBySize()
 				default:
 					flushAndSync()
 					if f != nil {
@@ -543,9 +539,7 @@ func (j *Journal) run() {
 
 		case e := <-j.in:
 			writeOne(e)
-			if !maybeRotateBySize() {
-				return
-			}
+			maybeRotateBySize()
 
 		case <-flushTimer.C:
 			flushAndSync()

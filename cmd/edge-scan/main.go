@@ -132,7 +132,7 @@ func main() {
 		os.Exit(1)
 	}
 	mdPath := filepath.Join(*outDir, fmt.Sprintf("summary-%s_%s.md", *startStr, *endStr))
-	if err := writeSummary(mdPath, *startStr, *endStr, *edgeThresh, res); err != nil {
+	if err := writeSummary(mdPath, *startStr, *endStr, res); err != nil {
 		fmt.Fprintln(os.Stderr, "edge-scan: write summary:", err)
 		os.Exit(1)
 	}

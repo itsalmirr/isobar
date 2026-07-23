@@ -18,9 +18,9 @@ func TestTradeMsgPriceDollars(t *testing.T) {
 	}{
 		// v2 int-cents shape.
 		{"yes side int price", tradeMsg{YesPrice: 40, TakerSide: "yes"}, 0.40},
-		{"no side int price", tradeMsg{NoPrice: 30, TakerSide: "no"}, 0.30},
+		{"no side taker still yields YES price", tradeMsg{NoPrice: 30, TakerSide: "no"}, 0.70},
 		{"yes side reconstructed from no", tradeMsg{NoPrice: 30, TakerSide: "yes"}, 0.70},
-		{"no side reconstructed from yes", tradeMsg{YesPrice: 40, TakerSide: "no"}, 0.60},
+		{"no side taker keeps yes_price", tradeMsg{YesPrice: 40, TakerSide: "no"}, 0.40},
 		{"legacy side field fallback", tradeMsg{YesPrice: 25, Side: "yes"}, 0.25},
 		{"int price missing side", tradeMsg{YesPrice: 40}, -1},
 		{"int price out of band", tradeMsg{YesPrice: 100, TakerSide: "yes"}, -1},

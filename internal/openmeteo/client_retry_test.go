@@ -141,6 +141,8 @@ func TestPoller_RetriesOnClientTimeout(t *testing.T) {
 
 	p, err := NewPoller(Options{
 		BaseURL:             srv.URL,
+		Model:               "gfs_seamless",
+		ForecastDays:        3,
 		PollInterval:        time.Minute,
 		Locations:           []Location{{Name: "NY", Lat: 40, Lon: -73}},
 		Logger:              discardLogger(),
