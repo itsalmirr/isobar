@@ -3,7 +3,7 @@
 **Project**: `isobar` (Kalshi weather-bracket trading bot)
 **Module**: `github.com/wh0o0pz/isobar` · Go 1.26
 **Path**: `/Users/wh0o0pz/dev/isobar`
-**main HEAD**: `5687c5e` (15 commits ahead of `origin/main`)
+**main HEAD**: `4c2ede1` (15 commits ahead of `origin/main`)
 **Mapped on**: 2026-05-13
 **Scope**: every directory, dependency, entrypoint, data path, integration, env var, secret, listener, config, deploy unit, CI workflow, script, and doc.
 

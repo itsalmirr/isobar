@@ -1,6 +1,6 @@
 # reduction/01-deadcode.md — Phase 1 dead-code sweep
 
-**HEAD**: `144c08f` + uncommitted working tree (same-day review/polish pass — see BUILDLOG 2026-07-03)
+**HEAD**: `397004f` + uncommitted working tree (same-day review/polish pass — see BUILDLOG 2026-07-03)
 **Date**: 2026-07-03
 **Scope**: Phase 1 per `00-baseline.md` protocol — deletion only, no abstraction
 **Methodology**: `golang.org/x/tools/cmd/deadcode@v0.44.0` over all 8 mains (61 flagged

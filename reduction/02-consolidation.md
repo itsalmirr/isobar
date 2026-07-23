@@ -1,6 +1,6 @@
 # reduction/02-consolidation.md — Phase 2 consolidation + complexity
 
-**HEAD**: `144c08f` + uncommitted working tree (stacked on the Phase 1/1b sweep — see `01-deadcode.md`)
+**HEAD**: `397004f` + uncommitted working tree (stacked on the Phase 1/1b sweep — see `01-deadcode.md`)
 **Date**: 2026-07-03
 **Scope**: Phase 2 per `00-baseline.md` protocol — judgment beyond deletion: duplication
 consolidation, decomposition of the top-complexity functions, resolution of the five

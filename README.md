@@ -1,5 +1,15 @@
 # isobar
 
+> **Status: closed & archived (2026-07-23).** Wound down at the
+> structure-first stage (ADR-0014) before the G-A gate calendar
+> started: the universe-discovery layer and the calibration/backtest
+> pipeline were built and tested, but wide recording never ran healthy
+> in production after the May recorder outage. Final state: `make all`
+> and CI green at HEAD. The evidence trail lives in
+> [docs/BUILDLOG.md](./docs/BUILDLOG.md) (closing entry at top),
+> [CHANGELOG 0.6.0](./CHANGELOG.md), and
+> [docs/decisions/](./docs/decisions/).
+
 Evidence-gated trading-research project on Kalshi: an end-to-end data
 plane (recorder → journal → replay), a calibration/backtest pipeline,
 and a series of decision-gate reports. Every strategy iteration is

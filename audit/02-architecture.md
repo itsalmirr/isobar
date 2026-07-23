@@ -1,7 +1,7 @@
 # audit/02-architecture.md — Phase 2 architecture reconsider
 
 **Project**: `isobar` (Kalshi weather-bracket trading bot)
-**HEAD at draft**: `be1cb02` (post-Bucket-A, post-ADR-0013)
+**HEAD at draft**: `2b9248d` (post-Bucket-A, post-ADR-0013)
 **Status**: **PROPOSAL ONLY.** Nothing in this document is implemented.
 **Charter**: restructure and consolidate only — no new capability.
 **Cadence**: per-decision sign-off gates implementation. No `git mv`, no public-API change, no new test until the relevant decision is approved.

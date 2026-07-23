@@ -13,7 +13,23 @@ Section order within a release: `Added` · `Changed` · `Fixed` ·
 
 ## [Unreleased]
 
+*Nothing — the project is closed and the repository archived
+(2026-07-23). 0.6.0 is the final release.*
+
+## [0.6.0] — 2026-07-23 — final release: main repaired, project closed
+
 ### Fixed
+- **Repo-level: `main` did not compile between 2026-07-08 and this
+  release.** The GitHub web-editor conflict resolutions for PRs
+  #1/#6/#5 left half-taken hunks across `internal/edge`,
+  `internal/journal`, `internal/openmeteo`, `cmd/edge-scan`, and the
+  example config: code spliced outside any function, deleted type
+  declarations, tests kept while the fixes they guarded were dropped,
+  and two directly contradictory journal regression tests. Every CI
+  run was red. `9fc3fb3` reconstructs the intended merge — the
+  reduction refactor's structure kept, the parallel branches' semantic
+  fixes ported onto it — and produced the first green CI run in this
+  repository's history.
 - `internal/edge` — the T−3h Bayesian update no longer fires for trades
   outside the bracket's resolution civil day (station-local). Day-ahead
   trades previously had *today's* running extremum folded into
@@ -21,16 +37,21 @@ Section order within a release: `Added` · `Changed` · `Fixed` ·
   `wrong_civil_day`.
 - `internal/edge` — `tradeMsg.priceDollars()` returned the raw NO price
   (not the YES price) for `side=no` trades in the int-cents wire shape,
-  inverting the price for every no-side taker on that path.
+  inverting the price for every no-side taker on that path. The scanner
+  now scores edges and backtest PnL in the YES frame for both taker
+  sides while `trade_price_cents` keeps reporting the price the taker
+  actually executed at.
 - `internal/edge` — ensemble daily extremes now use a DST-safe civil-day
   window (`AddDate`, not `Add(24h)`): the 25-hour fall-back day lost its
   final hour and the 23-hour spring-forward day absorbed the next day's
   first hour.
 - `internal/journal` — the writer goroutine no longer panics (nil
-  `bufio.Writer`) when the re-open after a rotation fails; it drops-and-
-  counts per frame (visible via `Dropped()` and the ADR-0011 alarm) and
-  recovers when the disk is writable again. The age-rotate failure path
-  no longer silently terminates journaling for the process lifetime.
+  `bufio.Writer`) when the re-open after a rotation fails, and neither
+  rotate path terminates journaling for the process lifetime anymore:
+  the writer stays alive, counts each lost frame as a write error
+  (`WriteErrorsTotal()` + the `OnWriteError` hook — ADR-0011 drop
+  accounting stays reserved for queue-full drops), retries the open
+  lazily per frame, and recovers as soon as the disk is writable again.
   `gzipFile` propagates the output file's Close error instead of
   swallowing it before the plain file is deleted.
 - `internal/calibration/mos` — `Fit` held out N+1 days when asked for N
@@ -57,15 +78,18 @@ Section order within a release: `Added` · `Changed` · `Fixed` ·
   FIXME" (it was closed in `internal/edge/resolution.go`).
 - `internal/edge.EdgeRow` — documented the real `BayesSkipReason` enum
   (`no_prior` / `prior-only` were undocumented or misspelled).
+- Project close-out: BUILDLOG closing entry, README status note, this
+  final release. The repository is archived; the prod recorder box is
+  decommissioned separately by the operator.
 
 ---
 
 ## [0.5.0] — 2026-06-10 — Phase 0.5 closed: directional gates failed; structure-first pivot (ADR-0014)
 
 *Cut as a backfill on 2026-06-10 after ~7 weeks of changelog drift
-(everything since `6a905e1`, ~123 commits). Entries are curated
+(everything since `c38f962`, ~123 commits). Entries are curated
 highlights, not a commit mirror — the per-commit record is
-`git log 6a905e1..`. The "every behavior-changing PR updates this
+`git log c38f962..`. The "every behavior-changing PR updates this
 file" rule is back in force from here.*
 
 ### Added

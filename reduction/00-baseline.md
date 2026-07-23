@@ -1,7 +1,7 @@
 # reduction/00-baseline.md — Phase 0 baseline
 
 **Project**: `isobar` (Kalshi weather-bracket trading bot)
-**HEAD**: `0ad0a3e` (post-Bucket-A, post-ADR-0013, docs refreshed)
+**HEAD**: `c78c9b1` (post-Bucket-A, post-ADR-0013, docs refreshed)
 **Date**: 2026-05-13
 **Scope**: code-minimization audit — Phase 0 measurement-only, **no code changes**
 **Methodology**: 4 parallel Opus 4.7 Explore agents (read-only). darwin/arm64, Go 1.26.2.

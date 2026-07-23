@@ -191,7 +191,7 @@ every Spec observed in the scan window, groups by
 `(series, valid_date)`, and the bracket resolver checks whether the
 T-bracket's key is at or below the lowest sibling B midpoint — if so,
 it flips to `(−Inf, K)`. Commit
-`a0d1c26` ("fix(edge): use ResolveWithSiblings for T-brackets") landed
+`04193fd` ("fix(edge): use ResolveWithSiblings for T-brackets") landed
 this in Lane A; the bracket convention itself (previously a FIXME) has
 since been locked in — see the evidence notes on `Spec.Resolve` in
 `internal/edge/resolution.go` and its tests.

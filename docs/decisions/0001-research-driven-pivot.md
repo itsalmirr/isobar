@@ -6,7 +6,7 @@
 
 ## Context
 
-The original Phase-0 design (see `docs/STRATEGY.md` at commit `b7ba2d9`)
+The original Phase-0 design (see `docs/STRATEGY.md` at commit `a6312f5`)
 proposed two trading signals:
 
 1. **Weather brackets** priced as `p_fair = ensemble_members_in_bracket / 31`
@@ -109,4 +109,4 @@ implemented, that's a kill signal.
   calibration approach.
 - `docs/research/07-atmospheric-physics.md` — predictability ceilings.
 - `docs/research/08-evt-statmech.md` — Lyapunov + EVT justification.
-- Git commit `4258365` — "W1: complete research pivot".
+- Git commit `5967578` — "W1: complete research pivot".

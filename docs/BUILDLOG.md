@@ -8,6 +8,43 @@ parallel session marks IN FLIGHT.
 
 ---
 
+## 2026-07-23 — PROJECT CLOSE-OUT (interactive session) — final entry
+
+**Done:**
+- `9fc3fb3` — repaired the botched 2026-07-08 GitHub-web merge
+  resolutions (PRs #1/#6/#5). Main had not compiled since 07-08 and
+  every CI run was red (post-move CI *does* run; the first verdicts
+  were startup failures' successor: honest build breaks). Damage:
+  orphaned pre-refactor code spliced outside functions, deleted type
+  decls, tests kept while their fixes were dropped, and one pair of
+  directly contradictory journal regression tests. Resolution kept the
+  reduction refactor's structure and ported the parallel branches'
+  semantic fixes onto it: YES-frame price normalization (executed
+  price still reported in `trade_price_cents`), the `wrong_civil_day`
+  Bayes gate re-ported into `applyBayes`, journal writer
+  stay-alive + lazy per-frame re-open with write-error accounting
+  (exit-cleanly test deleted as superseded). `make all` green;
+  **first green CI run in the repo's history**, verified on push.
+- CHANGELOG 0.6.0 cut (final release); README status banner; this
+  entry.
+- Hygiene: local `reduction/phase-1-2` deleted (merged); 7 stale
+  origin branches deleted (5 merged; 2 unmerged operator-approved:
+  `claude/bot-roadmap-documentation-XHaqy`,
+  `claude/cool-newton-953683` — pre-pivot BTC-era `cmd/score` /
+  `cmd/fillability` work, superseded by ADR-0014); local `nolmelabs`
+  remote removed. Repo archived on GitHub (read-only) after CI green.
+
+**Project disposition:** closed before the G-A calendar ever started.
+OPERATIONS §15 open items (prod redeploy, journalctl forensics on the
+05-20→24 window) are moot: the operator is decommissioning the prod
+box separately; tape data disposition is theirs. No positions were
+ever placed (ADR-0014's no-order-placement rail held, structurally,
+to the end).
+
+**Next:** nothing. This is the final entry.
+
+---
+
 ## 2026-07-03 ~21:30 ET — reduction Phase 2: consolidation + complexity (interactive session)
 
 **Done (same uncommitted tree):** operator authorized "reduce + maintainability" →
@@ -128,11 +165,11 @@ wiring; prod redeploy remains the calendar long pole).
 ## 2026-06-10 ~13:30 ET — cleanup run (interactive session)
 
 **Done:**
-- `92eaeb4` fix(kalshi): **recorder starvation fix LANDED** — reviewed and
+- `2a14a6b` fix(kalshi): **recorder starvation fix LANDED** — reviewed and
   committed the parallel session's working-tree edits (reconnect-time
   `RefreshTickers`, `retry.ResetAfter`, OPERATIONS §15 postmortem).
   Queue item "universe → cmd wiring" is now **UNBLOCKED**.
-- `ec07cfb` chore(lint): errorlint + gofumpt + gosec — `make lint` green.
+- `8034f90` chore(lint): errorlint + gofumpt + gosec — `make lint` green.
 - CI/build hygiene (this commit): `go mod tidy` (CI tidy-check was red —
   x/tools is a direct dep via tools/clockcheck); CI now pins
   golangci-lint **v2.12.2** (was v2.1 — 11-minor drift vs local) via
@@ -164,7 +201,7 @@ wide recording runs healthy in prod.
 **Next (queue order unchanged from run #2):**
 1. (b)(ii) hand-audit script (top item).
 2. (d) detectors in `internal/structscan` on existing weather tape.
-3. universe → cmd wiring + config widening — unblocked as of `92eaeb4`.
+3. universe → cmd wiring + config widening — unblocked as of `2a14a6b`.
 4. Operator: NY-eligibility confirmations for expansion series; prod
    redeploy (the calendar long pole).
 
@@ -173,7 +210,7 @@ wide recording runs healthy in prod.
 ## 2026-06-09 ~20:55 ET — manual run #2 (interactive session)
 
 **Done:**
-- `23edc77` feat(universe): catalog discovery + structural classification +
+- `aa41aaa` feat(universe): catalog discovery + structural classification +
   fail-closed eligibility gate. Public `/events`+`/series` (fee params from the
   exchange), MECNET-authoritative mutex detection, conservative exhaustive-tiling
   check, ladders/complements, Unknown groups kept for no-silent-truncation
@@ -205,8 +242,8 @@ at 14.8MB today and climbing. Still theirs; do not touch.
 ## 2026-06-09 ~20:35 ET — manual kick-off (interactive session)
 
 **Done:**
-- `52e7cf4` fix(edge-scan): Ts→TS missed call site — HEAD compiles again
-- `c79f4e0` docs(research): proposal 09 landed (incl. §0 epistemic grading)
+- `8bbab25` fix(edge-scan): Ts→TS missed call site — HEAD compiles again
+- `84b7b71` docs(research): proposal 09 landed (incl. §0 epistemic grading)
 - ADR-0014 accepted + index row + STRATEGY.md pointer + this BUILDLOG (this commit)
 - Fee-source probe: **public API exposes per-series `fee_type`/`fee_multiplier`**
   (`GET /trade-api/v2/series/KXHIGHNY` → `"fee_type":"quadratic","fee_multiplier":1`,

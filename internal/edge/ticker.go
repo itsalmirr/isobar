@@ -172,7 +172,7 @@ func parseBracketSuffix(s string) (BracketKind, float64, error) {
 
 // Station returns the ASOS-style station code Kalshi resolves on for a
 // given series. The Chicago series intentionally returns KMDW (Midway),
-// not KORD (O'Hare) — see ADR-0007 and commit 35d5622.
+// not KORD (O'Hare) — see ADR-0007 and commit ac5aec9.
 func (s Spec) Station() string {
 	switch s.Series {
 	case "KXHIGHNY", "KXLOWTNYC":

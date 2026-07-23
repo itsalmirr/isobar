@@ -91,4 +91,4 @@ strategy demonstrably needs crypto correlates, we rebuild.
 - `docs/research/SYNTHESIS.md` — decision context.
 - `docs/research/01-kalshi-landscape.md` — Coinbase/Kalshi integration.
 - `docs/research/05-literature-review.md` — latency analysis.
-- Git commit `4258365` — implementation of this decision.
+- Git commit `5967578` — implementation of this decision.

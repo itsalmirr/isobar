@@ -314,7 +314,7 @@ all scanner-side concerns live in one package.
   with N=4 — it beats a hash map on cache-line-resident inputs. Switch
   to a map when N exceeds ~16.
 - Chicago resolves on `KMDW` (Midway), *not* `KORD` (O'Hare) — per
-  ADR-0007 and commit `35d5622`. Adding a new station means appending
+  ADR-0007 and commit `ac5aec9`. Adding a new station means appending
   to `allStations` *and* updating `scripts/calibration-fetch-*.sh` to
   include the matching code.
 - Civil-day boundaries come from the IANA `TZ` field via

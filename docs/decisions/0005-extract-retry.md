@@ -7,7 +7,7 @@
 ## Context
 
 A deep code review after the W1 pivot (Explore agent transcript in
-git commit history for `fc3b7da`) identified three concrete defects
+git commit history for `feada2d`) identified three concrete defects
 in the current tree:
 
 1. **Jitter + exponential-backoff loop reinvention.** `kalshi/ws.go`
@@ -88,6 +88,6 @@ Canary: none. These are pure refactors guarded by tests.
 
 ## References
 
-- Git commit `fc3b7da` — implementation.
+- Git commit `feada2d` — implementation.
 - `docs/ARCHITECTURE.md` §`internal/retry`.
 - `docs/TESTING.md` — coverage target row.

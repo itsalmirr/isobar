@@ -1,7 +1,7 @@
 # audit/01-line-audit.md — Phase 1: Line-by-line audit
 
 **Project**: `isobar` (Kalshi weather-bracket trading bot)
-**HEAD**: `dee0df4` (post-P1-triage main)
+**HEAD**: `a86ddd7` (post-P1-triage main)
 **Methodology**: 6 parallel Opus 4.7 audit agents, one per package group. Every file read end-to-end. Every claim cites `file:line`. Severity-sorted within each package per the user's cadence rule.
 **Scope (per the user's non-negotiables)**: every `go func`, every `context.Context`, every error path, every `time.` usage, every external boundary, every magic number, every hardcoded path/URL, every disabled test, every panic, every silently-swallowed error, every comment-vs-code drift, every TODO/FIXME/XXX, every untrusted-input boundary, every concurrency invariant.
 
@@ -998,7 +998,7 @@ After Phase 1 the product lead split the 35 P1s into **Bucket A** (fix now — s
 | A10 | Resolve `internal/edge/resolution.go:28-65` FIXMEs (one resolved, one documented with counter+log) | edge §P1 #5, #6 | (same branch) |
 | A11 | `Poll.ModelSet` precompute cache (gate criteria PASSED — −99.99% ns/op, −100% allocs) | prior-review F2.2 | `perf/poll-modelset-cache` |
 
-Plus post-merge fix [b99423e](../internal/kalshi/client.go) — `time.Until` in `withCallDeadline` annotated `//nolint:clockcheck` per ADR-0012's escape-hatch policy (ctx.Deadline is intrinsically wall-bound).
+Plus post-merge fix [79c4398](../internal/kalshi/client.go) — `time.Until` in `withCallDeadline` annotated `//nolint:clockcheck` per ADR-0012's escape-hatch policy (ctx.Deadline is intrinsically wall-bound).
 
 **All gates green on merged main**: `go build` / `go vet` / `gofmt` / `go test -race -count=1` (every package) / `make lint` (golangci-lint **0 issues** + custom clockcheck analyzer **0 violations**).
 
@@ -1032,5 +1032,5 @@ Plus post-merge fix [b99423e](../internal/kalshi/client.go) — `time.Until` in 
 
 Phase 1 surfaced 35 P1 findings. Bucket A closed 17 of them (the 11 PRs above cover multiple cited line items). Bucket B holds the other 18, all routed to Phase 2.
 
-Net code change in Bucket A (vs pre-bucket main `dee0df4`): roughly +3500 LOC of production code + tests + docs + tooling, −400 LOC of dead code. ADRs: 0011 (already accepted) + 0012 (new, accepted).
+Net code change in Bucket A (vs pre-bucket main `a86ddd7`): roughly +3500 LOC of production code + tests + docs + tooling, −400 LOC of dead code. ADRs: 0011 (already accepted) + 0012 (new, accepted).
 

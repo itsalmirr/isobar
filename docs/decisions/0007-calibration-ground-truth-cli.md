@@ -145,7 +145,7 @@ either bound is breached, the decision is confirmed.
 ## References
 
 - `scripts/calibration-fetch-obs.sh`, `scripts/calibration-fetch-cli.sh`
-  — implementation, commit `ae8d7a0`.
+  — implementation, commit `44454c7`.
 - ADR-0001 — `weather-calibrated` requires NGR, requires paired y.
 - ADR-0004 — two-signal scope; calibration is the keystone of one of
   the two.

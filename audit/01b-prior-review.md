@@ -1,5 +1,5 @@
 > **Provenance**: This document predates the dispatched Phase 1 audit (mtime 2026-05-13 03:10:54,
-> HEAD pinned at 5687c5e). Author and dispatch context unattributed. Verified non-contradictory with
+> HEAD pinned at 4c2ede1). Author and dispatch context unattributed. Verified non-contradictory with
 > audit/01-line-audit.md on 2026-05-13. Retained for net-new coverage. Treat findings as input
 > requiring corroboration, not as authoritative output of this audit run.
 
@@ -14,7 +14,7 @@
 
 # audit/01b-prior-review.md — Consolidated code, design, ADR audit (origin unknown)
 
-**Project**: `isobar` · **Date**: 2026-05-13 · **HEAD**: `5687c5e` (per `audit/00-map.md`)
+**Project**: `isobar` · **Date**: 2026-05-13 · **HEAD**: `4c2ede1` (per `audit/00-map.md`)
 **Scope**: deep code review, system design, tech debt prioritization, ADR gap analysis.
 
 This audit sits on top of and is non-duplicative with prior work:

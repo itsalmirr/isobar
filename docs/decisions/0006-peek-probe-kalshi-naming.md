@@ -101,7 +101,7 @@ never run `peek` for a real question, it's clutter and should go.
 
 ## References
 
-- W1 discovery pass: commits `62649e4` (series fix), `ee34e3f` (peek).
+- W1 discovery pass: commits `37f4c55` (series fix), `7501ea5` (peek).
 - `cmd/peek/main.go` current scope.
 - Kalshi catalog probe output archived in PR discussion (not
   committed — it's an 8,998-series dump).

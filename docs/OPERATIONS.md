@@ -493,7 +493,7 @@ Phase 3 adds webhook-based alerting on `ERROR` slog lines. Until then:
 
 Per [ADR-0013](decisions/0013-retire-pr9-paper-trader-lineage.md),
 on 2026-05-13 `origin/main` was force-pushed
-(`+ 6a6530a...93733e4 main -> main (forced update)`) to retire the
+(`+ 6a6530a...bfa7f4b main -> main (forced update)`) to retire the
 PR#9 paper-trader / fillability / score / settle / backfill-score
 lineage during Bucket A consolidation. Recovery paths for that
 lineage are documented in ADR-0013 §"Recovery paths"
@@ -511,7 +511,7 @@ should be the rare case; the default for `main` is fast-forward only.
 Verify the current `origin/main` state:
 
 ```bash
-git reflog show origin/main      # local — shows the 6a6530a→93733e4 transition for ~30d
+git reflog show origin/main      # local — shows the 6a6530a→bfa7f4b transition for ~30d
 git log --oneline -n 5 origin/main
 ```
 
@@ -624,7 +624,7 @@ The subscriber's in-memory ticker list went fully stale — every
 subscribed market had settled. Kalshi **acks** a subscribe for settled
 markets and sends one stub `orderbook_snapshot` per ticker
 (`market_id: ""`, no book fields), then nothing further: no deltas, no
-trades, no error. The liveness watchdog (added 2026-05-13, c0c59f5)
+trades, no error. The liveness watchdog (added 2026-05-13, 814c648)
 correctly detected the silence at 60s and forced a reconnect — but the
 reconnect path reused the same stale list, so the loop could never
 converge. Observed cycle: connect → ack + N stubs in <2s → silence →

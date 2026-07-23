@@ -29,9 +29,9 @@ The 11 commits, in chronological order:
 | `ed4bbbf` | feat(settle): daily reconciler — Kalshi resolution → bet outcomes      |
 | `9310702` | feat: corner filter + cmd/score + cmd/fillability + deploy artifacts    |
 | `274f2cb` | feat(backfill-score): historical Kalshi-resolved P&L over fillability candidates |
-| `e84dd3c` | fix(edge,scripts): poll-pair sort, ticker error gating, fetch threshold, parse flags |
-| `e79f577` | fix(edge,scripts,build): five Copilot review-comment follow-ups on PR #7 |
-| `d448dbb` | chore(edge): cleanup pass — bug fixes, dead code removal, doc/test sharpening |
+| `392f48c` | fix(edge,scripts): poll-pair sort, ticker error gating, fetch threshold, parse flags |
+| `7ac4c65` | fix(edge,scripts,build): five Copilot review-comment follow-ups on PR #7 |
+| `18cbd97` | chore(edge): cleanup pass — bug fixes, dead code removal, doc/test sharpening |
 | `60788f3` | Merge pull request #8 from nolmelabs/claude/code-review-discussion-EpsqP |
 | `bb4743a` | Merge branch 'main' into claude/cool-newton-953683                     |
 | `6a6530a` | Merge pull request #9 from nolmelabs/claude/cool-newton-953683          |
@@ -54,7 +54,7 @@ between the audit lineage and the PR#9 lineage:
   referenced them; `internal/edge`'s `ParseTicker` / `Spec` /
   `BracketBetween` / `BracketThreshold` is the canonical parser, with
   different (corrected) semantics.
-- The earlier consolidation refactor (`579ba8e refactor(edge):
+- The earlier consolidation refactor (`aa176e4 refactor(edge):
   consolidate fee/scanner/ensemble into internal/edge`) had already
   removed `openmeteo.NumMembers` in favor of `Poll.MemberCount()` /
   the dynamic `Poll.Members` map.
@@ -83,7 +83,7 @@ at force-push time:
 force-push point on 2026-05-13:
 
 ```
-+ 6a6530a...93733e4 main -> main (forced update)
++ 6a6530a...bfa7f4b main -> main (forced update)
 ```
 
 The PR#9 capability work is **out of scope for the audit** and is
@@ -113,11 +113,11 @@ multiple sources, in order of preference:
    the 11 SHAs in the Context table above.
 
 3. **The two audit backup branches on origin**:
-   - `audit/2026-05-13` (sha `a767de6`) — pre-Bucket-A snapshot. Note:
+   - `audit/2026-05-13` (sha `205de5f`) — pre-Bucket-A snapshot. Note:
      this snapshot does NOT itself contain PR#9 work; local `main`
      was already diverged from PR#9 when the snapshot was taken.
      Useful only as the pre-Bucket-A audit state.
-   - `audit/2026-05-13-post-bucket-a` (sha `93733e4`) — identical
+   - `audit/2026-05-13-post-bucket-a` (sha `bfa7f4b`) — identical
      to current `main` post-force-push. The "after" snapshot.
 
 4. **Any developer's local clone** that has `origin/main` fetched
@@ -168,9 +168,9 @@ At that point, the PR#9 work returns via:
 - `audit/01-line-audit.md` — full Bucket A status (appendix)
 - `audit/01b-prior-review.md` — prior-art review; cross-linked to
   this ADR
-- A9 commit `cea6b86` — `chore(market): delete dead ParseTicker/Ticker`
+- A9 commit `169da3b` — `chore(market): delete dead ParseTicker/Ticker`
 - Force-push artifact: `git reflog show origin/main` will reveal the
-  `6a6530a → 93733e4` transition for ~30 days
+  `6a6530a → bfa7f4b` transition for ~30 days
 
 ## Alternatives considered
 
@@ -237,8 +237,8 @@ this ADR records the one instance where it was authorized, and why.
 ## References
 
 - Phase 1 response framing: "no new capability ships"
-- A9 commit: `cea6b86 chore(market): delete dead ParseTicker/Ticker`
-- Force-push event: `+ 6a6530a...93733e4 main -> main (forced update)`
+- A9 commit: `169da3b chore(market): delete dead ParseTicker/Ticker`
+- Force-push event: `+ 6a6530a...bfa7f4b main -> main (forced update)`
   on 2026-05-13
 - `audit/01-line-audit.md` Bucket A appendix
 - `audit/01b-prior-review.md` (origin-unknown prior review, cross-
